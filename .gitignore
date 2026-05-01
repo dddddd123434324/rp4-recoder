@@ -1,0 +1,10 @@
+node_modules/
+dist/
+out/
+build-tools/
+recordings/
+config/
+.env
+.env.*
+*.log
+.DS_Store

@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RP4 Recorder</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand" aria-label="RP4">RP<strong>4</strong></div>
+
+      <nav class="nav-list" aria-label="주 메뉴">
+        <button class="nav-item active" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10.5V20h13v-9.5"/><path d="M9.5 20v-6h5v6"/></svg>
+          <span>대시보드</span>
+        </button>
+        <button class="nav-item" type="button" data-action="open-folder">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9a2 2 0 0 1-2 2h-15z"/><path d="M3.5 6.5v12a2 2 0 0 0 2 2"/></svg>
+          <span>녹화 파일</span>
+        </button>
+      </nav>
+
+      <div class="ready-card" aria-live="polite">
+        <span class="status-dot"></span>
+        <div>
+          <strong id="statusTitle">준비 중</strong>
+          <p id="statusText">녹화 장치를 준비하고 있습니다.</p>
+        </div>
+      </div>
+      <span class="version">v0.1.0</span>
+    </aside>
+
+    <main class="main">
+      <div class="titlebar">
+        <span></span>
+        <div class="window-actions">
+          <button id="minimizeButton" type="button" aria-label="최소화">─</button>
+          <button id="maximizeButton" type="button" aria-label="최대화">□</button>
+          <button id="closeButton" type="button" aria-label="닫기">×</button>
+        </div>
+      </div>
+
+      <section class="content-grid">
+        <section class="panel preview-panel">
+          <div class="panel-header">
+            <h1>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="13" rx="1.6"/><path d="M8 21h8M12 18v3"/></svg>
+              미리보기
+            </h1>
+          </div>
+
+          <div class="preview-stage" id="previewStage">
+            <video id="previewVideo" muted playsinline></video>
+            <div id="previewPlaceholder" class="preview-placeholder">
+              <span>RP4</span>
+              <strong>캡처 소스를 선택해 주세요.</strong>
+            </div>
+            <div id="previewMeta" class="preview-meta">1920 x 1080 | 60 FPS | MP4</div>
+            <div id="recordingPill" class="recording-pill hidden">
+              <span></span>
+              <strong id="recordingTimer">00:00:00</strong>
+            </div>
+          </div>
+
+          <div class="transport">
+            <button id="pauseButton" class="transport-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14"/></svg>
+              <span>일시정지</span>
+            </button>
+            <button id="recordButton" class="record-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="6"/></svg>
+              <span>REC</span>
+            </button>
+            <button id="screenshotButton" class="transport-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h2l1.2-2h3.6L15 7h2a3 3 0 0 1 3 3v6.5a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 16.5V10a3 3 0 0 1 3-3z"/><circle cx="12" cy="13" r="3.2"/></svg>
+              <span>스크린샷</span>
+            </button>
+          </div>
+
+          <div class="clip-toolbar">
+            <button id="clipModeButton" class="clip-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5v14l14-7z"/></svg>
+              <span>클립 녹화 모드 시작</span>
+            </button>
+            <button id="clipSaveButton" class="clip-button secondary" type="button" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h11l3 3v11H5z"/><path d="M8 5v5h7V5M8 19v-5h8v5"/></svg>
+              <span>클립 저장</span>
+            </button>
+          </div>
+          <div class="clip-duration-row">
+            <label for="clipDurationInput">클립 길이</label>
+            <div class="clip-duration-control">
+              <input id="clipDurationInput" type="number" min="1" max="7200" step="1" value="300" inputmode="numeric">
+              <div class="clip-duration-stepper" aria-hidden="false">
+                <button id="clipDurationUp" type="button" aria-label="클립 길이 증가"></button>
+                <button id="clipDurationDown" type="button" aria-label="클립 길이 감소"></button>
+              </div>
+            </div>
+            <strong>초</strong>
+          </div>
+        </section>
+
+        <aside class="panel settings-panel">
+          <div class="settings-scroll">
+            <section class="settings-block">
+              <div class="panel-header compact">
+                <h2>캡처 모드</h2>
+              </div>
+              <div id="modeGrid" class="mode-grid">
+                <button class="mode-card active" type="button" data-mode="screen">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="13" rx="1.6"/><path d="M8 21h8M12 18v3"/></svg>
+                  <span>전체 화면</span>
+                </button>
+                <button class="mode-card" type="button" data-mode="monitor">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="11" rx="1.5"/><path d="M8 20h8M12 16v4"/></svg>
+                  <span>특정 모니터</span>
+                </button>
+                <button class="mode-card" type="button" data-mode="window">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="1.6"/><path d="M4 9h16"/></svg>
+                  <span>창 선택</span>
+                </button>
+                <button class="mode-card" type="button" data-mode="area">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h5M14 5h5M5 5v5M19 5v5M5 14v5M5 19h5M14 19h5M19 14v5"/></svg>
+                  <span>영역 녹화</span>
+                </button>
+              </div>
+            </section>
+
+            <section class="settings-block preset-section">
+              <div class="panel-header compact">
+                <h2>녹화 프리셋</h2>
+              </div>
+              <div class="preset-list inline-presets">
+                <button class="preset-card" type="button" data-preset="low">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="11" rx="1.4"/><path d="M9 20h6M12 17v3"/></svg>
+                  <span><strong>저용량 녹화</strong><small>720p · 30 FPS · 4 Mbps</small></span>
+                </button>
+                <button class="preset-card active" type="button" data-preset="normal">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="11" rx="1.4"/><path d="M9 20h6M12 17v3"/></svg>
+                  <span><strong>일반 녹화</strong><small>1080p · 60 FPS · 10 Mbps</small></span>
+                </button>
+                <button class="preset-card" type="button" data-preset="high">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="11" rx="1.4"/><path d="M9 20h6M12 17v3"/></svg>
+                  <span><strong>고화질 녹화</strong><small>1440p · 60 FPS · 24 Mbps</small></span>
+                </button>
+                <button class="preset-card" type="button" data-preset="game">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.5 9h9a4 4 0 0 1 3.8 2.7l1 3.1a3 3 0 0 1-5 3l-1.3-1.4H9l-1.3 1.4a3 3 0 0 1-5-3l1-3.1A4 4 0 0 1 7.5 9z"/><path d="M8 12v3M6.5 13.5h3M15.5 13.2h.1M18 14.8h.1"/></svg>
+                  <span><strong>게임 녹화</strong><small>1080p · 120 FPS · 35 Mbps</small></span>
+                </button>
+              </div>
+
+              <button class="section-toggle popup-trigger" type="button" data-settings-popup="record" aria-haspopup="dialog" aria-controls="settingsModal" aria-expanded="false">
+                <span>녹화 설정</span>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+              </button>
+            </section>
+
+            <section class="settings-block">
+              <button class="section-toggle popup-trigger" type="button" data-settings-popup="hotkeys" aria-haspopup="dialog" aria-controls="settingsModal" aria-expanded="false">
+                <span>단축키</span>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+              </button>
+            </section>
+          </div>
+        </aside>
+
+      </section>
+    </main>
+  </div>
+
+  <div id="sourceModal" class="modal hidden">
+    <div class="modal-card">
+      <div class="panel-header">
+        <h2 id="sourceModalTitle">소스 선택</h2>
+        <button id="closeSourceModal" class="icon-button" type="button" aria-label="닫기">×</button>
+      </div>
+      <div id="sourceGrid" class="source-grid"></div>
+    </div>
+  </div>
+
+  <div id="settingsModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settingsModalTitle">
+    <div class="modal-card settings-modal-card">
+      <div class="panel-header">
+        <h2 id="settingsModalTitle">녹화 설정</h2>
+        <button id="closeSettingsModal" class="icon-button" type="button" aria-label="닫기">×</button>
+      </div>
+      <div class="settings-popup-scroll">
+        <div id="recordSettingsBody" class="section-body settings-popup-body">
+          <div class="field-grid">
+            <label for="formatSelect">저장 형식</label>
+            <select id="formatSelect">
+              <option value="mp4" selected>MP4</option>
+              <option value="webm">WebM</option>
+            </select>
+
+            <label for="resolutionSelect">해상도</label>
+            <select id="resolutionSelect">
+              <option value="1280x720">1280 x 720 (HD)</option>
+              <option value="1600x900">1600 x 900</option>
+              <option value="1920x1080" selected>1920 x 1080 (FHD)</option>
+              <option value="2560x1440">2560 x 1440 (QHD)</option>
+              <option value="3840x2160">3840 x 2160 (4K)</option>
+            </select>
+
+            <label for="fpsSelect">프레임</label>
+            <select id="fpsSelect">
+              <option value="30">30 FPS</option>
+              <option value="48">48 FPS</option>
+              <option value="60" selected>60 FPS</option>
+              <option value="90">90 FPS</option>
+              <option value="120">120 FPS</option>
+            </select>
+
+            <label for="bitrateSelect">비트레이트</label>
+            <select id="bitrateSelect">
+              <option value="4">4 Mbps</option>
+              <option value="6">6 Mbps</option>
+              <option value="10" selected>10 Mbps</option>
+              <option value="16">16 Mbps</option>
+              <option value="24">24 Mbps</option>
+              <option value="35">35 Mbps</option>
+              <option value="50">50 Mbps</option>
+            </select>
+
+            <label for="encoderPresetSelect">인코딩 속도</label>
+            <select id="encoderPresetSelect">
+              <option value="ultrafast">매우 빠름</option>
+              <option value="superfast">빠름</option>
+              <option value="veryfast" selected>균형</option>
+              <option value="faster">고화질 우선</option>
+              <option value="fast">최고화질 우선</option>
+            </select>
+
+            <label for="audioBitrateSelect">오디오 품질</label>
+            <select id="audioBitrateSelect">
+              <option value="128">128 Kbps</option>
+              <option value="160">160 Kbps</option>
+              <option value="192" selected>192 Kbps</option>
+              <option value="256">256 Kbps</option>
+              <option value="320">320 Kbps</option>
+            </select>
+          </div>
+
+          <div class="audio-settings">
+            <div class="audio-row">
+              <span>마이크</span>
+              <label class="switch">
+                <input id="micToggle" type="checkbox" checked>
+                <span></span>
+              </label>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V7a3 3 0 0 0-3-3z"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M9 21h6"/></svg>
+              <input id="micVolume" type="range" min="0" max="100" value="70">
+              <strong id="micVolumeLabel">70%</strong>
+            </div>
+            <div class="audio-row">
+              <span>시스템 오디오</span>
+              <label class="switch">
+                <input id="systemAudioToggle" type="checkbox" checked>
+                <span></span>
+              </label>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9z"/><path d="M17 9.5a4 4 0 0 1 0 5"/></svg>
+              <input id="systemVolume" type="range" min="0" max="100" value="80">
+              <strong id="systemVolumeLabel">80%</strong>
+            </div>
+          </div>
+        </div>
+
+        <div id="hotkeySettingsBody" class="section-body settings-popup-body hidden">
+          <div id="hotkeyGrid" class="hotkey-grid">
+            <span>녹화 시작 / 중지</span>
+            <button class="hotkey-input" type="button" data-hotkey="recordToggle"></button>
+            <span>일시정지 / 재개</span>
+            <button class="hotkey-input" type="button" data-hotkey="pauseToggle"></button>
+            <span>스크린샷</span>
+            <button class="hotkey-input" type="button" data-hotkey="screenshot"></button>
+            <span>클립 모드 시작 / 중지</span>
+            <button class="hotkey-input" type="button" data-hotkey="clipToggle"></button>
+            <span>클립 저장</span>
+            <button class="hotkey-input" type="button" data-hotkey="clipSave"></button>
+          </div>
+          <button id="resetHotkeysButton" class="text-button reset-button" type="button">기본값으로 복원</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="./renderer.js"></script>
+</body>
+</html>

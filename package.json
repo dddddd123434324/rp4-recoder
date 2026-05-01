@@ -1,0 +1,74 @@
+{
+  "name": "rp4-recorder",
+  "version": "0.1.0",
+  "productName": "RP4 Recorder",
+  "description": "RP4 desktop game recorder prototype",
+  "author": "RP4",
+  "license": "MIT",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "set ELECTRON_RUN_AS_NODE=&& electron .",
+    "lint": "node --check src/main.js && node --check src/preload.js && node --check src/renderer.js",
+    "smoke": "set ELECTRON_RUN_AS_NODE=&& set RP4_SMOKE=1&& electron .",
+    "dist": "set CSC_IDENTITY_AUTO_DISCOVERY=false&& set ELECTRON_BUILDER_DISABLE_BUILD_CACHE=true&& electron-builder --win --x64"
+  },
+  "build": {
+    "appId": "com.rp4.recorder",
+    "productName": "RP4 Recorder",
+    "copyright": "Copyright © 2026 RP4",
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/ffmpeg-static/**/*"
+    ],
+    "afterPack": "scripts/after-pack.js",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "icon.ico",
+      "package.json"
+    ],
+    "win": {
+      "icon": "icon.ico",
+      "signAndEditExecutable": false,
+      "signExts": [
+        "!"
+      ],
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "RP4 Recorder"
+    },
+    "portable": {
+      "artifactName": "RP4-Recorder-Portable-${version}.${ext}"
+    }
+  },
+  "devDependencies": {
+    "electron": "^41.4.0",
+    "electron-builder": "^26.8.1",
+    "rcedit": "^5.0.2"
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.3.0"
+  }
+}
