@@ -20,6 +20,7 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9a2 2 0 0 1-2 2h-15z"/><path d="M3.5 6.5v12a2 2 0 0 0 2 2"/></svg>
           <span>녹화 파일</span>
         </button>
+        <button id="chooseFolderButton" class="nav-sub-action" type="button">경로 지정</button>
       </nav>
 
       <div class="ready-card" aria-live="polite">
@@ -29,7 +30,7 @@
           <p id="statusText">녹화 장치를 준비하고 있습니다.</p>
         </div>
       </div>
-      <span class="version">v0.1.0</span>
+      <span class="version">v0.1.1</span>
     </aside>
 
     <main class="main">
@@ -129,26 +130,37 @@
             </section>
 
             <section class="settings-block preset-section">
-              <div class="panel-header compact">
-                <h2>녹화 프리셋</h2>
-              </div>
-              <div class="preset-list inline-presets">
-                <button class="preset-card" type="button" data-preset="low">
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="11" rx="1.4"/><path d="M9 20h6M12 17v3"/></svg>
-                  <span><strong>저용량 녹화</strong><small>720p · 30 FPS · 4 Mbps</small></span>
+              <button class="section-toggle block-toggle" type="button" data-collapse-target="presetBody" aria-expanded="true">
+                <span>녹화 프리셋</span>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+              </button>
+              <div id="presetBody" class="section-body preset-body">
+                <div class="preset-list inline-presets">
+                  <button class="preset-card" type="button" data-preset="low">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="11" rx="1.4"/><path d="M9 20h6M12 17v3"/></svg>
+                    <span><strong>저용량 녹화</strong><small>720p · 30 FPS · 4 Mbps</small></span>
+                  </button>
+                  <button class="preset-card active" type="button" data-preset="normal">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="11" rx="1.4"/><path d="M9 20h6M12 17v3"/></svg>
+                    <span><strong>일반 녹화</strong><small>1080p · 60 FPS · 10 Mbps</small></span>
+                  </button>
+                  <button class="preset-card" type="button" data-preset="high">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="11" rx="1.4"/><path d="M9 20h6M12 17v3"/></svg>
+                    <span><strong>고화질 녹화</strong><small>1440p · 60 FPS · 24 Mbps</small></span>
+                  </button>
+                  <button class="preset-card" type="button" data-preset="game">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.5 9h9a4 4 0 0 1 3.8 2.7l1 3.1a3 3 0 0 1-5 3l-1.3-1.4H9l-1.3 1.4a3 3 0 0 1-5-3l1-3.1A4 4 0 0 1 7.5 9z"/><path d="M8 12v3M6.5 13.5h3M15.5 13.2h.1M18 14.8h.1"/></svg>
+                    <span><strong>게임 녹화</strong><small>1080p · 120 FPS · 35 Mbps</small></span>
+                  </button>
+                </div>
+
+                <button class="section-toggle sub-toggle" type="button" data-collapse-target="customPresetBody" aria-expanded="true">
+                  <span>생성한 녹화 프리셋</span>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
                 </button>
-                <button class="preset-card active" type="button" data-preset="normal">
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="11" rx="1.4"/><path d="M9 20h6M12 17v3"/></svg>
-                  <span><strong>일반 녹화</strong><small>1080p · 60 FPS · 10 Mbps</small></span>
-                </button>
-                <button class="preset-card" type="button" data-preset="high">
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="11" rx="1.4"/><path d="M9 20h6M12 17v3"/></svg>
-                  <span><strong>고화질 녹화</strong><small>1440p · 60 FPS · 24 Mbps</small></span>
-                </button>
-                <button class="preset-card" type="button" data-preset="game">
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.5 9h9a4 4 0 0 1 3.8 2.7l1 3.1a3 3 0 0 1-5 3l-1.3-1.4H9l-1.3 1.4a3 3 0 0 1-5-3l1-3.1A4 4 0 0 1 7.5 9z"/><path d="M8 12v3M6.5 13.5h3M15.5 13.2h.1M18 14.8h.1"/></svg>
-                  <span><strong>게임 녹화</strong><small>1080p · 120 FPS · 35 Mbps</small></span>
-                </button>
+                <div id="customPresetBody" class="section-body custom-preset-body">
+                  <div id="customPresetList" class="preset-list custom-preset-list"></div>
+                </div>
               </div>
 
               <button class="section-toggle popup-trigger" type="button" data-settings-popup="record" aria-haspopup="dialog" aria-controls="settingsModal" aria-expanded="false">
@@ -265,6 +277,7 @@
               <strong id="systemVolumeLabel">80%</strong>
             </div>
           </div>
+          <button id="createPresetButton" class="text-button preset-save-button" type="button">이 설정의 프리셋 생성</button>
         </div>
 
         <div id="hotkeySettingsBody" class="section-body settings-popup-body hidden">

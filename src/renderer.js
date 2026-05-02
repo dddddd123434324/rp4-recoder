@@ -20,6 +20,12 @@ const state = {
   startedAt: 0,
   timerId: null,
   toastTimer: null,
+  appSettings: {
+    selectedPreset: 'normal',
+    customPresets: [],
+    recordingsDir: ''
+  },
+  selectedPreset: 'normal',
   hotkeys: {},
   hotkeyDefaults: {},
   hotkeyRegistrations: {},
@@ -102,8 +108,8 @@ async function init() {
   bindEvents();
 
   state.appInfo = await window.rp4.appInfo();
+  await loadAppSettings();
   await loadHotkeys();
-  setActivePreset('normal');
   updateVolumeLabels();
   updateRecordingUi();
   updateClipUi();
@@ -137,6 +143,8 @@ function cacheElements() {
     clipModeButton: $('#clipModeButton'),
     clipSaveButton: $('#clipSaveButton'),
     modeGrid: $('#modeGrid'),
+    presetBody: $('#presetBody'),
+    customPresetList: $('#customPresetList'),
     formatSelect: $('#formatSelect'),
     resolutionSelect: $('#resolutionSelect'),
     fpsSelect: $('#fpsSelect'),
@@ -152,6 +160,7 @@ function cacheElements() {
     systemVolume: $('#systemVolume'),
     micVolumeLabel: $('#micVolumeLabel'),
     systemVolumeLabel: $('#systemVolumeLabel'),
+    createPresetButton: $('#createPresetButton'),
     hotkeyGrid: $('#hotkeyGrid'),
     resetHotkeysButton: $('#resetHotkeysButton'),
     sourceModal: $('#sourceModal'),
@@ -164,6 +173,7 @@ function cacheElements() {
     recordingList: $('#recordingList'),
     refreshFilesButton: $('#refreshFilesButton'),
     openFolderButton: $('#openFolderButton'),
+    chooseFolderButton: $('#chooseFolderButton'),
     toast: $('#toast'),
     minimizeButton: $('#minimizeButton'),
     maximizeButton: $('#maximizeButton'),
@@ -179,6 +189,8 @@ function bindEvents() {
   els.clipSaveButton.addEventListener('click', saveClip);
   els.refreshFilesButton?.addEventListener('click', renderRecordings);
   els.openFolderButton?.addEventListener('click', () => window.rp4.openRecordingsFolder());
+  els.chooseFolderButton?.addEventListener('click', chooseRecordingsFolder);
+  els.createPresetButton?.addEventListener('click', createCustomPreset);
 
   els.resetHotkeysButton.addEventListener('click', resetHotkeys);
   els.hotkeyGrid.addEventListener('click', (event) => {
@@ -223,9 +235,7 @@ function bindEvents() {
     els.audioBitrateSelect
   ].forEach((element) => {
     element.addEventListener('change', async () => {
-      setActivePreset(null);
-      updatePreviewMeta();
-      pruneClipChunks();
+      markProfileChanged();
       if (!state.isRecording && !state.clipStream && state.selectedSource) {
         await startPreview();
       }
@@ -233,7 +243,7 @@ function bindEvents() {
   });
 
   els.clipDurationInput.addEventListener('input', () => {
-    pruneClipChunks();
+    markProfileChanged();
     updateClipUi();
   });
   els.clipDurationInput.addEventListener('blur', () => {
@@ -242,14 +252,18 @@ function bindEvents() {
   els.clipDurationUp.addEventListener('click', () => stepClipDuration(1));
   els.clipDurationDown.addEventListener('click', () => stepClipDuration(-1));
 
-  els.micVolume.addEventListener('input', updateVolumeLabels);
-  els.systemVolume.addEventListener('input', updateVolumeLabels);
-
-  $$('.preset-card').forEach((button) => {
-    button.addEventListener('click', async () => {
-      await applyPreset(button.dataset.preset);
-    });
+  els.micToggle.addEventListener('change', markProfileChanged);
+  els.systemAudioToggle.addEventListener('change', markProfileChanged);
+  els.micVolume.addEventListener('input', () => {
+    markProfileChanged({ updatePreview: false });
+    updateVolumeLabels();
   });
+  els.systemVolume.addEventListener('input', () => {
+    markProfileChanged({ updatePreview: false });
+    updateVolumeLabels();
+  });
+
+  els.presetBody?.addEventListener('click', handlePresetClick);
 
   $$('.section-toggle').forEach((button) => {
     button.addEventListener('click', () => {
@@ -282,6 +296,58 @@ function bindEvents() {
   els.minimizeButton.addEventListener('click', () => window.rp4.window.minimize());
   els.maximizeButton.addEventListener('click', () => window.rp4.window.maximizeToggle());
   els.closeButton.addEventListener('click', () => window.rp4.window.close());
+}
+
+async function loadAppSettings() {
+  try {
+    const settings = await window.rp4.getAppSettings();
+    applyAppSettings(settings);
+    await applyPreset(state.appSettings.selectedPreset || 'normal', { persist: false });
+  } catch (error) {
+    console.error(error);
+    setActivePreset('normal');
+    showToast('앱 설정을 불러오지 못했습니다.');
+  }
+}
+
+function applyAppSettings(settings = {}) {
+  state.appSettings = {
+    selectedPreset: settings.selectedPreset || 'normal',
+    customPresets: Array.isArray(settings.customPresets) ? settings.customPresets : [],
+    recordingsDir: settings.recordingsDir || state.appInfo?.recordingsDir || ''
+  };
+  state.selectedPreset = state.appSettings.selectedPreset;
+  renderCustomPresets();
+  updateRecordingFolderUi();
+}
+
+function updateRecordingFolderUi() {
+  if (!els.chooseFolderButton) return;
+  const recordingsDir = state.appSettings.recordingsDir || state.appInfo?.recordingsDir || '';
+  els.chooseFolderButton.title = recordingsDir ? `현재 경로: ${recordingsDir}` : '녹화 파일 저장 경로 지정';
+}
+
+async function chooseRecordingsFolder() {
+  if (state.isRecording || state.clipStream) {
+    showToast('녹화 중에는 저장 경로를 바꿀 수 없습니다.');
+    return;
+  }
+
+  try {
+    const result = await window.rp4.chooseRecordingsFolder();
+    if (result?.canceled) return;
+
+    state.appSettings.recordingsDir = result.recordingsDir;
+    if (state.appInfo) {
+      state.appInfo.recordingsDir = result.recordingsDir;
+    }
+    updateRecordingFolderUi();
+    await renderRecordings();
+    showToast(`저장 경로를 변경했습니다: ${result.recordingsDir}`);
+  } catch (error) {
+    console.error(error);
+    showToast('저장 경로를 변경하지 못했습니다.');
+  }
 }
 
 async function loadHotkeys() {
@@ -579,7 +645,7 @@ function stepClipDuration(direction) {
   const current = getProfile().clipDurationSeconds;
   const next = clamp(current + direction, 1, 7200);
   els.clipDurationInput.value = String(next);
-  pruneClipChunks();
+  markProfileChanged();
   updateClipUi();
 }
 
@@ -1613,33 +1679,250 @@ function createRecordingItem(recording) {
   return item;
 }
 
-async function applyPreset(key) {
+async function applyPreset(key, { persist = true } = {}) {
   if (state.isRecording || state.clipStream) {
     showToast('녹화 중에는 프리셋을 바꿀 수 없습니다.');
     return;
   }
 
-  const preset = presets[key];
+  const preset = getPresetByKey(key);
   if (!preset) return;
 
-  els.formatSelect.value = preset.format;
-  els.resolutionSelect.value = preset.resolution;
-  els.fpsSelect.value = preset.fps;
-  els.bitrateSelect.value = preset.bitrate;
-  els.encoderPresetSelect.value = preset.encoderPreset;
-  els.audioBitrateSelect.value = preset.audioBitrate;
+  applyProfileToForm(preset.profile || preset);
   setActivePreset(key);
   updatePreviewMeta();
+  updateVolumeLabels();
+  pruneClipChunks();
+
+  if (persist) {
+    saveSelectedPreset(key);
+  }
 
   if (state.selectedSource) {
     await startPreview();
   }
 }
 
+function getPresetByKey(key) {
+  if (presets[key]) return presets[key];
+  const customId = String(key || '').startsWith('custom:') ? String(key).slice(7) : null;
+  if (!customId) return null;
+  return state.appSettings.customPresets.find((preset) => preset.id === customId) || null;
+}
+
+function applyProfileToForm(profile = {}) {
+  setSelectValue(els.formatSelect, profile.format);
+  setSelectValue(els.resolutionSelect, profile.resolution);
+  setSelectValue(els.fpsSelect, profile.fps);
+  setSelectValue(els.bitrateSelect, profile.bitrate);
+  setSelectValue(els.encoderPresetSelect, profile.encoderPreset);
+  setSelectValue(els.audioBitrateSelect, profile.audioBitrate);
+
+  if (typeof profile.micEnabled === 'boolean') {
+    els.micToggle.checked = profile.micEnabled;
+  }
+  if (typeof profile.systemAudioEnabled === 'boolean') {
+    els.systemAudioToggle.checked = profile.systemAudioEnabled;
+  }
+  if (Number.isFinite(Number(profile.micVolume))) {
+    els.micVolume.value = String(clamp(Number(profile.micVolume), 0, 100));
+  }
+  if (Number.isFinite(Number(profile.systemVolume))) {
+    els.systemVolume.value = String(clamp(Number(profile.systemVolume), 0, 100));
+  }
+  if (Number.isFinite(Number(profile.clipDurationSeconds))) {
+    els.clipDurationInput.value = String(clamp(Number(profile.clipDurationSeconds), 1, 7200));
+  }
+}
+
+function setSelectValue(select, value) {
+  if (!select || value == null) return;
+  const next = String(value);
+  if ([...select.options].some((option) => option.value === next)) {
+    select.value = next;
+  }
+}
+
 function setActivePreset(key) {
+  state.selectedPreset = key || null;
   $$('.preset-card').forEach((button) => {
-    button.classList.toggle('active', button.dataset.preset === key);
+    const cardKey = button.dataset.presetKey || button.dataset.preset;
+    button.classList.toggle('active', cardKey === key);
   });
+}
+
+function markProfileChanged({ updatePreview = true } = {}) {
+  setActivePreset(null);
+  if (updatePreview) {
+    updatePreviewMeta();
+  }
+  pruneClipChunks();
+}
+
+async function saveSelectedPreset(key) {
+  try {
+    const settings = await window.rp4.setSelectedPreset(key);
+    applyAppSettings(settings);
+    setActivePreset(key);
+  } catch (error) {
+    console.error(error);
+    showToast('선택한 프리셋을 저장하지 못했습니다.');
+  }
+}
+
+function getPresetProfile() {
+  const profile = getProfile();
+  return {
+    format: profile.format,
+    resolution: `${profile.width}x${profile.height}`,
+    fps: String(profile.fps),
+    bitrate: String(profile.bitrateMbps),
+    encoderPreset: profile.encoderPreset,
+    audioBitrate: String(profile.audioBitrateKbps),
+    micEnabled: els.micToggle.checked,
+    systemAudioEnabled: els.systemAudioToggle.checked,
+    micVolume: Number(els.micVolume.value),
+    systemVolume: Number(els.systemVolume.value),
+    clipDurationSeconds: profile.clipDurationSeconds
+  };
+}
+
+async function createCustomPreset() {
+  const name = window.prompt('새 프리셋 이름을 입력해 주세요.', makeDefaultPresetName());
+  if (!name) return;
+
+  try {
+    const settings = await window.rp4.saveCustomPreset({
+      name,
+      profile: getPresetProfile()
+    });
+    applyAppSettings(settings);
+    await applyPreset(settings.selectedPreset, { persist: false });
+    showToast('프리셋을 생성했습니다.');
+  } catch (error) {
+    console.error(error);
+    showToast('프리셋을 저장하지 못했습니다.');
+  }
+}
+
+function makeDefaultPresetName() {
+  return `사용자 프리셋 ${state.appSettings.customPresets.length + 1}`;
+}
+
+async function handlePresetClick(event) {
+  const editButton = event.target.closest('[data-preset-edit]');
+  if (editButton) {
+    await updateCustomPreset(editButton.dataset.presetEdit);
+    return;
+  }
+
+  const deleteButton = event.target.closest('[data-preset-delete]');
+  if (deleteButton) {
+    await deleteCustomPreset(deleteButton.dataset.presetDelete);
+    return;
+  }
+
+  const card = event.target.closest('.preset-card');
+  if (!card || !els.presetBody.contains(card)) return;
+  await applyPreset(card.dataset.presetKey || card.dataset.preset);
+}
+
+async function updateCustomPreset(id) {
+  const preset = state.appSettings.customPresets.find((item) => item.id === id);
+  if (!preset) return;
+
+  const name = window.prompt('프리셋 이름을 입력해 주세요. 현재 녹화 설정으로 덮어씁니다.', preset.name);
+  if (!name) return;
+
+  try {
+    const settings = await window.rp4.saveCustomPreset({
+      id,
+      name,
+      profile: getPresetProfile()
+    });
+    applyAppSettings(settings);
+    await applyPreset(`custom:${id}`, { persist: false });
+    showToast('프리셋을 수정했습니다.');
+  } catch (error) {
+    console.error(error);
+    showToast('프리셋을 수정하지 못했습니다.');
+  }
+}
+
+async function deleteCustomPreset(id) {
+  const preset = state.appSettings.customPresets.find((item) => item.id === id);
+  if (!preset) return;
+  if (!window.confirm(`"${preset.name}" 프리셋을 삭제할까요?`)) return;
+
+  try {
+    const settings = await window.rp4.deleteCustomPreset(id);
+    applyAppSettings(settings);
+    if (settings.selectedPreset) {
+      await applyPreset(settings.selectedPreset, { persist: false });
+    }
+    showToast('프리셋을 삭제했습니다.');
+  } catch (error) {
+    console.error(error);
+    showToast('프리셋을 삭제하지 못했습니다.');
+  }
+}
+
+function renderCustomPresets() {
+  if (!els.customPresetList) return;
+  els.customPresetList.replaceChildren();
+
+  if (!state.appSettings.customPresets.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-state compact';
+    empty.textContent = '생성한 프리셋이 없습니다.';
+    els.customPresetList.append(empty);
+    return;
+  }
+
+  for (const preset of state.appSettings.customPresets) {
+    els.customPresetList.append(createCustomPresetItem(preset));
+  }
+}
+
+function createCustomPresetItem(preset) {
+  const row = document.createElement('div');
+  row.className = 'custom-preset-row';
+
+  const card = document.createElement('button');
+  card.className = 'preset-card';
+  card.type = 'button';
+  card.dataset.presetKey = `custom:${preset.id}`;
+  card.innerHTML = icons.video;
+
+  const text = document.createElement('span');
+  const title = document.createElement('strong');
+  title.textContent = preset.name;
+  const summary = document.createElement('small');
+  summary.textContent = formatPresetSummary(preset.profile);
+  text.append(title, summary);
+  card.append(text);
+
+  const actions = document.createElement('div');
+  actions.className = 'custom-preset-actions';
+  const edit = document.createElement('button');
+  edit.type = 'button';
+  edit.textContent = '수정';
+  edit.dataset.presetEdit = preset.id;
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.textContent = '삭제';
+  remove.dataset.presetDelete = preset.id;
+  actions.append(edit, remove);
+
+  row.append(card, actions);
+  return row;
+}
+
+function formatPresetSummary(profile = {}) {
+  const resolution = String(profile.resolution || '1920x1080');
+  const [, height] = resolution.split('x');
+  const label = height ? `${height}p` : resolution;
+  return `${label} · ${profile.fps || 60} FPS · ${profile.bitrate || 10} Mbps`;
 }
 
 function setActiveMode(mode) {

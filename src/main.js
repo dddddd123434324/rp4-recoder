@@ -1,4 +1,4 @@
-const { app, BrowserWindow, desktopCapturer, globalShortcut, ipcMain, screen, session, shell } = require('electron/main');
+const { app, BrowserWindow, desktopCapturer, dialog, globalShortcut, ipcMain, screen, session, shell } = require('electron/main');
 const { execFile, spawn } = require('node:child_process');
 const fs = require('node:fs/promises');
 const path = require('node:path');
@@ -10,9 +10,10 @@ const ICON_PATH = path.join(APP_ROOT, 'icon.ico');
 const RP4_ROOT = path.resolve('D:\\RP4');
 const CONFIG_DIR = path.join(RP4_ROOT, 'config');
 const SETTINGS_FILE = path.join(CONFIG_DIR, 'rp4-recorder-settings.json');
-const RECORDINGS_DIR = path.join(RP4_ROOT, 'recordings');
-const TEMP_RECORDINGS_DIR = path.join(RECORDINGS_DIR, '.temp');
-const SCREENSHOTS_DIR = path.join(RECORDINGS_DIR, 'screenshots');
+const DEFAULT_RECORDINGS_DIR = path.join(RP4_ROOT, 'recordings');
+const DEFAULT_SELECTED_PRESET = 'normal';
+const BUILTIN_PRESET_KEYS = new Set(['low', 'normal', 'high', 'game']);
+const MAX_CUSTOM_PRESETS = 48;
 const IS_SMOKE = process.env.RP4_SMOKE === '1';
 
 const recordingSessions = new Map();
@@ -29,7 +30,10 @@ const HOTKEY_ACTIONS = Object.keys(DEFAULT_HOTKEYS);
 let mainWindow = null;
 let areaSelectionWindow = null;
 let appSettings = {
-  hotkeys: { ...DEFAULT_HOTKEYS }
+  hotkeys: { ...DEFAULT_HOTKEYS },
+  selectedPreset: DEFAULT_SELECTED_PRESET,
+  customPresets: [],
+  recordingsDir: DEFAULT_RECORDINGS_DIR
 };
 let hotkeyRegistrations = {};
 
@@ -66,9 +70,9 @@ function createWindow() {
 
 async function ensureFolders() {
   await fs.mkdir(CONFIG_DIR, { recursive: true });
-  await fs.mkdir(RECORDINGS_DIR, { recursive: true });
-  await fs.mkdir(TEMP_RECORDINGS_DIR, { recursive: true });
-  await fs.mkdir(SCREENSHOTS_DIR, { recursive: true });
+  await fs.mkdir(getRecordingsDir(), { recursive: true });
+  await fs.mkdir(getTempRecordingsDir(), { recursive: true });
+  await fs.mkdir(getScreenshotsDir(), { recursive: true });
 }
 
 function mergeSettings(value = {}) {
@@ -81,7 +85,98 @@ function mergeSettings(value = {}) {
       : DEFAULT_HOTKEYS[action];
   }
 
-  return { hotkeys };
+  const customPresets = normalizeCustomPresets(value.customPresets);
+  return {
+    hotkeys,
+    selectedPreset: normalizeSelectedPreset(value.selectedPreset, customPresets),
+    customPresets,
+    recordingsDir: normalizeRecordingsDir(value.recordingsDir)
+  };
+}
+
+function getRecordingsDir() {
+  return appSettings.recordingsDir || DEFAULT_RECORDINGS_DIR;
+}
+
+function getTempRecordingsDir() {
+  return path.join(getRecordingsDir(), '.temp');
+}
+
+function getScreenshotsDir() {
+  return path.join(getRecordingsDir(), 'screenshots');
+}
+
+function normalizeRecordingsDir(value) {
+  if (typeof value !== 'string' || !value.trim()) {
+    return DEFAULT_RECORDINGS_DIR;
+  }
+  return path.resolve(value.trim());
+}
+
+function normalizeSelectedPreset(value, customPresets = []) {
+  const key = typeof value === 'string' ? value : DEFAULT_SELECTED_PRESET;
+  if (BUILTIN_PRESET_KEYS.has(key)) return key;
+
+  const customId = key.startsWith('custom:') ? key.slice(7) : null;
+  if (customId && customPresets.some((preset) => preset.id === customId)) {
+    return key;
+  }
+
+  return DEFAULT_SELECTED_PRESET;
+}
+
+function normalizeCustomPresets(value) {
+  if (!Array.isArray(value)) return [];
+
+  const seen = new Set();
+  return value
+    .slice(0, MAX_CUSTOM_PRESETS)
+    .map((item, index) => {
+      const source = item && typeof item === 'object' ? item : {};
+      const rawId = typeof source.id === 'string' && source.id.trim()
+        ? source.id.trim()
+        : crypto.randomUUID();
+      const id = seen.has(rawId) ? crypto.randomUUID() : rawId;
+      seen.add(id);
+
+      return {
+        id,
+        name: sanitizePresetName(source.name || `사용자 프리셋 ${index + 1}`),
+        profile: normalizePresetProfile(source.profile || source)
+      };
+    });
+}
+
+function sanitizePresetName(value) {
+  return String(value || '사용자 프리셋')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 40) || '사용자 프리셋';
+}
+
+function normalizePresetProfile(value = {}) {
+  const profile = value && typeof value === 'object' ? value : {};
+  const format = ['mp4', 'webm'].includes(profile.format) ? profile.format : 'mp4';
+  const resolution = /^\d{3,5}x\d{3,5}$/.test(String(profile.resolution || ''))
+    ? String(profile.resolution)
+    : '1920x1080';
+  const encoderPreset = normalizeEncoderPreset(profile.encoderPreset);
+  const micVolume = Number(profile.micVolume);
+  const systemVolume = Number(profile.systemVolume);
+
+  return {
+    format,
+    resolution,
+    fps: String(clampNumber(Number(profile.fps) || 60, 1, 240)),
+    bitrate: String(clampNumber(Number(profile.bitrate) || 10, 1, 300)),
+    encoderPreset,
+    audioBitrate: String(clampNumber(Number(profile.audioBitrate) || 192, 64, 320)),
+    micEnabled: profile.micEnabled !== false,
+    systemAudioEnabled: profile.systemAudioEnabled !== false,
+    micVolume: clampNumber(Number.isFinite(micVolume) ? micVolume : 70, 0, 100),
+    systemVolume: clampNumber(Number.isFinite(systemVolume) ? systemVolume : 80, 0, 100),
+    clipDurationSeconds: clampNumber(Number(profile.clipDurationSeconds) || 300, 1, 7200)
+  };
 }
 
 async function loadSettings() {
@@ -784,10 +879,11 @@ ipcMain.handle('window:client-crop', async (_event, sourceId) => getWindowClient
 
 ipcMain.handle('recordings:list', async () => {
   await ensureFolders();
-  const entries = await fs.readdir(RECORDINGS_DIR, { withFileTypes: true });
+  const recordingsDir = getRecordingsDir();
+  const entries = await fs.readdir(recordingsDir, { withFileTypes: true });
   const files = entries
     .filter((entry) => entry.isFile() && /\.(webm|mp4|mkv)$/i.test(entry.name))
-    .map((entry) => path.join(RECORDINGS_DIR, entry.name));
+    .map((entry) => path.join(recordingsDir, entry.name));
 
   const recordings = await Promise.all(files.map(async (filePath) => {
     const stats = await statFile(filePath);
@@ -799,11 +895,13 @@ ipcMain.handle('recordings:list', async () => {
 
 ipcMain.handle('recording:start', async (_event, meta = {}) => {
   await ensureFolders();
+  const recordingsDir = getRecordingsDir();
+  const tempRecordingsDir = getTempRecordingsDir();
   const baseName = formatRecordingBaseName(meta);
   const format = normalizeRecordingFormat(meta.format);
   const fileName = `${baseName}.${format}`;
-  const filePath = path.join(RECORDINGS_DIR, fileName);
-  const tempPath = path.join(TEMP_RECORDINGS_DIR, `${baseName}.webm`);
+  const filePath = path.join(recordingsDir, fileName);
+  const tempPath = path.join(tempRecordingsDir, `${baseName}.webm`);
   const handle = await fs.open(tempPath, 'w');
   const sessionId = crypto.randomUUID();
 
@@ -870,6 +968,8 @@ ipcMain.handle('recording:stop', async (_event, payload = {}) => {
 
 ipcMain.handle('clip:save', async (_event, payload = {}) => {
   await ensureFolders();
+  const recordingsDir = getRecordingsDir();
+  const tempRecordingsDir = getTempRecordingsDir();
 
   const meta = payload.meta && typeof payload.meta === 'object' ? payload.meta : {};
   if (Array.isArray(payload.segments)) {
@@ -895,10 +995,10 @@ ipcMain.handle('clip:save', async (_event, payload = {}) => {
       ...meta,
       modeLabel: meta.modeLabel || '클립'
     })}_${crypto.randomUUID().slice(0, 8)}`;
-    const targetPath = path.join(RECORDINGS_DIR, `${baseName}.${format}`);
-    const segmentDir = path.join(TEMP_RECORDINGS_DIR, `${baseName}_segments`);
+    const targetPath = path.join(recordingsDir, `${baseName}.${format}`);
+    const segmentDir = path.join(tempRecordingsDir, `${baseName}_segments`);
     const listPath = path.join(segmentDir, 'segments.txt');
-    const fallbackPath = path.join(RECORDINGS_DIR, `${baseName}_fallback.webm`);
+    const fallbackPath = path.join(recordingsDir, `${baseName}_fallback.webm`);
     await fs.rm(segmentDir, { recursive: true, force: true });
     await fs.mkdir(segmentDir, { recursive: true });
 
@@ -972,8 +1072,8 @@ ipcMain.handle('clip:save', async (_event, payload = {}) => {
     modeLabel: meta.modeLabel || '클립'
   })}_${crypto.randomUUID().slice(0, 8)}`;
   const fileName = `${baseName}.${format}`;
-  const filePath = path.join(RECORDINGS_DIR, fileName);
-  const tempPath = path.join(TEMP_RECORDINGS_DIR, `${baseName}.webm`);
+  const filePath = path.join(recordingsDir, fileName);
+  const tempPath = path.join(tempRecordingsDir, `${baseName}.webm`);
   await fs.writeFile(tempPath, buffer);
 
   const tempStats = await statFile(tempPath);
@@ -1011,15 +1111,43 @@ ipcMain.handle('clip:save', async (_event, payload = {}) => {
 ipcMain.handle('screenshot:save', async (_event, payload = {}) => {
   await ensureFolders();
   const fileName = `${timestamp()}_screenshot.png`;
-  const filePath = path.join(SCREENSHOTS_DIR, fileName);
+  const filePath = path.join(getScreenshotsDir(), fileName);
   await fs.writeFile(filePath, Buffer.from(payload.buffer));
   return { filePath, fileName };
 });
 
 ipcMain.handle('folder:open-recordings', async () => {
   await ensureFolders();
-  await shell.openPath(RECORDINGS_DIR);
-  return RECORDINGS_DIR;
+  const recordingsDir = getRecordingsDir();
+  await shell.openPath(recordingsDir);
+  return recordingsDir;
+});
+
+ipcMain.handle('folder:choose-recordings', async (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const result = await dialog.showOpenDialog(win, {
+    title: '녹화 파일 저장 경로 선택',
+    defaultPath: getRecordingsDir(),
+    properties: ['openDirectory', 'createDirectory']
+  });
+
+  if (result.canceled || !result.filePaths[0]) {
+    return {
+      canceled: true,
+      recordingsDir: getRecordingsDir()
+    };
+  }
+
+  appSettings = mergeSettings({
+    ...appSettings,
+    recordingsDir: result.filePaths[0]
+  });
+  await saveSettings();
+
+  return {
+    canceled: false,
+    recordingsDir: getRecordingsDir()
+  };
 });
 
 ipcMain.handle('file:show', async (_event, filePath) => {
@@ -1032,10 +1160,77 @@ ipcMain.handle('app:info', async () => ({
   appRoot: APP_ROOT,
   rp4Root: RP4_ROOT,
   settingsFile: SETTINGS_FILE,
-  recordingsDir: RECORDINGS_DIR,
+  recordingsDir: getRecordingsDir(),
   version: app.getVersion(),
   isSmoke: IS_SMOKE
 }));
+
+function settingsDto() {
+  return {
+    selectedPreset: appSettings.selectedPreset,
+    customPresets: appSettings.customPresets.map((preset) => ({
+      id: preset.id,
+      name: preset.name,
+      profile: { ...preset.profile }
+    })),
+    recordingsDir: getRecordingsDir(),
+    defaultRecordingsDir: DEFAULT_RECORDINGS_DIR,
+    settingsFile: SETTINGS_FILE
+  };
+}
+
+ipcMain.handle('settings:get', async () => settingsDto());
+
+ipcMain.handle('settings:selected-preset', async (_event, key) => {
+  appSettings = mergeSettings({
+    ...appSettings,
+    selectedPreset: key
+  });
+  await saveSettings();
+  return settingsDto();
+});
+
+ipcMain.handle('settings:custom-preset:save', async (_event, payload = {}) => {
+  const id = typeof payload.id === 'string' && payload.id.trim()
+    ? payload.id.trim()
+    : crypto.randomUUID();
+  const nextPreset = {
+    id,
+    name: sanitizePresetName(payload.name),
+    profile: normalizePresetProfile(payload.profile)
+  };
+  const customPresets = [...appSettings.customPresets];
+  const index = customPresets.findIndex((preset) => preset.id === id);
+
+  if (index >= 0) {
+    customPresets[index] = nextPreset;
+  } else {
+    customPresets.unshift(nextPreset);
+  }
+
+  appSettings = mergeSettings({
+    ...appSettings,
+    selectedPreset: `custom:${id}`,
+    customPresets: customPresets.slice(0, MAX_CUSTOM_PRESETS)
+  });
+  await saveSettings();
+  return settingsDto();
+});
+
+ipcMain.handle('settings:custom-preset:delete', async (_event, id) => {
+  const targetId = String(id || '');
+  const selectedPreset = appSettings.selectedPreset === `custom:${targetId}`
+    ? DEFAULT_SELECTED_PRESET
+    : appSettings.selectedPreset;
+
+  appSettings = mergeSettings({
+    ...appSettings,
+    selectedPreset,
+    customPresets: appSettings.customPresets.filter((preset) => preset.id !== targetId)
+  });
+  await saveSettings();
+  return settingsDto();
+});
 
 ipcMain.handle('hotkeys:get', async () => ({
   hotkeys: { ...appSettings.hotkeys },
@@ -1044,7 +1239,7 @@ ipcMain.handle('hotkeys:get', async () => ({
 }));
 
 ipcMain.handle('hotkeys:set', async (_event, hotkeys = {}) => {
-  appSettings = mergeSettings({ hotkeys });
+  appSettings = mergeSettings({ ...appSettings, hotkeys });
   await saveSettings();
   registerHotkeys();
   return {
@@ -1055,7 +1250,7 @@ ipcMain.handle('hotkeys:set', async (_event, hotkeys = {}) => {
 });
 
 ipcMain.handle('hotkeys:reset', async () => {
-  appSettings = mergeSettings({ hotkeys: DEFAULT_HOTKEYS });
+  appSettings = mergeSettings({ ...appSettings, hotkeys: DEFAULT_HOTKEYS });
   await saveSettings();
   registerHotkeys();
   return {
@@ -1085,8 +1280,9 @@ ipcMain.handle('window:close', (event) => {
 });
 
 app.whenReady().then(async () => {
-  await ensureFolders();
+  await fs.mkdir(CONFIG_DIR, { recursive: true });
   await loadSettings();
+  await ensureFolders();
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
     callback(['media', 'display-capture'].includes(permission));
   });

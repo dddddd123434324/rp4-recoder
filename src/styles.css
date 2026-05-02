@@ -162,6 +162,25 @@ svg {
   background: var(--accent);
 }
 
+.nav-sub-action {
+  justify-self: stretch;
+  min-height: 30px;
+  margin: -2px 18px 2px 60px;
+  border: 1px solid #2d323a;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+  color: #cdd3dc;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.nav-sub-action:hover {
+  border-color: rgba(255, 45, 10, 0.68);
+  color: #fff;
+  background: rgba(255, 45, 10, 0.1);
+}
+
 .ready-card {
   margin-top: auto;
   display: grid;
@@ -806,6 +825,10 @@ svg {
   overflow: visible;
 }
 
+.preset-body {
+  padding-top: 10px;
+}
+
 .preset-card {
   display: grid;
   grid-template-columns: 28px minmax(0, 1fr);
@@ -854,6 +877,55 @@ svg {
   font-size: 11px;
 }
 
+.sub-toggle {
+  min-height: 34px;
+  margin-top: 10px;
+  color: #cfd5dd;
+  font-size: 13px;
+}
+
+.custom-preset-body {
+  padding-top: 8px;
+}
+
+.custom-preset-list {
+  gap: 7px;
+}
+
+.custom-preset-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: 7px;
+}
+
+.custom-preset-actions {
+  display: grid;
+  grid-template-columns: repeat(2, 34px);
+  gap: 5px;
+}
+
+.custom-preset-actions button {
+  min-width: 0;
+  border: 1px solid #30343c;
+  border-radius: 8px;
+  background: #14171b;
+  color: #cbd1da;
+  font-size: 11px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.custom-preset-actions button:hover {
+  border-color: rgba(255, 45, 10, 0.7);
+  color: #fff;
+}
+
+.empty-state.compact {
+  min-height: 56px;
+  font-size: 12px;
+}
+
 .section-toggle {
   width: 100%;
   display: flex;
@@ -876,6 +948,12 @@ svg {
   width: 18px;
   height: 18px;
   transition: transform 160ms ease;
+}
+
+.block-toggle {
+  min-height: 34px;
+  margin-top: 0;
+  border-top: 0;
 }
 
 .popup-trigger svg {
@@ -1066,6 +1144,11 @@ svg {
 
 .reset-button {
   margin-top: 12px;
+}
+
+.preset-save-button {
+  width: 100%;
+  margin-top: 14px;
 }
 
 .recording-list {
