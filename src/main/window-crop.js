@@ -1,0 +1,291 @@
+'use strict';
+
+const { spawn } = require('node:child_process');
+const fs = require('node:fs/promises');
+const path = require('node:path');
+const readline = require('node:readline');
+
+const paths = require('./paths');
+
+/*
+ * Window capture includes the DWM frame and drop shadow, so the client rectangle has to
+ * be queried from Win32 in order to crop it away.
+ *
+ * The previous implementation spawned powershell.exe and recompiled a C# type on *every*
+ * call - which meant every preview restart (including changing the bitrate dropdown) paid
+ * a multi-second cost against an 8s timeout, and the result was cached for the lifetime of
+ * the stream so moving the captured window left the crop stale.
+ *
+ * This version keeps one PowerShell host alive, compiles the helper once, and answers
+ * subsequent queries over stdin/stdout in well under a millisecond. That makes it cheap
+ * enough to re-poll continuously while recording.
+ */
+
+const HOST_SCRIPT_NAME = 'rp4-window-crop-host.ps1';
+const READY_TOKEN = 'RP4:READY';
+const RESPONSE_PREFIX = 'RP4:';
+const READY_TIMEOUT_MS = 20000;
+const REQUEST_TIMEOUT_MS = 4000;
+
+const HOST_SCRIPT = `
+$ErrorActionPreference = 'Stop'
+$OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+$code = @'
+using System;
+using System.Globalization;
+using System.Runtime.InteropServices;
+
+public static class Rp4WindowCrop
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int X; public int Y; }
+
+    [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
+    [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    [DllImport("user32.dll")] private static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
+    [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out RECT pvAttribute, int cbAttribute);
+    [DllImport("user32.dll")] private static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
+
+    private const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+
+    public static void Init()
+    {
+        // Per-monitor-v2 so the coordinates we read are not DPI virtualized.
+        try { SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch { }
+    }
+
+    private static string Escape(int value)
+    {
+        return value.ToString(CultureInfo.InvariantCulture);
+    }
+
+    public static string Query(string id, long hwndValue)
+    {
+        try
+        {
+            IntPtr hWnd = new IntPtr(hwndValue);
+            if (!IsWindow(hWnd) || IsIconic(hWnd)) return "RP4:" + id + ":null";
+
+            RECT frame;
+            int hr = DwmGetWindowAttribute(hWnd, DWMWA_EXTENDED_FRAME_BOUNDS, out frame, Marshal.SizeOf(typeof(RECT)));
+            if (hr != 0 && !GetWindowRect(hWnd, out frame)) return "RP4:" + id + ":null";
+
+            RECT client;
+            if (!GetClientRect(hWnd, out client)) return "RP4:" + id + ":null";
+
+            POINT topLeft = new POINT(); topLeft.X = client.Left; topLeft.Y = client.Top;
+            POINT bottomRight = new POINT(); bottomRight.X = client.Right; bottomRight.Y = client.Bottom;
+            if (!ClientToScreen(hWnd, ref topLeft) || !ClientToScreen(hWnd, ref bottomRight))
+            {
+                return "RP4:" + id + ":null";
+            }
+
+            int frameWidth = Math.Max(1, frame.Right - frame.Left);
+            int frameHeight = Math.Max(1, frame.Bottom - frame.Top);
+            int x = Math.Max(0, topLeft.X - frame.Left);
+            int y = Math.Max(0, topLeft.Y - frame.Top);
+            int width = Math.Max(1, bottomRight.X - topLeft.X);
+            int height = Math.Max(1, bottomRight.Y - topLeft.Y);
+
+            if (x + width > frameWidth) width = Math.Max(1, frameWidth - x);
+            if (y + height > frameHeight) height = Math.Max(1, frameHeight - y);
+
+            return "RP4:" + id + ":{\\"x\\":" + Escape(x)
+                + ",\\"y\\":" + Escape(y)
+                + ",\\"width\\":" + Escape(width)
+                + ",\\"height\\":" + Escape(height)
+                + ",\\"frameWidth\\":" + Escape(frameWidth)
+                + ",\\"frameHeight\\":" + Escape(frameHeight) + "}";
+        }
+        catch
+        {
+            return "RP4:" + id + ":null";
+        }
+    }
+}
+'@
+
+Add-Type -TypeDefinition $code
+[Rp4WindowCrop]::Init()
+[Console]::Out.WriteLine('${READY_TOKEN}')
+[Console]::Out.Flush()
+
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    $line = $line.Trim()
+    if ($line.Length -eq 0) { continue }
+    if ($line -eq 'quit') { break }
+
+    $parts = $line.Split(' ')
+    if ($parts.Length -lt 2) { continue }
+    try {
+        [Console]::Out.WriteLine([Rp4WindowCrop]::Query($parts[0], [int64]$parts[1]))
+    } catch {
+        [Console]::Out.WriteLine('RP4:' + $parts[0] + ':null')
+    }
+    [Console]::Out.Flush()
+}
+`;
+
+class WindowCropService {
+  constructor() {
+    this.child = null;
+    this.ready = null;
+    this.pending = new Map();
+    this.nextId = 1;
+    this.disposed = false;
+    this.unsupported = process.platform !== 'win32';
+  }
+
+  async hostScriptPath() {
+    const target = path.join(paths.configDir(), HOST_SCRIPT_NAME);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, HOST_SCRIPT, 'utf8');
+    return target;
+  }
+
+  async ensureHost() {
+    if (this.unsupported || this.disposed) return null;
+    if (this.ready) return this.ready;
+
+    this.ready = (async () => {
+      const scriptPath = await this.hostScriptPath();
+      const child = spawn('powershell.exe', [
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', scriptPath
+      ], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+
+      this.child = child;
+      child.stderr.resume();
+
+      const rl = readline.createInterface({ input: child.stdout });
+      rl.on('line', (line) => this.handleLine(line.trim()));
+
+      const cleanup = () => {
+        rl.close();
+        this.child = null;
+        this.ready = null;
+        for (const entry of this.pending.values()) {
+          clearTimeout(entry.timer);
+          entry.resolve(null);
+        }
+        this.pending.clear();
+      };
+      child.on('error', cleanup);
+      child.on('exit', cleanup);
+
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('window crop host timed out')), READY_TIMEOUT_MS);
+        this.onReady = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        child.on('exit', () => {
+          clearTimeout(timer);
+          reject(new Error('window crop host exited'));
+        });
+      });
+
+      return child;
+    })().catch(() => {
+      this.ready = null;
+      this.child = null;
+      return null;
+    });
+
+    return this.ready;
+  }
+
+  handleLine(line) {
+    if (line === READY_TOKEN) {
+      this.onReady?.();
+      this.onReady = null;
+      return;
+    }
+    if (!line.startsWith(RESPONSE_PREFIX)) return;
+
+    const rest = line.slice(RESPONSE_PREFIX.length);
+    const separator = rest.indexOf(':');
+    if (separator < 0) return;
+
+    const id = rest.slice(0, separator);
+    const body = rest.slice(separator + 1);
+    const entry = this.pending.get(id);
+    if (!entry) return;
+
+    this.pending.delete(id);
+    clearTimeout(entry.timer);
+
+    if (body === 'null') {
+      entry.resolve(null);
+      return;
+    }
+    try {
+      entry.resolve(JSON.parse(body));
+    } catch {
+      entry.resolve(null);
+    }
+  }
+
+  /**
+   * Returns the client rectangle of a window relative to its captured frame, or null when
+   * it cannot be determined (minimized, closed, non-Windows, helper unavailable).
+   */
+  async query(hwnd) {
+    if (this.unsupported || this.disposed) return null;
+    const numeric = String(hwnd || '').trim();
+    if (!/^\d+$/.test(numeric)) return null;
+
+    const child = await this.ensureHost();
+    if (!child || !child.stdin.writable) return null;
+
+    const id = `q${this.nextId++}`;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        resolve(null);
+      }, REQUEST_TIMEOUT_MS);
+
+      this.pending.set(id, { resolve, timer });
+      try {
+        child.stdin.write(`${id} ${numeric}\n`);
+      } catch {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        resolve(null);
+      }
+    });
+  }
+
+  dispose() {
+    this.disposed = true;
+    const child = this.child;
+    if (!child) return;
+    try {
+      child.stdin.write('quit\n');
+      child.stdin.end();
+    } catch {
+      // ignore
+    }
+    setTimeout(() => {
+      if (!child.killed) child.kill();
+    }, 300);
+  }
+}
+
+function parseWindowHandle(sourceId) {
+  const match = /^window:(\d+):/.exec(String(sourceId || ''));
+  return match ? match[1] : null;
+}
+
+module.exports = { WindowCropService, parseWindowHandle };

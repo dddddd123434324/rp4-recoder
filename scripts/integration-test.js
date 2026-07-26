@@ -1,0 +1,359 @@
+#!/usr/bin/env electron
+'use strict';
+
+/*
+ * End-to-end test for the recording pipeline.
+ *
+ * Runs the real main-process modules against a temporary userData/recordings sandbox and
+ * drives them with genuine MediaRecorder output from a hidden renderer. The headline
+ * assertion is that stopping a recording completes almost instantly, because the file is
+ * written in its final container rather than converted afterwards.
+ *
+ * Usage: npm run test:integration
+ */
+
+const { app, BrowserWindow } = require('electron');
+const { execFile } = require('node:child_process');
+const fs = require('node:fs');
+const fsp = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+
+const ffmpegStatic = require('ffmpeg-static');
+
+const SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'rp4-itest-'));
+const USER_DATA = path.join(SANDBOX, 'userData');
+const RECORDINGS = path.join(SANDBOX, 'recordings');
+fs.mkdirSync(USER_DATA, { recursive: true });
+
+// Redirect every app path before the modules read it, so the test never touches the real
+// configuration or recordings folder.
+app.setPath('userData', USER_DATA);
+
+const results = [];
+let failures = 0;
+
+function check(name, passed, detail = '') {
+  results.push({ name, passed, detail });
+  if (!passed) failures += 1;
+  process.stdout.write(`${passed ? 'PASS' : 'FAIL'}  ${name}${detail ? `  (${detail})` : ''}\n`);
+}
+
+function ffprobe(file) {
+  return new Promise((resolve) => {
+    execFile(
+      ffmpegStatic,
+      ['-hide_banner', '-i', file],
+      { windowsHide: true, maxBuffer: 1024 * 1024 * 8 },
+      (_error, _stdout, stderr) => {
+        const text = String(stderr || '');
+        const duration = /Duration:\s*(\d+):(\d+):(\d+\.\d+)/.exec(text);
+        const start = /start:\s*(-?\d+\.\d+)/.exec(text);
+        const video = /Stream #\d+:\d+.*Video:\s*([a-z0-9]+).*?(\d{2,5})x(\d{2,5})/i.exec(text);
+        resolve({
+          raw: text,
+          // ffmpeg names the MP4 demuxer "mov,mp4,m4a,3gp,3g2,mj2", so keep the whole list.
+          container: /Input #0,\s*([^\n]+?),\s*from/.exec(text)?.[1] || null,
+          durationSec: duration
+            ? Number(duration[1]) * 3600 + Number(duration[2]) * 60 + Number(duration[3])
+            : null,
+          startSec: start ? Number(start[1]) : null,
+          codec: video?.[1] || null,
+          width: video ? Number(video[2]) : null,
+          height: video ? Number(video[3]) : null
+        });
+      }
+    );
+  });
+}
+
+/** Records a short clip in the renderer and returns the chunks as base64 strings. */
+async function recordChunks(win, { seconds = 5, timeslice = 1000 }) {
+  const summary = await win.webContents.executeJavaScript(`
+    (async () => {
+      const MIME = ['video/mp4;codecs=avc1.640028,mp4a.40.2', 'video/mp4;codecs=avc1', 'video/mp4']
+        .find((m) => MediaRecorder.isTypeSupported(m));
+      if (!MIME) return JSON.stringify({ error: 'no mp4 support' });
+
+      const canvas = document.createElement('canvas');
+      canvas.width = 1280; canvas.height = 720;
+      const ctx = canvas.getContext('2d', { alpha: false });
+      let n = 0;
+      const iv = setInterval(() => {
+        n += 1;
+        ctx.fillStyle = 'hsl(' + (n * 11 % 360) + ',80%,45%)';
+        ctx.fillRect(0, 0, 1280, 720);
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 64px sans-serif';
+        ctx.fillText('frame ' + n, 40, 120);
+      }, 33);
+
+      const stream = canvas.captureStream(30);
+      const chunks = [];
+      const rec = new MediaRecorder(stream, { mimeType: MIME, videoBitsPerSecond: 4000000 });
+      rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+      const stopped = new Promise((r) => { rec.onstop = r; });
+      rec.start(${timeslice});
+      await new Promise((r) => setTimeout(r, ${seconds * 1000}));
+      rec.stop();
+      await stopped;
+      clearInterval(iv);
+      stream.getTracks().forEach((t) => t.stop());
+
+      window.__rp4chunks = chunks;
+      window.__rp4take = async (i) => {
+        const u8 = new Uint8Array(await chunks[i].arrayBuffer());
+        let s = ''; const CH = 0x8000;
+        for (let o = 0; o < u8.length; o += CH) s += String.fromCharCode.apply(null, u8.subarray(o, o + CH));
+        return btoa(s);
+      };
+      return JSON.stringify({ mime: MIME, count: chunks.length, sizes: chunks.map((c) => c.size) });
+    })()
+  `);
+
+  const info = JSON.parse(summary);
+  if (info.error) throw new Error(info.error);
+
+  const buffers = [];
+  for (let i = 0; i < info.count; i += 1) {
+    const b64 = await win.webContents.executeJavaScript(`window.__rp4take(${i})`);
+    buffers.push(Buffer.from(b64, 'base64'));
+  }
+  return { mime: info.mime, sizes: info.sizes, buffers };
+}
+
+async function run() {
+  const paths = require('../src/main/paths');
+  const { SettingsStore } = require('../src/main/settings');
+  const { RecordingManager } = require('../src/main/recording');
+
+  // ---- settings + path handling -------------------------------------------------
+  const settings = new SettingsStore();
+  await settings.load();
+  await settings.update({ recordingsDir: RECORDINGS });
+  await paths.ensureRecordingDirs(settings.recordingsDir);
+
+  check('settings persist to sandbox userData', fs.existsSync(paths.settingsFile()), paths.settingsFile());
+  check('recordings dir is the configured one', settings.recordingsDir === RECORDINGS);
+  check('temp + screenshot dirs created',
+    fs.existsSync(settings.tempDir) && fs.existsSync(settings.screenshotsDir));
+
+  // A settings file from an older version has no saved profile. Defaults must not be
+  // substituted there, or the user's chosen preset would be overridden on first launch.
+  const legacyShaped = require('../src/main/settings').normalize({
+    selectedPreset: 'game',
+    hotkeys: { recordToggle: 'Alt+F9' }
+  });
+  check('legacy settings keep their selected preset', legacyShaped.selectedPreset === 'game');
+  check('legacy settings have no substituted profile', legacyShaped.profile === null);
+  check('legacy hotkeys survive normalization', legacyShaped.hotkeys.recordToggle === 'Alt+F9');
+  check('missing hotkeys fall back to defaults',
+    legacyShaped.hotkeys.clipSave === 'CommandOrControl+Shift+V');
+
+  await settings.update({ profile: { resolution: '1280x720', fps: '30' } });
+  check('saved profile round-trips', settings.value.profile?.resolution === '1280x720',
+    JSON.stringify(settings.value.profile));
+  check('profile values are clamped',
+    require('../src/main/settings').normalize({ profile: { fps: '9999', bitrate: '-4' } })
+      .profile.fps === '240');
+
+  // A drive root must never be accepted as a recordings folder.
+  check('drive root rejected as recordings dir', paths.isPlausibleRecordingsDir('D:\\') === false);
+  check('relative path rejected as recordings dir', paths.isPlausibleRecordingsDir('recordings') === false);
+  check('path containment allows nested file',
+    paths.isInside(RECORDINGS, path.join(RECORDINGS, 'a', 'b.mp4')) === true);
+  check('path containment blocks traversal',
+    paths.isInside(RECORDINGS, path.join(RECORDINGS, '..', 'secret.mp4')) === false);
+
+  const recordings = new RecordingManager({ settings, emit: () => {} });
+  await recordings.loadIndex();
+
+  // ---- capture real MediaRecorder output ----------------------------------------
+  const win = new BrowserWindow({
+    show: false,
+    webPreferences: { contextIsolation: true, backgroundThrottling: false }
+  });
+  const page = path.join(SANDBOX, 'page.html');
+  fs.writeFileSync(page, '<!doctype html><html><body>itest</body></html>', 'utf8');
+  await win.loadFile(page);
+
+  const recorded = await recordChunks(win, { seconds: 5, timeslice: 1000 });
+  check('renderer produced MP4 chunks', recorded.buffers.length >= 2,
+    `${recorded.buffers.length} chunks, mime=${recorded.mime}`);
+  check('first chunk is a small init segment', recorded.sizes[0] < recorded.sizes[1],
+    `init=${recorded.sizes[0]}B media=${recorded.sizes[1]}B`);
+
+  // ---- normal recording: stop must be effectively instant -----------------------
+  const meta = {
+    mode: 'screen',
+    modeLabel: '전체 화면',
+    sourceName: '테스트 소스',
+    format: 'mp4',
+    mimeType: recorded.mime,
+    width: 1280,
+    height: 720,
+    fps: 30,
+    bitrateMbps: 4,
+    audioBitrateKbps: 192,
+    encoderPreset: 'veryfast'
+  };
+
+  const session = await recordings.start(meta, { webContentsId: win.webContents.id });
+  check('recording writes straight to the target container', session.directToTarget === true,
+    `container=${session.recordedContainer} codec=${session.recordedCodec}`);
+
+  let written = 0;
+  for (const buffer of recorded.buffers) {
+    const result = await recordings.write(
+      { sessionId: session.sessionId, buffer },
+      { webContentsId: win.webContents.id }
+    );
+    written = result.bytes;
+  }
+  check('all bytes streamed to disk',
+    written === recorded.buffers.reduce((sum, b) => sum + b.length, 0), `${written} bytes`);
+
+  // Another renderer must not be able to write into someone else's session.
+  let ownershipEnforced = false;
+  try {
+    await recordings.write(
+      { sessionId: session.sessionId, buffer: Buffer.from([1, 2, 3]) },
+      { webContentsId: win.webContents.id + 999 }
+    );
+  } catch {
+    ownershipEnforced = true;
+  }
+  check('session rejects writes from another renderer', ownershipEnforced);
+
+  const stopStarted = Date.now();
+  const saved = await recordings.stop({ sessionId: session.sessionId, durationMs: 5000 });
+  const stopMs = Date.now() - stopStarted;
+
+  check('stop returned a saved recording', Boolean(saved), saved?.name);
+  check('saved file is .mp4', saved?.name?.toLowerCase().endsWith('.mp4') === true, saved?.name);
+  check('no conversion was performed', saved?.converted === false);
+  // The whole point of the change: stopping is a close plus a rename.
+  check('stop completes in under 250 ms', stopMs < 250, `${stopMs} ms`);
+
+  const probe = await ffprobe(saved.filePath);
+  check('saved file is readable H.264 MP4',
+    probe.codec === 'h264' && /\bmp4\b/.test(probe.container || ''),
+    `container=${probe.container} codec=${probe.codec} ${probe.width}x${probe.height}`);
+  check('saved file reports a real duration', (probe.durationSec || 0) > 3,
+    `${probe.durationSec}s`);
+  check('reported duration excludes nothing unexpected',
+    Math.abs((probe.durationSec || 0) - 5) < 1.5, `${probe.durationSec}s vs 5s`);
+
+  // ---- unique file names --------------------------------------------------------
+  const first = await recordings.start(meta, { webContentsId: win.webContents.id });
+  await recordings.write({ sessionId: first.sessionId, buffer: recorded.buffers[0] },
+    { webContentsId: win.webContents.id });
+  await recordings.write({ sessionId: first.sessionId, buffer: recorded.buffers[1] },
+    { webContentsId: win.webContents.id });
+  const savedA = await recordings.stop({ sessionId: first.sessionId, durationMs: 1000 });
+
+  const second = await recordings.start(meta, { webContentsId: win.webContents.id });
+  await recordings.write({ sessionId: second.sessionId, buffer: recorded.buffers[0] },
+    { webContentsId: win.webContents.id });
+  await recordings.write({ sessionId: second.sessionId, buffer: recorded.buffers[1] },
+    { webContentsId: win.webContents.id });
+  const savedB = await recordings.stop({ sessionId: second.sessionId, durationMs: 1000 });
+
+  check('same-second recordings get distinct files',
+    Boolean(savedA && savedB) && savedA.filePath !== savedB.filePath,
+    `${savedA?.name} vs ${savedB?.name}`);
+  check('both same-second files still exist',
+    fs.existsSync(savedA.filePath) && fs.existsSync(savedB.filePath));
+
+  // ---- clip mode: init segment + suffix of fragments ----------------------------
+  const clipBuffer = Buffer.concat([
+    recorded.buffers[0],
+    ...recorded.buffers.slice(Math.max(1, recorded.buffers.length - 2))
+  ]);
+  const clipStarted = Date.now();
+  const clip = await recordings.saveClip({
+    buffer: clipBuffer,
+    meta: { ...meta, modeLabel: '전체 화면 클립', durationMs: 2000, clip: true }
+  });
+  const clipMs = Date.now() - clipStarted;
+
+  check('clip saved', Boolean(clip), `${clip?.name} in ${clipMs} ms`);
+  check('clip is .mp4', clip?.name?.toLowerCase().endsWith('.mp4') === true);
+  const clipProbe = await ffprobe(clip.filePath);
+  check('clip is decodable H.264', clipProbe.codec === 'h264', `codec=${clipProbe.codec}`);
+  // The stream copy exists to normalize a spliced clip back to a zero start time.
+  check('clip starts at zero after normalization', (clipProbe.startSec ?? 1) < 0.1,
+    `start=${clipProbe.startSec}`);
+  check('clip save stays fast', clipMs < 5000, `${clipMs} ms`);
+
+  // ---- metadata survives a restart ---------------------------------------------
+  const revived = new RecordingManager({ settings, emit: () => {} });
+  await revived.loadIndex();
+  const listed = await revived.list();
+  const match = listed.find((item) => item.filePath === saved.filePath);
+  check('recording index persists metadata across restart',
+    Boolean(match) && match.durationMs > 0 && match.width === 1280,
+    `duration=${match?.durationMs} ${match?.width}x${match?.height}`);
+
+  // ---- orphaned temp files are recovered, not lost ------------------------------
+  const orphan = path.join(settings.tempDir, 'crashed_take.mp4');
+  await fsp.writeFile(orphan, Buffer.concat([recorded.buffers[0], recorded.buffers[1]]));
+  const sweep = await recordings.sweepTempDir();
+  check('orphaned temp recording is recovered', sweep.recovered.length === 1,
+    sweep.recovered[0] ? path.basename(sweep.recovered[0]) : 'none');
+  check('recovered file left the temp folder', !fs.existsSync(orphan));
+
+  const tiny = path.join(settings.tempDir, 'empty_take.mp4');
+  await fsp.writeFile(tiny, Buffer.alloc(128));
+  const sweep2 = await recordings.sweepTempDir();
+  check('worthless temp scraps are cleaned up',
+    sweep2.removed === 1 && !fs.existsSync(tiny));
+
+  // ---- screenshots get unique names --------------------------------------------
+  const png = Buffer.from(
+    '89504e470d0a1a0a0000000d4948445200000001000000010806000000'
+    + '1f15c4890000000a49444154789c6300010000050001',
+    'hex'
+  );
+  const shotA = await recordings.saveScreenshot({ buffer: png });
+  const shotB = await recordings.saveScreenshot({ buffer: png });
+  check('screenshots in the same second do not overwrite',
+    shotA.filePath !== shotB.filePath && fs.existsSync(shotA.filePath) && fs.existsSync(shotB.filePath),
+    `${shotA.fileName} / ${shotB.fileName}`);
+
+  // ---- background optimization never destroys the file -------------------------
+  recordings.enqueueOptimize(saved.filePath, 5000);
+  const optimizeDeadline = Date.now() + 20000;
+  while ((recordings.optimizing || recordings.optimizeQueue.length > 0) && Date.now() < optimizeDeadline) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  const afterOptimize = await ffprobe(saved.filePath);
+  check('file still valid after background optimization',
+    afterOptimize.codec === 'h264' && (afterOptimize.durationSec || 0) > 3,
+    `codec=${afterOptimize.codec} duration=${afterOptimize.durationSec}s`);
+  check('no .optimizing leftovers',
+    fs.readdirSync(RECORDINGS).every((f) => !f.includes('.optimizing.')));
+
+  win.destroy();
+}
+
+app.whenReady().then(async () => {
+  let fatal = null;
+  try {
+    await run();
+  } catch (error) {
+    fatal = error;
+    process.stdout.write(`FATAL ${error?.stack || error}\n`);
+  }
+
+  const passed = results.filter((r) => r.passed).length;
+  process.stdout.write(`\n${passed}/${results.length} checks passed\n`);
+
+  try {
+    fs.rmSync(SANDBOX, { recursive: true, force: true });
+  } catch {
+    // The OS will clean the temp directory eventually.
+  }
+
+  app.exit(failures > 0 || fatal ? 1 : 0);
+});

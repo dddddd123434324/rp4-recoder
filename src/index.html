@@ -2,6 +2,8 @@
 <html lang="ko">
 <head>
   <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob: mediastream:; font-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>RP4 Recorder</title>
   <link rel="stylesheet" href="./styles.css">
@@ -23,6 +25,17 @@
         <button id="chooseFolderButton" class="nav-sub-action" type="button">경로 지정</button>
       </nav>
 
+      <section class="file-panel" aria-label="최근 녹화 파일">
+        <div class="file-panel-header">
+          <h2>최근 파일</h2>
+          <div class="file-panel-actions">
+            <button id="refreshFilesButton" class="icon-button" type="button" aria-label="목록 새로고침">↻</button>
+            <button id="openFolderButton" class="icon-button" type="button" aria-label="폴더 열기">⁝</button>
+          </div>
+        </div>
+        <div id="recordingList" class="recording-list"></div>
+      </section>
+
       <div class="ready-card" aria-live="polite">
         <span class="status-dot"></span>
         <div>
@@ -30,7 +43,7 @@
           <p id="statusText">녹화 장치를 준비하고 있습니다.</p>
         </div>
       </div>
-      <span class="version">v0.1.1</span>
+      <span class="version">v0.2.0</span>
     </aside>
 
     <main class="main">
@@ -65,6 +78,11 @@
             </div>
           </div>
 
+          <div id="progressBar" class="progress-bar hidden">
+            <div class="progress-track"><div id="progressFill" class="progress-fill"></div></div>
+            <small id="progressLabel"></small>
+          </div>
+
           <div class="transport">
             <button id="pauseButton" class="transport-button" type="button">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14"/></svg>
@@ -80,6 +98,8 @@
             </button>
           </div>
 
+          <p id="pipelineNote" class="pipeline-note"></p>
+
           <div class="clip-toolbar">
             <button id="clipModeButton" class="clip-button" type="button">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5v14l14-7z"/></svg>
@@ -94,7 +114,7 @@
             <label for="clipDurationInput">클립 길이</label>
             <div class="clip-duration-control">
               <input id="clipDurationInput" type="number" min="1" max="7200" step="1" value="300" inputmode="numeric">
-              <div class="clip-duration-stepper" aria-hidden="false">
+              <div class="clip-duration-stepper">
                 <button id="clipDurationUp" type="button" aria-label="클립 길이 증가"></button>
                 <button id="clipDurationDown" type="button" aria-label="클립 길이 감소"></button>
               </div>
@@ -203,8 +223,8 @@
           <div class="field-grid">
             <label for="formatSelect">저장 형식</label>
             <select id="formatSelect">
-              <option value="mp4" selected>MP4</option>
-              <option value="webm">WebM</option>
+              <option value="mp4" selected>MP4 (H.264)</option>
+              <option value="webm">WebM (VP9)</option>
             </select>
 
             <label for="resolutionSelect">해상도</label>
@@ -236,7 +256,7 @@
               <option value="50">50 Mbps</option>
             </select>
 
-            <label for="encoderPresetSelect">인코딩 속도</label>
+            <label for="encoderPresetSelect">변환 품질</label>
             <select id="encoderPresetSelect">
               <option value="ultrafast">매우 빠름</option>
               <option value="superfast">빠름</option>
@@ -277,6 +297,30 @@
               <strong id="systemVolumeLabel">80%</strong>
             </div>
           </div>
+
+          <div class="advanced-settings">
+            <div class="advanced-row">
+              <div>
+                <strong>MP4 최적화</strong>
+                <small>저장 후 백그라운드에서 파일 구조를 정리합니다. 녹화 저장을 지연시키지 않습니다.</small>
+              </div>
+              <label class="switch">
+                <input id="optimizeMp4Toggle" type="checkbox" checked>
+                <span></span>
+              </label>
+            </div>
+            <div class="advanced-row">
+              <div>
+                <strong>클립 버퍼 한도</strong>
+                <small>클립 모드가 메모리에 유지할 최대 용량입니다.</small>
+              </div>
+              <div class="advanced-input">
+                <input id="clipBufferInput" type="number" min="128" max="16384" step="128" value="2048" inputmode="numeric">
+                <span>MB</span>
+              </div>
+            </div>
+          </div>
+
           <button id="createPresetButton" class="text-button preset-save-button" type="button">이 설정의 프리셋 생성</button>
         </div>
 
@@ -300,6 +344,15 @@
   </div>
 
   <div id="toast" class="toast hidden"></div>
-  <script src="./renderer.js"></script>
+
+  <script src="./renderer/core.js"></script>
+  <script src="./renderer/modal.js"></script>
+  <script src="./renderer/capture.js"></script>
+  <script src="./renderer/profile.js"></script>
+  <script src="./renderer/recorder.js"></script>
+  <script src="./renderer/clips.js"></script>
+  <script src="./renderer/hotkeys.js"></script>
+  <script src="./renderer/files.js"></script>
+  <script src="./renderer/app.js"></script>
 </body>
 </html>

@@ -526,58 +526,8 @@ svg {
   font-size: 13px;
 }
 
-.area-selector {
-  position: absolute;
-  z-index: 5;
-  border: 2px solid var(--accent);
-  background: rgba(255, 45, 10, 0.08);
-  box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.9),
-    0 0 18px rgba(255, 45, 10, 0.28);
-  cursor: move;
-  touch-action: none;
-}
-
-.area-selector.recording {
-  border-color: var(--danger);
-  background: rgba(255, 16, 16, 0.09);
-  box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.9),
-    0 0 18px rgba(255, 16, 16, 0.35);
-}
-
-.area-handle {
-  position: absolute;
-  width: 12px;
-  height: 12px;
-  border: 2px solid #050607;
-  background: currentColor;
-  color: inherit;
-}
-
-.area-handle.nw {
-  left: -7px;
-  top: -7px;
-  cursor: nwse-resize;
-}
-
-.area-handle.ne {
-  right: -7px;
-  top: -7px;
-  cursor: nesw-resize;
-}
-
-.area-handle.sw {
-  left: -7px;
-  bottom: -7px;
-  cursor: nesw-resize;
-}
-
-.area-handle.se {
-  right: -7px;
-  bottom: -7px;
-  cursor: nwse-resize;
-}
+/* The in-app drag overlay was removed: region selection happens in the dedicated
+   full-desktop selector window (area-selector.html). */
 
 .transport {
   display: grid;
@@ -1409,4 +1359,271 @@ svg {
     min-height: 0;
   }
 
+}
+
+/* ------------------------------------------------------------------------- */
+/* Recent files panel in the sidebar                                          */
+/* ------------------------------------------------------------------------- */
+
+.file-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.file-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.file-panel-header h2 {
+  margin: 0;
+  color: #d8dde5;
+  font-size: 13px;
+  font-weight: 900;
+  letter-spacing: 0.02em;
+}
+
+.file-panel-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.file-panel .recording-list {
+  max-height: none;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.file-panel .recording-item {
+  grid-template-columns: 46px minmax(0, 1fr) auto;
+  gap: 10px;
+  min-height: 54px;
+}
+
+.file-panel .recording-thumb {
+  width: 46px;
+  height: 32px;
+}
+
+.file-panel .recording-thumb svg {
+  width: 18px;
+  height: 18px;
+}
+
+.file-panel .recording-info strong {
+  font-size: 12px;
+}
+
+.file-panel .recording-info small {
+  margin-top: 3px;
+  font-size: 11px;
+}
+
+.file-panel .recording-actions {
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+}
+
+.file-panel .recording-actions small {
+  color: #7f868f;
+  font-size: 10px;
+}
+
+.file-panel .recording-actions button {
+  width: 24px;
+  height: 20px;
+}
+
+.ready-card {
+  flex: 0 0 auto;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Conversion / optimization progress                                         */
+/* ------------------------------------------------------------------------- */
+
+.progress-bar {
+  display: grid;
+  gap: 6px;
+}
+
+.progress-track {
+  height: 6px;
+  border-radius: 999px;
+  background: #1a1d22;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #ff4a17, #f22b08);
+  transition: width 160ms ease;
+}
+
+.progress-bar small {
+  color: #9ba2ad;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+/* Explains how the file will be finished (direct write vs. conversion). */
+.pipeline-note {
+  margin: 0;
+  color: #8b929c;
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.recording-pill.paused span {
+  animation: none;
+  background: #f3b33d;
+  box-shadow: 0 0 16px rgba(243, 179, 61, 0.8);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Advanced settings rows                                                     */
+/* ------------------------------------------------------------------------- */
+
+.advanced-settings {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid #282c33;
+}
+
+.advanced-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.advanced-row strong {
+  display: block;
+  color: #eef1f5;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.advanced-row small {
+  display: block;
+  margin-top: 4px;
+  color: #8b929c;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.advanced-input {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.advanced-input input {
+  width: 74px;
+  min-height: 32px;
+  padding: 0 8px;
+  border: 1px solid #272b32;
+  border-radius: 8px;
+  background: #1a1d22;
+  color: #f5f7fa;
+  font: inherit;
+  font-size: 12px;
+  text-align: right;
+  outline: 0;
+}
+
+.advanced-input input:focus {
+  border-color: rgba(255, 45, 10, 0.82);
+}
+
+.advanced-input span {
+  color: #9ba2ad;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+/* ------------------------------------------------------------------------- */
+/* In-app prompt / confirm dialog                                             */
+/* Replaces window.prompt and window.confirm, which Electron does not support. */
+/* ------------------------------------------------------------------------- */
+
+.dialog-modal {
+  z-index: 60;
+}
+
+.dialog-card {
+  width: min(420px, calc(100vw - 48px));
+  max-height: none;
+}
+
+.dialog-body {
+  display: grid;
+  gap: 12px;
+  padding: 16px 0 4px;
+}
+
+.dialog-body p {
+  margin: 0;
+  color: #b6bcc6;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.dialog-input {
+  width: 100%;
+  min-height: 38px;
+  padding: 0 12px;
+  border: 1px solid #272b32;
+  border-radius: 8px;
+  background: #1a1d22;
+  color: #f5f7fa;
+  font: inherit;
+  font-size: 14px;
+  outline: 0;
+}
+
+.dialog-input:focus {
+  border-color: rgba(255, 45, 10, 0.82);
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.dialog-button {
+  min-height: 36px;
+  padding: 0 16px;
+  border: 1px solid #30343c;
+  border-radius: 8px;
+  background: #14171b;
+  color: #cbd1da;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.dialog-button:hover {
+  border-color: rgba(255, 45, 10, 0.7);
+  color: #fff;
+}
+
+.dialog-button.primary {
+  border-color: rgba(255, 45, 10, 0.9);
+  background: linear-gradient(180deg, #ff4a17, #f22b08);
+  color: #fff;
 }

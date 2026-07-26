@@ -1,0 +1,699 @@
+'use strict';
+
+const fs = require('node:fs/promises');
+const path = require('node:path');
+const crypto = require('node:crypto');
+
+const ffmpeg = require('./ffmpeg');
+const paths = require('./paths');
+
+const RECORDING_EXTENSIONS = /\.(webm|mp4|mkv)$/i;
+const INDEX_FILE_NAME = 'recordings-index.json';
+const MAX_INDEX_ENTRIES = 2000;
+
+// Refuse to start a recording without some headroom, and stop cleanly rather than
+// letting writes fail halfway through once the disk is nearly full.
+const MIN_FREE_BYTES_TO_START = 512 * 1024 * 1024;
+const MIN_FREE_BYTES_TO_CONTINUE = 128 * 1024 * 1024;
+
+function timestamp(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, '0');
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate())
+  ].join('-') + '_' + [
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds())
+  ].join('-');
+}
+
+/**
+ * Strips characters Windows rejects in file names, plus trailing dots and spaces which
+ * Windows silently discards. Window titles reach this function, so it must be defensive.
+ */
+function sanitizeName(value, fallback = 'capture') {
+  const cleaned = String(value || '')
+    // Control characters are stripped deliberately: window titles reach this function and
+    // Windows rejects them in file names.
+    // eslint-disable-next-line no-control-regex
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80)
+    .replace(/[. ]+$/, '');
+
+  if (!cleaned) return fallback;
+
+  // Reserved DOS device names cannot be used even with an extension.
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(cleaned)) return `_${cleaned}`;
+  return cleaned;
+}
+
+function containerFromMimeType(mimeType) {
+  const value = String(mimeType || '').toLowerCase();
+  if (value.includes('video/mp4')) return 'mp4';
+  if (value.includes('x-matroska')) return 'mkv';
+  return 'webm';
+}
+
+function videoCodecFromMimeType(mimeType) {
+  const value = String(mimeType || '').toLowerCase();
+  if (value.includes('avc1') || value.includes('h264')) return 'h264';
+  if (value.includes('vp9')) return 'vp9';
+  if (value.includes('vp8')) return 'vp8';
+  if (value.includes('av01')) return 'av1';
+  return 'unknown';
+}
+
+async function statFile(filePath) {
+  try {
+    return await fs.stat(filePath);
+  } catch {
+    return null;
+  }
+}
+
+async function freeBytes(target) {
+  try {
+    const stats = await fs.statfs(target);
+    return Number(stats.bsize) * Number(stats.bavail);
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+/**
+ * Appends " (2)", " (3)" … until the name is free. The previous build derived names from
+ * a one-second timestamp only, so two recordings started in the same second truncated
+ * each other's files.
+ */
+async function uniquePath(dir, baseName, extension) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const suffix = attempt === 0 ? '' : ` (${attempt + 1})`;
+    const candidate = path.join(dir, `${baseName}${suffix}.${extension}`);
+    if (!(await paths.pathExists(candidate))) return candidate;
+  }
+  return path.join(dir, `${baseName}_${crypto.randomUUID().slice(0, 8)}.${extension}`);
+}
+
+/** Same-volume rename, with a copy fallback if the target is on another device. */
+async function moveFile(from, to) {
+  try {
+    await fs.rename(from, to);
+  } catch (error) {
+    if (error.code !== 'EXDEV') throw error;
+    await fs.copyFile(from, to);
+    await fs.rm(from, { force: true });
+  }
+}
+
+class RecordingManager {
+  /**
+   * @param {object} options
+   * @param {import('./settings').SettingsStore} options.settings
+   * @param {(channel: string, payload: unknown) => void} options.emit
+   */
+  constructor({ settings, emit }) {
+    this.settings = settings;
+    this.emit = emit || (() => {});
+    this.sessions = new Map();
+    this.metadata = new Map();
+    this.optimizeQueue = [];
+    this.optimizing = false;
+    this.indexChain = Promise.resolve();
+  }
+
+  get activeCount() {
+    return this.sessions.size;
+  }
+
+  hasActiveSessions() {
+    return this.sessions.size > 0;
+  }
+
+  indexFile() {
+    return path.join(paths.configDir(), INDEX_FILE_NAME);
+  }
+
+  /**
+   * Recording metadata used to live only in memory, so durations and resolutions
+   * vanished on restart and every past file showed 00:00:00. It is now persisted to a
+   * single index file rather than a sidecar per recording.
+   */
+  async loadIndex() {
+    try {
+      const raw = JSON.parse(await fs.readFile(this.indexFile(), 'utf8'));
+      if (!raw || typeof raw !== 'object' || !Array.isArray(raw.entries)) return;
+      for (const entry of raw.entries) {
+        if (entry && typeof entry.filePath === 'string' && entry.meta) {
+          this.metadata.set(entry.filePath, entry.meta);
+        }
+      }
+    } catch {
+      // A missing or corrupt index is not fatal: file listings simply lose extra detail.
+    }
+  }
+
+  saveIndex() {
+    const run = async () => {
+      const entries = [...this.metadata.entries()]
+        .slice(-MAX_INDEX_ENTRIES)
+        .map(([filePath, meta]) => ({ filePath, meta }));
+      const target = this.indexFile();
+      const temporary = `${target}.tmp-${process.pid}`;
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      await fs.writeFile(temporary, JSON.stringify({ version: 1, entries }), 'utf8');
+      await fs.rename(temporary, target);
+    };
+
+    this.indexChain = this.indexChain.then(run, run);
+    return this.indexChain;
+  }
+
+  setMetadata(filePath, meta) {
+    this.metadata.set(filePath, meta);
+    void this.saveIndex();
+  }
+
+  /**
+   * Removes leftovers from `.temp`. A crash or a force-quit during recording used to
+   * strand partial files there forever, invisible to the user.
+   */
+  async sweepTempDir({ maxAgeMs = 0 } = {}) {
+    const tempDir = this.settings.tempDir;
+    let entries;
+    try {
+      entries = await fs.readdir(tempDir, { withFileTypes: true });
+    } catch {
+      return { removed: 0, recovered: [] };
+    }
+
+    const activeTempPaths = new Set([...this.sessions.values()].map((session) => session.tempPath));
+    const recovered = [];
+    let removed = 0;
+
+    for (const entry of entries) {
+      const fullPath = path.join(tempDir, entry.name);
+      if (activeTempPaths.has(fullPath)) continue;
+
+      if (entry.isDirectory()) {
+        await fs.rm(fullPath, { recursive: true, force: true });
+        removed += 1;
+        continue;
+      }
+
+      const stats = await statFile(fullPath);
+      if (!stats) continue;
+      if (maxAgeMs > 0 && Date.now() - stats.mtimeMs < maxAgeMs) continue;
+
+      // Anything with real content is salvaged into the recordings folder instead of
+      // being deleted, so an interrupted take is never silently thrown away.
+      if (stats.size > 64 * 1024 && RECORDING_EXTENSIONS.test(entry.name)) {
+        const extension = path.extname(entry.name).slice(1).toLowerCase();
+        const baseName = `${path.basename(entry.name, path.extname(entry.name))}_recovered`;
+        const target = await uniquePath(this.settings.recordingsDir, baseName, extension);
+        try {
+          await moveFile(fullPath, target);
+          recovered.push(target);
+          continue;
+        } catch {
+          // fall through to deletion
+        }
+      }
+
+      await fs.rm(fullPath, { force: true });
+      removed += 1;
+    }
+
+    return { removed, recovered };
+  }
+
+  async start(meta = {}, { webContentsId } = {}) {
+    await paths.ensureRecordingDirs(this.settings.recordingsDir);
+
+    const recordingsDir = this.settings.recordingsDir;
+    const available = await freeBytes(recordingsDir);
+    if (available < MIN_FREE_BYTES_TO_START) {
+      throw new Error('저장 공간이 부족합니다. 최소 512MB 이상의 여유 공간이 필요합니다.');
+    }
+
+    const targetFormat = meta.format === 'webm' ? 'webm' : 'mp4';
+    const recordedContainer = containerFromMimeType(meta.mimeType);
+    const recordedCodec = videoCodecFromMimeType(meta.mimeType);
+    const baseName = [
+      timestamp(),
+      sanitizeName(meta.modeLabel || meta.mode, 'recording'),
+      sanitizeName(meta.sourceName, 'source')
+    ].join('_');
+
+    const sessionId = crypto.randomUUID();
+    const tempPath = path.join(this.settings.tempDir, `${baseName}_${sessionId.slice(0, 8)}.${recordedContainer}`);
+    const handle = await fs.open(tempPath, 'w');
+
+    this.sessions.set(sessionId, {
+      handle,
+      webContentsId,
+      recordingsDir,
+      baseName,
+      tempPath,
+      targetFormat,
+      recordedContainer,
+      recordedCodec,
+      bytes: 0,
+      startedAtMs: Date.now(),
+      failed: null,
+      meta: {
+        ...meta,
+        targetFormat,
+        recordedContainer,
+        recordedCodec,
+        startedAt: new Date().toISOString()
+      }
+    });
+
+    return {
+      sessionId,
+      // The recording streams straight into its final container when the codec already
+      // matches the target, which is what makes stopping instant.
+      directToTarget: recordedContainer === targetFormat,
+      recordedContainer,
+      recordedCodec
+    };
+  }
+
+  async write(payload = {}, { webContentsId } = {}) {
+    const session = this.sessions.get(payload.sessionId);
+    if (!session) {
+      throw new Error('녹화 세션을 찾을 수 없습니다.');
+    }
+    // Only the renderer that opened the session may write to it.
+    if (session.webContentsId != null && webContentsId != null && session.webContentsId !== webContentsId) {
+      throw new Error('녹화 세션에 접근할 수 없습니다.');
+    }
+    if (session.failed) {
+      throw new Error(session.failed);
+    }
+
+    const chunk = Buffer.from(payload.buffer);
+    if (chunk.length === 0) return { bytes: session.bytes };
+
+    try {
+      await session.handle.write(chunk);
+    } catch (error) {
+      // Surface the failure instead of continuing to produce a corrupt file.
+      session.failed = `녹화 데이터를 디스크에 쓸 수 없습니다. ${error.message}`;
+      throw new Error(session.failed, { cause: error });
+    }
+
+    session.bytes += chunk.length;
+
+    // Periodically re-check headroom so we can stop deliberately near a full disk.
+    if (session.bytes - (session.lastSpaceCheckBytes || 0) > 64 * 1024 * 1024) {
+      session.lastSpaceCheckBytes = session.bytes;
+      const available = await freeBytes(session.recordingsDir);
+      if (available < MIN_FREE_BYTES_TO_CONTINUE) {
+        session.failed = '저장 공간이 거의 없어 녹화를 중지해야 합니다.';
+        this.emit('recording:disk-full', { sessionId: payload.sessionId });
+      }
+    }
+
+    return { bytes: session.bytes, warning: session.failed || null };
+  }
+
+  /**
+   * Closes the file and moves it into place. When the recorded container already matches
+   * the requested format this is a rename and returns immediately; conversion only
+   * happens for genuinely mismatched codecs.
+   */
+  async stop(payload = {}) {
+    const session = this.sessions.get(payload.sessionId);
+    if (!session) return null;
+
+    this.sessions.delete(payload.sessionId);
+    try {
+      await session.handle.close();
+    } catch {
+      // Already closed; the bytes on disk are still valid.
+    }
+
+    if (session.bytes === 0) {
+      await fs.rm(session.tempPath, { force: true });
+      return null;
+    }
+
+    const durationMs = Number.isFinite(Number(payload.durationMs)) && Number(payload.durationMs) > 0
+      ? Math.round(Number(payload.durationMs))
+      : Math.max(0, Date.now() - session.startedAtMs);
+
+    const finalized = await this.finalize(session, { durationMs });
+    const stats = await statFile(finalized.filePath);
+    const meta = {
+      ...session.meta,
+      ...(payload.meta && typeof payload.meta === 'object' ? payload.meta : {}),
+      format: finalized.format,
+      converted: finalized.converted,
+      conversionError: finalized.conversionError || null,
+      durationMs,
+      stoppedAt: new Date().toISOString(),
+      bytes: stats?.size || 0
+    };
+
+    this.setMetadata(finalized.filePath, meta);
+
+    if (finalized.optimizable && this.settings.value.optimizeMp4) {
+      this.enqueueOptimize(finalized.filePath, durationMs);
+    }
+
+    return {
+      ...this.toDto(finalized.filePath, stats, meta),
+      converted: finalized.converted,
+      conversionError: finalized.conversionError || null
+    };
+  }
+
+  /**
+   * Decides between three outcomes, cheapest first:
+   *  1. rename       – recorded container already matches the target (the normal path)
+   *  2. stream copy   – right codec, wrong container
+   *  3. re-encode     – codec cannot go into the target container at all
+   */
+  async finalize(session, { durationMs }) {
+    const { targetFormat, recordedContainer, recordedCodec } = session;
+    const canStreamCopyToMp4 = targetFormat === 'mp4' && recordedCodec === 'h264';
+
+    // A clip is spliced from a buffered init segment plus a suffix of media fragments, so
+    // its timestamps start partway through the stream. A stream copy rebuilds the
+    // container so the clip starts at zero and reports its real length. Measured at about
+    // 100 ms for 11 MB, versus the minutes a re-encode would cost.
+    if (session.forceRemux && recordedContainer === targetFormat && targetFormat === 'mp4') {
+      const target = await uniquePath(session.recordingsDir, session.baseName, 'mp4');
+      try {
+        await ffmpeg.remux(session.tempPath, target, { totalDurationMs: durationMs });
+        await fs.rm(session.tempPath, { force: true });
+        return { filePath: target, format: 'mp4', converted: true, optimizable: false };
+      } catch {
+        // Fall through: an un-normalized clip is still perfectly playable.
+      }
+    }
+
+    if (recordedContainer === targetFormat) {
+      const target = await uniquePath(session.recordingsDir, session.baseName, targetFormat);
+      await moveFile(session.tempPath, target);
+      return {
+        filePath: target,
+        format: targetFormat,
+        converted: false,
+        // A stream-copy pass moves the moov atom to the front. It is optional, runs in
+        // the background, and never delays the save.
+        optimizable: targetFormat === 'mp4'
+      };
+    }
+
+    if (canStreamCopyToMp4) {
+      const target = await uniquePath(session.recordingsDir, session.baseName, 'mp4');
+      try {
+        this.emit('recording:convert-progress', { phase: 'remux', ratio: 0 });
+        await ffmpeg.remux(session.tempPath, target, {
+          totalDurationMs: durationMs,
+          onProgress: (ratio) => this.emit('recording:convert-progress', { phase: 'remux', ratio })
+        });
+        await fs.rm(session.tempPath, { force: true });
+        return { filePath: target, format: 'mp4', converted: true, optimizable: false };
+      } catch (error) {
+        return this.keepOriginal(session, target, error);
+      }
+    }
+
+    if (targetFormat === 'mp4') {
+      const target = await uniquePath(session.recordingsDir, session.baseName, 'mp4');
+      try {
+        this.emit('recording:convert-progress', { phase: 'transcode', ratio: 0 });
+        await ffmpeg.transcodeToMp4(session.tempPath, target, {
+          fps: session.meta.fps,
+          bitrateMbps: session.meta.bitrateMbps,
+          audioBitrateKbps: session.meta.audioBitrateKbps,
+          encoderPreset: session.meta.encoderPreset,
+          totalDurationMs: durationMs,
+          jobId: `convert:${session.baseName}`,
+          onProgress: (ratio) => this.emit('recording:convert-progress', { phase: 'transcode', ratio })
+        });
+        await fs.rm(session.tempPath, { force: true });
+        return { filePath: target, format: 'mp4', converted: true, optimizable: false };
+      } catch (error) {
+        return this.keepOriginal(session, target, error);
+      }
+    }
+
+    // Requested WebM but recorded something else: keep the real container rather than
+    // lying about the extension.
+    const target = await uniquePath(session.recordingsDir, session.baseName, recordedContainer);
+    await moveFile(session.tempPath, target);
+    return { filePath: target, format: recordedContainer, converted: false, optimizable: false };
+  }
+
+  /** Conversion failed: keep the untouched recording so nothing is ever lost. */
+  async keepOriginal(session, failedTarget, error) {
+    await fs.rm(failedTarget, { force: true });
+    const target = await uniquePath(
+      session.recordingsDir,
+      `${session.baseName}_original`,
+      session.recordedContainer
+    );
+    await moveFile(session.tempPath, target);
+    return {
+      filePath: target,
+      format: session.recordedContainer,
+      converted: false,
+      optimizable: false,
+      conversionError: error?.message || String(error)
+    };
+  }
+
+  /**
+   * Background faststart pass. The recording is already saved and listed before this
+   * runs, so the user never waits for it.
+   */
+  enqueueOptimize(filePath, durationMs) {
+    this.optimizeQueue.push({ filePath, durationMs });
+    void this.drainOptimizeQueue();
+  }
+
+  async drainOptimizeQueue() {
+    if (this.optimizing) return;
+    this.optimizing = true;
+
+    try {
+      while (this.optimizeQueue.length > 0) {
+        const job = this.optimizeQueue.shift();
+        if (!(await paths.pathExists(job.filePath))) continue;
+
+        const optimized = `${job.filePath}.optimizing.mp4`;
+        try {
+          this.emit('recording:optimize', { filePath: job.filePath, state: 'start' });
+          await ffmpeg.remux(job.filePath, optimized, {
+            jobId: `optimize:${job.filePath}`,
+            totalDurationMs: job.durationMs
+          });
+
+          const before = await statFile(job.filePath);
+          const after = await statFile(optimized);
+          // Only swap when the result looks sane, so a truncated remux cannot replace a
+          // good recording.
+          if (after && before && after.size > before.size * 0.5) {
+            await fs.rm(job.filePath, { force: true });
+            await moveFile(optimized, job.filePath);
+            const meta = this.metadata.get(job.filePath);
+            if (meta) this.setMetadata(job.filePath, { ...meta, optimized: true, bytes: after.size });
+            this.emit('recording:optimize', { filePath: job.filePath, state: 'done' });
+          } else {
+            await fs.rm(optimized, { force: true });
+            this.emit('recording:optimize', { filePath: job.filePath, state: 'skipped' });
+          }
+        } catch (error) {
+          await fs.rm(optimized, { force: true });
+          this.emit('recording:optimize', {
+            filePath: job.filePath,
+            state: 'failed',
+            error: error?.message || String(error)
+          });
+        }
+      }
+    } finally {
+      this.optimizing = false;
+    }
+  }
+
+  /**
+   * Saves a clip assembled by the renderer. The renderer hands over one continuous
+   * buffer (init segment + clusters), so this is a plain write plus the same finalize
+   * path as a normal recording — no concat list and no re-encode.
+   */
+  async saveClip(payload = {}) {
+    await paths.ensureRecordingDirs(this.settings.recordingsDir);
+
+    const meta = payload.meta && typeof payload.meta === 'object' ? payload.meta : {};
+    const buffer = Buffer.from(payload.buffer || []);
+    if (buffer.length === 0) {
+      throw new Error('저장할 클립 데이터가 없습니다.');
+    }
+
+    const targetFormat = meta.format === 'webm' ? 'webm' : 'mp4';
+    const recordedContainer = containerFromMimeType(meta.mimeType);
+    const recordedCodec = videoCodecFromMimeType(meta.mimeType);
+    const baseName = [
+      timestamp(),
+      sanitizeName(meta.modeLabel || meta.mode, 'clip'),
+      sanitizeName(meta.sourceName, 'source')
+    ].join('_');
+
+    const tempPath = path.join(
+      this.settings.tempDir,
+      `${baseName}_${crypto.randomUUID().slice(0, 8)}.${recordedContainer}`
+    );
+    await fs.writeFile(tempPath, buffer);
+
+    const durationMs = Math.max(0, Math.round(Number(meta.durationMs) || 0));
+    const session = {
+      recordingsDir: this.settings.recordingsDir,
+      baseName,
+      tempPath,
+      targetFormat,
+      recordedContainer,
+      recordedCodec,
+      forceRemux: true,
+      meta: { ...meta, clip: true, targetFormat, recordedContainer, recordedCodec }
+    };
+
+    const finalized = await this.finalize(session, { durationMs });
+    const stats = await statFile(finalized.filePath);
+    const dtoMeta = {
+      ...session.meta,
+      format: finalized.format,
+      converted: finalized.converted,
+      conversionError: finalized.conversionError || null,
+      durationMs,
+      stoppedAt: new Date().toISOString(),
+      bytes: stats?.size || 0
+    };
+
+    this.setMetadata(finalized.filePath, dtoMeta);
+    if (finalized.optimizable && this.settings.value.optimizeMp4) {
+      this.enqueueOptimize(finalized.filePath, durationMs);
+    }
+
+    return this.toDto(finalized.filePath, stats, dtoMeta);
+  }
+
+  toDto(filePath, stats, meta = {}) {
+    return {
+      filePath,
+      name: path.basename(filePath),
+      size: stats?.size || 0,
+      createdAt: (stats?.birthtime || stats?.mtime || new Date()).toISOString(),
+      durationMs: meta.durationMs || 0,
+      width: meta.width || null,
+      height: meta.height || null,
+      fps: meta.fps || null,
+      bitrateMbps: meta.bitrateMbps || null,
+      sourceName: meta.sourceName || null,
+      modeLabel: meta.modeLabel || null,
+      format: meta.format || path.extname(filePath).slice(1).toLowerCase()
+    };
+  }
+
+  async list() {
+    await paths.ensureRecordingDirs(this.settings.recordingsDir);
+    const recordingsDir = this.settings.recordingsDir;
+
+    let entries;
+    try {
+      entries = await fs.readdir(recordingsDir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+
+    const files = entries
+      .filter((entry) => entry.isFile() && RECORDING_EXTENSIONS.test(entry.name))
+      .filter((entry) => !entry.name.endsWith('.optimizing.mp4'))
+      .map((entry) => path.join(recordingsDir, entry.name));
+
+    const recordings = await Promise.all(files.map(async (filePath) => {
+      const stats = await statFile(filePath);
+      return this.toDto(filePath, stats, this.metadata.get(filePath) || {});
+    }));
+
+    // Drop index entries whose files are gone so the index cannot grow without bound.
+    const known = new Set(files);
+    let pruned = false;
+    for (const filePath of [...this.metadata.keys()]) {
+      if (!known.has(filePath) && filePath.startsWith(recordingsDir)) {
+        this.metadata.delete(filePath);
+        pruned = true;
+      }
+    }
+    if (pruned) void this.saveIndex();
+
+    return recordings.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  }
+
+  async saveScreenshot(payload = {}) {
+    await paths.ensureRecordingDirs(this.settings.recordingsDir);
+    const buffer = Buffer.from(payload.buffer || []);
+    if (buffer.length === 0) {
+      throw new Error('저장할 스크린샷 데이터가 없습니다.');
+    }
+
+    const baseName = `${timestamp()}_screenshot`;
+    // Screenshots also used a one-second name, so rapid hotkey presses overwrote
+    // each other.
+    const filePath = await uniquePath(this.settings.screenshotsDir, baseName, 'png');
+    await fs.writeFile(filePath, buffer);
+    return { filePath, fileName: path.basename(filePath) };
+  }
+
+  /** Closes every open handle. Awaited during shutdown so nothing is left dangling. */
+  async closeAllSessions() {
+    const sessions = [...this.sessions.entries()];
+    this.sessions.clear();
+
+    await Promise.allSettled(sessions.map(async ([, session]) => {
+      try {
+        await session.handle.close();
+      } catch {
+        // ignore
+      }
+    }));
+
+    return sessions.length;
+  }
+
+  /**
+   * Finalizes every in-flight recording. Used when the window is closing so a take is
+   * saved properly instead of being stranded in `.temp`.
+   */
+  async finalizeAllSessions() {
+    const ids = [...this.sessions.keys()];
+    const saved = [];
+    for (const sessionId of ids) {
+      try {
+        const result = await this.stop({ sessionId });
+        if (result) saved.push(result);
+      } catch {
+        // Best effort: the sweep on next launch recovers anything left behind.
+      }
+    }
+    return saved;
+  }
+}
+
+module.exports = {
+  RecordingManager,
+  RECORDING_EXTENSIONS,
+  timestamp,
+  sanitizeName,
+  containerFromMimeType,
+  videoCodecFromMimeType,
+  uniquePath
+};

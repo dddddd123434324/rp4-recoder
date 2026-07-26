@@ -1,15 +1,18 @@
 {
   "name": "rp4-recorder",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "productName": "RP4 Recorder",
-  "description": "RP4 desktop game recorder prototype",
+  "description": "RP4 desktop game recorder",
   "author": "RP4",
   "license": "MIT",
   "main": "src/main.js",
   "scripts": {
     "start": "set ELECTRON_RUN_AS_NODE=&& electron .",
-    "lint": "node --check src/main.js && node --check src/preload.js && node --check src/renderer.js",
+    "lint": "eslint src scripts",
+    "lint:syntax": "node scripts/check-syntax.js",
     "smoke": "set ELECTRON_RUN_AS_NODE=&& set RP4_SMOKE=1&& electron .",
+    "test:integration": "set ELECTRON_RUN_AS_NODE=&& electron scripts/integration-test.js",
+    "test": "npm run lint && npm run smoke && npm run test:integration",
     "dist": "set CSC_IDENTITY_AUTO_DISCOVERY=false&& set ELECTRON_BUILDER_DISABLE_BUILD_CACHE=true&& electron-builder --win --x64"
   },
   "build": {
@@ -64,8 +67,11 @@
     }
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "electron": "^41.4.0",
     "electron-builder": "^26.8.1",
+    "eslint": "^10.8.0",
+    "globals": "^17.7.0",
     "rcedit": "^5.0.2"
   },
   "dependencies": {

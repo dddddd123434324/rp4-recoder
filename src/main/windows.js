@@ -1,0 +1,218 @@
+'use strict';
+
+const { BrowserWindow, ipcMain, shell, dialog } = require('electron/main');
+const path = require('node:path');
+
+const displays = require('./displays');
+
+const SRC_DIR = path.resolve(__dirname, '..');
+const APP_ROOT = path.resolve(SRC_DIR, '..');
+const ICON_PATH = path.join(APP_ROOT, 'icon.ico');
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Blocks in-app navigation and popups. Nothing in this app should ever leave its own
+ * pages, and external links belong in the user's browser.
+ */
+function hardenWebContents(contents) {
+  contents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) {
+      void shell.openExternal(url);
+    }
+    return { action: 'deny' };
+  });
+
+  contents.on('will-navigate', (event, url) => {
+    if (url !== contents.getURL()) {
+      event.preventDefault();
+    }
+  });
+
+  contents.on('will-attach-webview', (event) => {
+    event.preventDefault();
+  });
+}
+
+function createMainWindow({ isSmoke, onQuitRequested }) {
+  const win = new BrowserWindow({
+    width: 1440,
+    height: 900,
+    minWidth: 900,
+    minHeight: 560,
+    frame: false,
+    show: false,
+    backgroundColor: '#07080a',
+    title: 'RP4 Recorder',
+    icon: ICON_PATH,
+    webPreferences: {
+      preload: path.join(SRC_DIR, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      // Area and window capture crop frames inside the renderer. Chromium throttles
+      // timers and rendering for hidden windows, which would stall capture the moment the
+      // user alt-tabs away - exactly when a game recorder is expected to be working.
+      backgroundThrottling: false
+    }
+  });
+
+  hardenWebContents(win.webContents);
+
+  win.once('ready-to-show', () => {
+    if (isSmoke) return;
+    win.show();
+  });
+
+  win.on('close', (event) => {
+    if (win.rp4AllowClose) return;
+    event.preventDefault();
+    void onQuitRequested(win);
+  });
+
+  void win.loadFile(path.join(SRC_DIR, 'index.html'));
+  return win;
+}
+
+/**
+ * Asks the renderer to flush and finalize any in-flight recording, then waits for the
+ * sessions to drain. Closing the window used to abandon the take in `.temp`, where it was
+ * invisible to the user.
+ */
+async function drainRecordings(win, recordingManager, { timeoutMs = 20000 } = {}) {
+  if (!recordingManager.hasActiveSessions()) return { drained: true, saved: [] };
+
+  if (win && !win.isDestroyed()) {
+    win.webContents.send('app:finalize-recordings');
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (recordingManager.hasActiveSessions() && Date.now() < deadline) {
+    await sleep(150);
+  }
+
+  // Safety net for anything the renderer could not finish on its own.
+  const saved = await recordingManager.finalizeAllSessions();
+  return { drained: !recordingManager.hasActiveSessions(), saved };
+}
+
+async function confirmCloseWhileRecording(win) {
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'warning',
+    buttons: ['저장하고 종료', '계속 녹화'],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+    title: 'RP4 Recorder',
+    message: '녹화가 진행 중입니다.',
+    detail: '지금 종료하면 녹화를 마무리한 뒤 파일을 저장합니다.'
+  });
+  return response === 0;
+}
+
+/**
+ * Full-desktop region selector. The previous version only ever covered the primary
+ * display, so a region on a second monitor could not be selected at all.
+ */
+function selectDesktopArea({ isSmoke } = {}) {
+  if (isSmoke) return Promise.resolve(null);
+  if (selectDesktopArea.current) {
+    selectDesktopArea.current.focus();
+    return Promise.resolve(null);
+  }
+
+  const payload = displays.getDisplayPayload();
+  const bounds = payload.virtualBounds;
+
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const win = new BrowserWindow({
+      x: bounds.x,
+      y: bounds.y,
+      width: bounds.width,
+      height: bounds.height,
+      enableLargerThanScreen: true,
+      frame: false,
+      show: false,
+      transparent: true,
+      resizable: false,
+      movable: false,
+      minimizable: false,
+      maximizable: false,
+      fullscreenable: false,
+      skipTaskbar: true,
+      alwaysOnTop: true,
+      hasShadow: false,
+      backgroundColor: '#00000000',
+      webPreferences: {
+        // This window used to run with nodeIntegration and no context isolation, giving
+        // a screen-covering always-on-top surface full Node access. It now goes through a
+        // minimal preload like every other renderer.
+        preload: path.join(SRC_DIR, 'preload-area.js'),
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: false,
+        backgroundThrottling: false
+      }
+    });
+
+    hardenWebContents(win.webContents);
+    selectDesktopArea.current = win;
+    win.setAlwaysOnTop(true, 'screen-saver');
+
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      ipcMain.removeListener('area-selector:complete', onComplete);
+      ipcMain.removeListener('area-selector:cancel', onCancel);
+      selectDesktopArea.current = null;
+      if (!win.isDestroyed()) win.destroy();
+      resolve(value);
+    };
+
+    const onComplete = (event, rect) => {
+      if (event.sender !== win.webContents) return;
+      finish(displays.normalizeDesktopArea(rect));
+    };
+    const onCancel = (event) => {
+      if (event.sender !== win.webContents) return;
+      finish(null);
+    };
+
+    ipcMain.on('area-selector:complete', onComplete);
+    ipcMain.on('area-selector:cancel', onCancel);
+    win.on('closed', () => finish(null));
+
+    void win.loadFile(path.join(SRC_DIR, 'area-selector.html'));
+    win.once('ready-to-show', () => {
+      win.setBounds(bounds, false);
+      win.show();
+      win.focus();
+    });
+  });
+}
+selectDesktopArea.current = null;
+
+function closeAreaSelector() {
+  const win = selectDesktopArea.current;
+  if (win && !win.isDestroyed()) {
+    win.destroy();
+  }
+  selectDesktopArea.current = null;
+}
+
+module.exports = {
+  APP_ROOT,
+  SRC_DIR,
+  ICON_PATH,
+  createMainWindow,
+  hardenWebContents,
+  drainRecordings,
+  confirmCloseWhileRecording,
+  selectDesktopArea,
+  closeAreaSelector,
+  sleep
+};

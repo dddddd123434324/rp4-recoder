@@ -1,0 +1,150 @@
+:root {
+  --accent: #ff2d0a;
+  font-family: "Segoe UI", "Malgun Gothic", Arial, sans-serif;
+  color: #fff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  cursor: crosshair;
+  user-select: none;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.hint {
+  position: fixed;
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid rgba(255, 45, 10, 0.72);
+  border-radius: 8px;
+  background: rgba(5, 6, 7, 0.88);
+  box-shadow: 0 12px 35px rgba(0, 0, 0, 0.45);
+  color: #f5f7fa;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.hint button,
+.actions button {
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid #30343c;
+  border-radius: 6px;
+  background: #12151a;
+  color: #f5f7fa;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.hint button:hover,
+.actions button:hover {
+  border-color: rgba(255, 45, 10, 0.8);
+}
+
+.actions {
+  position: fixed;
+  z-index: 5;
+  display: flex;
+  gap: 8px;
+}
+
+.actions button.primary {
+  border-color: rgba(255, 45, 10, 0.9);
+  background: linear-gradient(180deg, #ff4a17, #f22b08);
+}
+
+/* One outline per physical monitor so the boundaries are visible when the overlay spans
+   the whole virtual desktop. */
+.display-outline {
+  position: absolute;
+  border: 1px solid rgba(255, 45, 10, 0.45);
+  pointer-events: none;
+}
+
+.display-outline strong {
+  position: absolute;
+  left: 10px;
+  top: 10px;
+  padding: 3px 7px;
+  border-radius: 5px;
+  background: rgba(5, 6, 7, 0.7);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
+.selection {
+  position: absolute;
+  display: none;
+  border: 2px solid var(--accent);
+  background: rgba(255, 45, 10, 0.1);
+  box-shadow:
+    0 0 0 1px #000,
+    0 0 24px rgba(255, 45, 10, 0.42);
+  cursor: move;
+  touch-action: none;
+}
+
+.selection.active {
+  display: block;
+}
+
+.selection::after {
+  content: attr(data-size);
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  padding: 5px 8px;
+  border: 1px solid rgba(255, 45, 10, 0.64);
+  border-radius: 6px;
+  background: rgba(5, 6, 7, 0.88);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.handle {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border: 2px solid #050607;
+  background: var(--accent);
+}
+
+.handle.nw {
+  left: -8px;
+  top: -8px;
+  cursor: nwse-resize;
+}
+
+.handle.ne {
+  right: -8px;
+  top: -8px;
+  cursor: nesw-resize;
+}
+
+.handle.sw {
+  left: -8px;
+  bottom: -8px;
+  cursor: nesw-resize;
+}
+
+.handle.se {
+  right: -8px;
+  bottom: -8px;
+  cursor: nwse-resize;
+}
