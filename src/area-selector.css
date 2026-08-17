@@ -66,26 +66,6 @@ body {
   background: linear-gradient(180deg, #ff4a17, #f22b08);
 }
 
-/* One outline per physical monitor so the boundaries are visible when the overlay spans
-   the whole virtual desktop. */
-.display-outline {
-  position: absolute;
-  border: 1px solid rgba(255, 45, 10, 0.45);
-  pointer-events: none;
-}
-
-.display-outline strong {
-  position: absolute;
-  left: 10px;
-  top: 10px;
-  padding: 3px 7px;
-  border-radius: 5px;
-  background: rgba(5, 6, 7, 0.7);
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0.04em;
-}
-
 .selection {
   position: absolute;
   display: none;

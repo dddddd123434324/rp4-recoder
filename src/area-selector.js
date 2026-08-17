@@ -11,7 +11,6 @@ const cancelButton = document.getElementById('cancelButton');
 const fillDisplayButton = document.getElementById('fillDisplayButton');
 const hint = document.getElementById('hint');
 const actions = document.getElementById('actions');
-const outlines = document.getElementById('outlines');
 
 let virtualBounds = { x: 0, y: 0, width: 0, height: 0 };
 let displayList = [];
@@ -57,32 +56,6 @@ function displayAt(clientX, clientY) {
     && absoluteY >= display.bounds.y
     && absoluteY < display.bounds.y + display.bounds.height
   )) || displayList.find((display) => display.primary) || displayList[0] || null;
-}
-
-function renderOutlines() {
-  outlines.replaceChildren();
-
-  for (const display of displayList) {
-    const topLeft = toClient(display.bounds.x, display.bounds.y);
-    const bottomRight = toClient(
-      display.bounds.x + display.bounds.width,
-      display.bounds.y + display.bounds.height
-    );
-
-    const node = document.createElement('div');
-    node.className = 'display-outline';
-    node.style.left = `${topLeft.x}px`;
-    node.style.top = `${topLeft.y}px`;
-    node.style.width = `${bottomRight.x - topLeft.x}px`;
-    node.style.height = `${bottomRight.y - topLeft.y}px`;
-
-    const label = document.createElement('strong');
-    label.textContent = display.primary
-      ? `모니터 ${display.index} (주 화면)`
-      : `모니터 ${display.index}`;
-    node.append(label);
-    outlines.append(node);
-  }
 }
 
 /** Keeps the toolbars on whichever monitor the pointer is using. */
@@ -259,7 +232,6 @@ async function init() {
   displayList = data.displays || [];
   minSizePx = data.minSelectionPx || 16;
 
-  renderOutlines();
   positionChrome(window.innerWidth / 2, window.innerHeight / 2);
 
   window.addEventListener('pointerdown', beginPointer);
