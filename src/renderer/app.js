@@ -41,6 +41,9 @@
       optimizeMp4Toggle: RP4.$('#optimizeMp4Toggle'),
       clipBufferInput: RP4.$('#clipBufferInput'),
       pipelineNote: RP4.$('#pipelineNote'),
+      screenshotFormatSelect: RP4.$('#screenshotFormatSelect'),
+      screenshotQualitySelect: RP4.$('#screenshotQualitySelect'),
+      screenshotQualityNote: RP4.$('#screenshotQualityNote'),
 
       clipDurationInput: RP4.$('#clipDurationInput'),
       clipDurationUp: RP4.$('#clipDurationUp'),
@@ -247,6 +250,10 @@
       profile: settings.profile || null,
       recordingsDir: settings.recordingsDir || state.appInfo?.recordingsDir || '',
       optimizeMp4: settings.optimizeMp4 !== false,
+      screenshotFormat: ['png', 'jpeg', 'webp'].includes(settings.screenshotFormat)
+        ? settings.screenshotFormat
+        : 'png',
+      screenshotQuality: util.clamp(Number(settings.screenshotQuality) || 100, 10, 100),
       clipBufferLimitMb: Number(settings.clipBufferLimitMb) || 256,
       maxCustomPresets: Number(settings.maxCustomPresets) || 48
     };
@@ -254,6 +261,9 @@
 
     els.optimizeMp4Toggle.checked = state.appSettings.optimizeMp4;
     els.clipBufferInput.value = String(state.appSettings.clipBufferLimitMb);
+    els.screenshotFormatSelect.value = state.appSettings.screenshotFormat;
+    els.screenshotQualitySelect.value = String(state.appSettings.screenshotQuality);
+    updateScreenshotQualityUi();
 
     renderCustomPresets();
     updateRecordingFolderUi();
@@ -497,16 +507,37 @@
   }
 
   function openSettingsModal(type) {
-    const showHotkeys = type === 'hotkeys';
-    els.settingsModalTitle.textContent = showHotkeys ? '단축키' : '녹화 설정';
-    RP4.$('#recordSettingsBody').classList.toggle('hidden', showHotkeys);
-    RP4.$('#hotkeySettingsBody').classList.toggle('hidden', !showHotkeys);
+    const titles = { record: '녹화 설정', screenshot: '스크린샷 설정', hotkeys: '단축키' };
+    els.settingsModalTitle.textContent = titles[type] || titles.record;
+    RP4.$('#recordSettingsBody').classList.toggle('hidden', type !== 'record');
+    RP4.$('#screenshotSettingsBody').classList.toggle('hidden', type !== 'screenshot');
+    RP4.$('#hotkeySettingsBody').classList.toggle('hidden', type !== 'hotkeys');
     els.settingsModal.classList.remove('hidden');
 
     for (const button of RP4.$$('[data-settings-popup]')) {
       button.setAttribute('aria-expanded', String(button.dataset.settingsPopup === type));
     }
-    if (showHotkeys) RP4.hotkeys.render();
+    if (type === 'hotkeys') RP4.hotkeys.render();
+  }
+
+  function updateScreenshotQualityUi() {
+    const lossless = els.screenshotFormatSelect.value === 'png';
+    els.screenshotQualitySelect.disabled = lossless;
+    els.screenshotQualityNote.textContent = lossless
+      ? 'PNG는 원본 해상도를 무손실로 저장하므로 품질이 최고로 고정됩니다.'
+      : 'JPG와 WebP는 선택한 품질이 높을수록 파일 용량도 커집니다.';
+  }
+
+  async function saveScreenshotSettings() {
+    const screenshotFormat = els.screenshotFormatSelect.value;
+    const screenshotQuality = util.clamp(Number(els.screenshotQualitySelect.value) || 100, 10, 100);
+    state.appSettings.screenshotFormat = screenshotFormat;
+    state.appSettings.screenshotQuality = screenshotQuality;
+    try {
+      await window.rp4.setOptions({ screenshotFormat, screenshotQuality });
+    } catch {
+      RP4.ui.showToast('스크린샷 설정을 저장하지 못했습니다.');
+    }
   }
 
   function closeSettingsModal() {
@@ -728,6 +759,12 @@
       ]);
       window.rp4.reportFinalizeComplete(requestId);
     });
+
+    els.screenshotFormatSelect.addEventListener('change', () => {
+      updateScreenshotQualityUi();
+      void saveScreenshotSettings();
+    });
+    els.screenshotQualitySelect.addEventListener('change', () => void saveScreenshotSettings());
   }
 
   /**

@@ -986,10 +986,24 @@ class RecordingManager {
       throw new Error('스크린샷 데이터는 64MB를 초과할 수 없습니다.');
     }
 
+    let format = null;
+    if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a
+    ]))) {
+      format = 'png';
+    } else if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+      format = 'jpg';
+    } else if (buffer.length >= 12
+      && buffer.subarray(0, 4).toString('ascii') === 'RIFF'
+      && buffer.subarray(8, 12).toString('ascii') === 'WEBP') {
+      format = 'webp';
+    }
+    if (!format) throw new Error('지원하지 않는 스크린샷 형식입니다.');
+
     const baseName = `${timestamp()}_screenshot`;
     // Screenshots also used a one-second name, so rapid hotkey presses overwrote
     // each other.
-    const filePath = await writeUniqueFile(this.settings.screenshotsDir, baseName, 'png', buffer);
+    const filePath = await writeUniqueFile(this.settings.screenshotsDir, baseName, format, buffer);
     return { filePath, fileName: path.basename(filePath) };
   }
 

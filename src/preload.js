@@ -25,6 +25,7 @@ contextBridge.exposeInMainWorld('rp4', {
   listSources: () => ipcRenderer.invoke('sources:list'),
   selectArea: () => ipcRenderer.invoke('area:select'),
   getWindowClientCrop: (sourceId) => ipcRenderer.invoke('window:client-crop', sourceId),
+  captureScreenshotSource: (sourceId) => ipcRenderer.invoke('screenshot:capture-source', sourceId),
 
   listRecordings: () => ipcRenderer.invoke('recordings:list'),
   startRecording: (meta) => ipcRenderer.invoke('recording:start', meta),

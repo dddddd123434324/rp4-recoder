@@ -538,60 +538,25 @@
   async function captureStill() {
     const source = state.selectedSource;
     if (!source) throw new Error('캡처 소스가 없습니다.');
-
-    const constraints = {
-      audio: false,
-      video: {
-        mandatory: {
-          chromeMediaSource: 'desktop',
-          chromeMediaSourceId: source.id,
-          maxWidth: 7680,
-          maxHeight: 4320
-        }
-      }
-    };
-
-    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    const frame = await window.rp4.captureScreenshotSource(source.id);
+    const bitmap = await createImageBitmap(new Blob([frame.buffer], { type: 'image/png' }));
     try {
-      const track = stream.getVideoTracks()[0];
-      if (!track) throw new Error('영상 트랙을 찾을 수 없습니다.');
-      await waitForTrackDimensions(track);
-
-      const video = document.createElement('video');
-      video.muted = true;
-      video.playsInline = true;
-      video.srcObject = new MediaStream([track]);
-      await video.play().catch(() => {});
-
-      // Give the source a moment to present a real frame rather than a blank one.
-      const deadline = Date.now() + 3000;
-      while ((!video.videoWidth || video.currentTime === 0) && Date.now() < deadline) {
-        await util.sleep(50);
-      }
-      if (!video.videoWidth || !video.videoHeight) {
-        throw new Error('화면을 읽을 수 없습니다.');
-      }
-
-      let crop = { x: 0, y: 0, width: video.videoWidth, height: video.videoHeight };
+      let crop = { x: 0, y: 0, width: bitmap.width, height: bitmap.height };
       if (state.selectedMode === 'area' && state.hasAreaSelection) {
-        crop = areaCropFor(video.videoWidth, video.videoHeight);
+        crop = areaCropFor(bitmap.width, bitmap.height);
       } else if (source.type === 'window') {
-        const windowCrop = await window.rp4.getWindowClientCrop(source.id);
-        if (windowCrop) crop = windowCropFor(windowCrop, video.videoWidth, video.videoHeight);
+        if (frame.clientCrop) crop = windowCropFor(frame.clientCrop, bitmap.width, bitmap.height);
       }
 
       const canvas = document.createElement('canvas');
       canvas.width = crop.width;
       canvas.height = crop.height;
       const context = canvas.getContext('2d');
-      context.drawImage(video, crop.x, crop.y, crop.width, crop.height, 0, 0, crop.width, crop.height);
-
-      video.pause();
-      video.srcObject = null;
+      context.drawImage(bitmap, crop.x, crop.y, crop.width, crop.height, 0, 0, crop.width, crop.height);
 
       return canvas;
     } finally {
-      util.stopStream(stream);
+      bitmap.close();
     }
   }
 

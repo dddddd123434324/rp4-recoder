@@ -21,6 +21,10 @@ const MAX_CUSTOM_PRESETS = 48;
 
 const ENCODER_PRESETS = ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium'];
 const CONTAINERS = ['mp4', 'webm'];
+const SCREENSHOT_FORMATS = ['png', 'jpeg', 'webp'];
+const DEFAULT_SCREENSHOT_FORMAT = 'png';
+const DEFAULT_SCREENSHOT_QUALITY = 100;
+const SCREENSHOT_QUALITIES = [70, 80, 90, 95, 100];
 
 // Clip mode keeps recent footage buffered. Without a byte ceiling a 7200s buffer at
 // 35 Mbps would try to hold ~31 GB, so the buffer is bounded in megabytes as well as
@@ -63,6 +67,17 @@ function normalizeEncoderPreset(preset) {
 
 function normalizeFormat(format) {
   return CONTAINERS.includes(format) ? format : 'mp4';
+}
+
+function normalizeScreenshotFormat(format) {
+  return SCREENSHOT_FORMATS.includes(format) ? format : DEFAULT_SCREENSHOT_FORMAT;
+}
+
+function normalizeScreenshotQuality(quality) {
+  const value = clampNumber(Number(quality) || DEFAULT_SCREENSHOT_QUALITY, 10, 100);
+  return SCREENSHOT_QUALITIES.reduce((closest, candidate) => (
+    Math.abs(candidate - value) < Math.abs(closest - value) ? candidate : closest
+  ), DEFAULT_SCREENSHOT_QUALITY);
 }
 
 function normalizeProfile(value = {}) {
@@ -153,6 +168,8 @@ function normalize(value = {}, { recordingsDirFallback } = {}) {
     // Recording writes a ready-to-play MP4 directly. This optional pass re-muxes it in
     // the background (never blocking the user) so the moov atom sits at the front.
     optimizeMp4: source.optimizeMp4 !== false,
+    screenshotFormat: normalizeScreenshotFormat(source.screenshotFormat),
+    screenshotQuality: normalizeScreenshotQuality(source.screenshotQuality),
     clipBufferLimitMb: clampNumber(
       Number.isFinite(clipLimit) ? clipLimit : DEFAULT_CLIP_BUFFER_LIMIT_MB,
       MIN_CLIP_BUFFER_LIMIT_MB,
@@ -283,12 +300,18 @@ module.exports = {
   BUILTIN_PRESET_KEYS,
   MAX_CUSTOM_PRESETS,
   DEFAULT_CLIP_BUFFER_LIMIT_MB,
+  DEFAULT_SCREENSHOT_FORMAT,
+  DEFAULT_SCREENSHOT_QUALITY,
+  SCREENSHOT_FORMATS,
+  SCREENSHOT_QUALITIES,
   MIN_CLIP_BUFFER_LIMIT_MB,
   MAX_CLIP_BUFFER_LIMIT_MB,
   clampNumber,
   normalize,
   normalizeProfile,
   normalizeFormat,
+  normalizeScreenshotFormat,
+  normalizeScreenshotQuality,
   normalizeEncoderPreset,
   normalizeCustomPresets,
   normalizeSelectedPreset,

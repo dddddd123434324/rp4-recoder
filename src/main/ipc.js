@@ -5,7 +5,6 @@ const {
   app,
   desktopCapturer,
   dialog,
-  globalShortcut,
   ipcMain,
   screen,
   shell
@@ -49,6 +48,8 @@ function registerIpcHandlers(context) {
       defaultRecordingsDir: paths.defaultRecordingsDir(),
       settingsFile: paths.settingsFile(),
       optimizeMp4: value.optimizeMp4,
+      screenshotFormat: value.screenshotFormat,
+      screenshotQuality: value.screenshotQuality,
       clipBufferLimitMb: value.clipBufferLimitMb,
       maxCustomPresets: settingsModule.MAX_CUSTOM_PRESETS
     };
@@ -113,6 +114,58 @@ function registerIpcHandlers(context) {
     return windowCrop.query(hwnd);
   });
 
+  ipcMain.handle('screenshot:capture-source', async (_event, sourceId) => {
+    const id = String(sourceId || '');
+    const type = id.startsWith('screen:') ? 'screen' : id.startsWith('window:') ? 'window' : null;
+    if (!type) throw new Error('스크린샷 소스가 올바르지 않습니다.');
+
+    let width;
+    let height;
+    let clientCrop = null;
+
+    if (type === 'screen') {
+      const available = await desktopCapturer.getSources({
+        types: ['screen'],
+        thumbnailSize: { width: 0, height: 0 }
+      });
+      const source = available.find((item) => item.id === id);
+      if (!source) throw new Error('스크린샷 화면을 찾을 수 없습니다.');
+      const display = screen.getAllDisplays().find((item) => (
+        String(item.id) === String(source.display_id)
+      ));
+      if (!display) throw new Error('스크린샷 화면 크기를 확인할 수 없습니다.');
+      width = Math.round(display.bounds.width * display.scaleFactor);
+      height = Math.round(display.bounds.height * display.scaleFactor);
+    } else {
+      const hwnd = parseWindowHandle(id);
+      clientCrop = hwnd ? await windowCrop.query(hwnd) : null;
+      if (!clientCrop) {
+        throw new Error('최소화된 창은 원본 크기로 캡처할 수 없습니다. 창을 복원해 주세요.');
+      }
+      width = clientCrop.frameWidth;
+      height = clientCrop.frameHeight;
+    }
+
+    width = Math.max(2, Math.min(7680, Math.round(Number(width) || 0)));
+    height = Math.max(2, Math.min(4320, Math.round(Number(height) || 0)));
+    const sources = await desktopCapturer.getSources({
+      types: [type],
+      thumbnailSize: { width, height },
+      fetchWindowIcons: false
+    });
+    const source = sources.find((item) => item.id === id);
+    if (!source || source.thumbnail.isEmpty()) {
+      throw new Error('스크린샷 원본 프레임을 가져올 수 없습니다.');
+    }
+    const size = source.thumbnail.getSize();
+    return {
+      buffer: source.thumbnail.toPNG(),
+      width: size.width,
+      height: size.height,
+      clientCrop
+    };
+  });
+
   ipcMain.handle('recordings:list', async () => recordings.list());
 
   ipcMain.handle('recording:start', async (event, meta = {}) => {
@@ -154,7 +207,9 @@ function registerIpcHandlers(context) {
 
     folderDialogActive = true;
     try {
-      globalShortcut.setSuspended(true);
+      // Electron 41 has no globalShortcut.setSuspended(). Temporarily unregister the
+      // app-owned bindings while the native picker is open, then restore them below.
+      hotkeys.unregisterAll();
       const win = BrowserWindow.fromWebContents(event.sender);
       const result = await dialog.showOpenDialog(win, {
         title: '녹화 파일 저장 경로 선택',
@@ -198,7 +253,7 @@ function registerIpcHandlers(context) {
       return { canceled: false, failed: false, recordingsDir: settings.recordingsDir };
     } finally {
       try {
-        globalShortcut.setSuspended(false);
+        hotkeys.register(settings.value.hotkeys);
       } catch {
         // App shutdown may have released the shortcut service while the dialog closed.
       }
@@ -256,6 +311,12 @@ function registerIpcHandlers(context) {
   ipcMain.handle('settings:options', async (_event, options = {}) => {
     const patch = {};
     if (typeof options.optimizeMp4 === 'boolean') patch.optimizeMp4 = options.optimizeMp4;
+    if (typeof options.screenshotFormat === 'string') {
+      patch.screenshotFormat = options.screenshotFormat;
+    }
+    if (Number.isFinite(Number(options.screenshotQuality))) {
+      patch.screenshotQuality = Number(options.screenshotQuality);
+    }
     if (Number.isFinite(Number(options.clipBufferLimitMb))) {
       patch.clipBufferLimitMb = Number(options.clipBufferLimitMb);
     }

@@ -43,7 +43,7 @@
           <p id="statusText">녹화 장치를 준비하고 있습니다.</p>
         </div>
       </div>
-      <span class="version">v0.2.8</span>
+      <span class="version">v0.2.9</span>
     </aside>
 
     <main class="main">
@@ -189,6 +189,13 @@
             </section>
 
             <section class="settings-block">
+              <button class="section-toggle popup-trigger" type="button" data-settings-popup="screenshot" aria-haspopup="dialog" aria-controls="settingsModal" aria-expanded="false">
+                <span>스크린샷 설정</span>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+              </button>
+            </section>
+
+            <section class="settings-block">
               <button class="section-toggle popup-trigger" type="button" data-settings-popup="hotkeys" aria-haspopup="dialog" aria-controls="settingsModal" aria-expanded="false">
                 <span>단축키</span>
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
@@ -321,6 +328,28 @@
           </div>
 
           <button id="createPresetButton" class="text-button preset-save-button" type="button">이 설정의 프리셋 생성</button>
+        </div>
+
+        <div id="screenshotSettingsBody" class="section-body settings-popup-body hidden">
+          <div class="field-grid">
+            <label for="screenshotFormatSelect">저장 형식</label>
+            <select id="screenshotFormatSelect">
+              <option value="png" selected>PNG (무손실)</option>
+              <option value="jpeg">JPG</option>
+              <option value="webp">WebP</option>
+            </select>
+
+            <label for="screenshotQualitySelect">이미지 품질</label>
+            <select id="screenshotQualitySelect">
+              <option value="100" selected>최고 (100%)</option>
+              <option value="95">매우 높음 (95%)</option>
+              <option value="90">높음 (90%)</option>
+              <option value="80">보통 (80%)</option>
+              <option value="70">용량 절약 (70%)</option>
+            </select>
+          </div>
+          <p id="screenshotQualityNote" class="settings-note">PNG는 원본 해상도를 무손실로 저장하므로 품질이 최고로 고정됩니다.</p>
+          <p class="settings-note">스크린샷 설정은 녹화 해상도와 녹화 프리셋에 영향을 받지 않습니다.</p>
         </div>
 
         <div id="hotkeySettingsBody" class="section-body settings-popup-body hidden">

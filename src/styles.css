@@ -1267,6 +1267,22 @@ svg {
   grid-template-columns: minmax(150px, 1fr) minmax(150px, 190px);
 }
 
+.settings-note {
+  margin: 14px 0 0;
+  color: #9ba2ad;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.settings-note + .settings-note {
+  margin-top: 6px;
+}
+
+.field-grid select:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
 .source-grid {
   min-height: 0;
   display: grid;

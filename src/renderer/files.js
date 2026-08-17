@@ -130,12 +130,25 @@
 
     try {
       const canvas = await RP4.capture.captureStill();
-      const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+      const configuredFormat = state.appSettings.screenshotFormat || 'png';
+      const requestedMime = configuredFormat === 'jpeg'
+        ? 'image/jpeg'
+        : configuredFormat === 'webp' ? 'image/webp' : 'image/png';
+      const quality = util.clamp(Number(state.appSettings.screenshotQuality) || 100, 10, 100) / 100;
+      const blob = await new Promise((resolve) => {
+        if (requestedMime === 'image/png') canvas.toBlob(resolve, requestedMime);
+        else canvas.toBlob(resolve, requestedMime, quality);
+      });
       if (!blob) throw new Error('이미지를 만들 수 없습니다.');
+
+      const format = blob.type === 'image/jpeg'
+        ? 'jpeg'
+        : blob.type === 'image/webp' ? 'webp' : 'png';
 
       const buffer = await blob.arrayBuffer();
       const saved = await window.rp4.saveScreenshot({
         buffer,
+        format,
         width: canvas.width,
         height: canvas.height
       });
