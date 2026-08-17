@@ -82,9 +82,9 @@ function createMainWindow({ isSmoke, onQuitRequested }) {
  * invisible to the user.
  */
 async function drainRecordings(win, recordingManager, { timeoutMs = 20000 } = {}) {
-  if (!recordingManager.hasActiveSessions()) return { drained: true, saved: [] };
+  if (!recordingManager.hasPendingRecordings()) return { drained: true, saved: [] };
 
-  if (win && !win.isDestroyed()) {
+  if (recordingManager.hasActiveSessions() && win && !win.isDestroyed()) {
     win.webContents.send('app:finalize-recordings');
   }
 
@@ -93,9 +93,11 @@ async function drainRecordings(win, recordingManager, { timeoutMs = 20000 } = {}
     await sleep(150);
   }
 
-  // Safety net for anything the renderer could not finish on its own.
+  // Safety net for anything the renderer could not finish on its own. Once finalization
+  // starts it is intentionally not timed out: cancelling ffmpeg here could corrupt the
+  // only copy of the recording.
   const saved = await recordingManager.finalizeAllSessions();
-  return { drained: !recordingManager.hasActiveSessions(), saved };
+  return { drained: !recordingManager.hasPendingRecordings(), saved };
 }
 
 async function confirmCloseWhileRecording(win) {

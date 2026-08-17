@@ -1,6 +1,7 @@
 'use strict';
 
 const { app, BrowserWindow, dialog, ipcMain, session } = require('electron/main');
+const { fileURLToPath } = require('node:url');
 
 const ffmpeg = require('./main/ffmpeg');
 const paths = require('./main/paths');
@@ -93,7 +94,7 @@ async function shutdown() {
 async function handleQuitRequest(win) {
   if (isQuitting) return;
 
-  if (recordings?.hasActiveSessions()) {
+  if (recordings?.hasPendingRecordings()) {
     const shouldSave = await windows.confirmCloseWhileRecording(win);
     if (!shouldSave) return;
   }
@@ -121,11 +122,21 @@ async function bootstrap() {
       onTrigger: (action) => send('hotkey:trigger', action)
     });
 
-    session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-      callback(['media', 'display-capture'].includes(permission));
+    const isTrustedAppContents = (webContents) => {
+      if (!webContents || webContents.isDestroyed()) return false;
+      const owner = BrowserWindow.fromWebContents(webContents);
+      if (!owner) return false;
+      try {
+        return paths.isInside(windows.SRC_DIR, fileURLToPath(webContents.getURL()));
+      } catch {
+        return false;
+      }
+    };
+    session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+      callback(isTrustedAppContents(webContents) && ['media', 'display-capture'].includes(permission));
     });
-    session.defaultSession.setPermissionCheckHandler((_webContents, permission) => (
-      ['media', 'display-capture'].includes(permission)
+    session.defaultSession.setPermissionCheckHandler((webContents, permission) => (
+      isTrustedAppContents(webContents) && ['media', 'display-capture'].includes(permission)
     ));
 
     registerIpcHandlers({ settings, recordings, windowCrop, hotkeys, isSmoke: IS_SMOKE });
@@ -161,6 +172,12 @@ async function bootstrap() {
         send('app:notice', {
           level: 'info',
           message: `이전에 완료되지 못한 녹화 ${sweep.recovered.length}개를 복구했습니다.`
+        });
+      }
+      if (sweep.failed.length > 0) {
+        send('app:notice', {
+          level: 'warn',
+          message: `이전 녹화 ${sweep.failed.length}개를 복구하지 못했습니다. 원본은 ${settings.tempDir}에 보존했습니다.`
         });
       }
     });

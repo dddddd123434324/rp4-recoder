@@ -25,9 +25,9 @@ const CONTAINERS = ['mp4', 'webm'];
 // Clip mode keeps recent footage buffered. Without a byte ceiling a 7200s buffer at
 // 35 Mbps would try to hold ~31 GB, so the buffer is bounded in megabytes as well as
 // seconds and the tighter of the two wins.
-const DEFAULT_CLIP_BUFFER_LIMIT_MB = 2048;
-const MIN_CLIP_BUFFER_LIMIT_MB = 128;
-const MAX_CLIP_BUFFER_LIMIT_MB = 16384;
+const DEFAULT_CLIP_BUFFER_LIMIT_MB = 256;
+const MIN_CLIP_BUFFER_LIMIT_MB = 64;
+const MAX_CLIP_BUFFER_LIMIT_MB = 512;
 
 const DEFAULT_PROFILE = {
   format: 'mp4',
@@ -194,24 +194,33 @@ class SettingsStore {
   }
 
   /** Merges a patch, normalizes the result, and persists it. */
-  async update(patch = {}) {
-    this.current = normalize({ ...this.current, ...patch });
-    await this.save();
-    return this.current;
+  update(patch = {}) {
+    const run = async () => {
+      const next = normalize({ ...this.current, ...patch });
+      await this.writeSnapshot(next);
+      this.current = next;
+      return this.current;
+    };
+
+    this.writeChain = this.writeChain.then(run, run);
+    return this.writeChain;
   }
 
   /**
    * Writes via a temp file + rename so an interrupted write cannot leave a truncated
    * settings file behind, and serializes writes so concurrent updates cannot interleave.
    */
-  async save() {
-    const run = async () => {
-      const target = paths.settingsFile();
-      const temporary = `${target}.tmp-${process.pid}`;
-      await fs.mkdir(path.dirname(target), { recursive: true });
-      await fs.writeFile(temporary, JSON.stringify(this.current, null, 2), 'utf8');
-      await fs.rename(temporary, target);
-    };
+  async writeSnapshot(snapshot) {
+    const target = paths.settingsFile();
+    const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(temporary, JSON.stringify(snapshot, null, 2), 'utf8');
+    await fs.rename(temporary, target);
+  }
+
+  save() {
+    const snapshot = this.current;
+    const run = () => this.writeSnapshot(snapshot);
 
     this.writeChain = this.writeChain.then(run, run);
     return this.writeChain;
@@ -239,6 +248,8 @@ module.exports = {
   BUILTIN_PRESET_KEYS,
   MAX_CUSTOM_PRESETS,
   DEFAULT_CLIP_BUFFER_LIMIT_MB,
+  MIN_CLIP_BUFFER_LIMIT_MB,
+  MAX_CLIP_BUFFER_LIMIT_MB,
   clampNumber,
   normalize,
   normalizeProfile,

@@ -2,6 +2,16 @@
 
 const { contextBridge, ipcRenderer } = require('electron/renderer');
 
+const MAX_IPC_BINARY_BYTES = 64 * 1024 * 1024;
+
+function invokeWithBoundedBuffer(channel, payload = {}) {
+  const bytes = Number(payload.buffer?.byteLength ?? payload.buffer?.length ?? 0);
+  if (bytes > MAX_IPC_BINARY_BYTES) {
+    return Promise.reject(new Error('한 번에 전송할 수 있는 데이터 크기(64MB)를 초과했습니다.'));
+  }
+  return ipcRenderer.invoke(channel, payload);
+}
+
 /** Wraps an ipcRenderer listener and hands back an unsubscribe function. */
 function subscribe(channel, callback) {
   const listener = (_event, payload) => callback(payload);
@@ -18,10 +28,10 @@ contextBridge.exposeInMainWorld('rp4', {
 
   listRecordings: () => ipcRenderer.invoke('recordings:list'),
   startRecording: (meta) => ipcRenderer.invoke('recording:start', meta),
-  writeRecordingChunk: (payload) => ipcRenderer.invoke('recording:write', payload),
+  writeRecordingChunk: (payload) => invokeWithBoundedBuffer('recording:write', payload),
   stopRecording: (payload) => ipcRenderer.invoke('recording:stop', payload),
-  saveClip: (payload) => ipcRenderer.invoke('clip:save', payload),
-  saveScreenshot: (payload) => ipcRenderer.invoke('screenshot:save', payload),
+  saveClip: (payload) => invokeWithBoundedBuffer('clip:save', payload),
+  saveScreenshot: (payload) => invokeWithBoundedBuffer('screenshot:save', payload),
   cancelConversion: (jobId) => ipcRenderer.invoke('convert:cancel', jobId),
 
   openRecordingsFolder: () => ipcRenderer.invoke('folder:open-recordings'),

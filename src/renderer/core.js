@@ -42,7 +42,7 @@ window.RP4 = window.RP4 || {};
       profile: null,
       recordingsDir: '',
       optimizeMp4: true,
-      clipBufferLimitMb: 2048,
+      clipBufferLimitMb: 256,
       maxCustomPresets: 48
     },
     selectedPreset: 'normal',

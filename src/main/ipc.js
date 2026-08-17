@@ -113,7 +113,9 @@ function registerIpcHandlers(context) {
     webContentsId: event.sender.id
   }));
 
-  ipcMain.handle('recording:stop', async (_event, payload = {}) => recordings.stop(payload));
+  ipcMain.handle('recording:stop', async (event, payload = {}) => recordings.stop(payload, {
+    webContentsId: event.sender.id
+  }));
 
   ipcMain.handle('clip:save', async (_event, payload = {}) => recordings.saveClip(payload));
 

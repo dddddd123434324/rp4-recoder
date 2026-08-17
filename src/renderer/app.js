@@ -231,7 +231,7 @@
       profile: settings.profile || null,
       recordingsDir: settings.recordingsDir || state.appInfo?.recordingsDir || '',
       optimizeMp4: settings.optimizeMp4 !== false,
-      clipBufferLimitMb: Number(settings.clipBufferLimitMb) || 2048,
+      clipBufferLimitMb: Number(settings.clipBufferLimitMb) || 256,
       maxCustomPresets: Number(settings.maxCustomPresets) || 48
     };
     state.selectedPreset = state.appSettings.selectedPreset;
@@ -633,7 +633,7 @@
     });
 
     els.clipBufferInput.addEventListener('change', async () => {
-      const value = util.clamp(Number(els.clipBufferInput.value) || 2048, 128, 16384);
+      const value = util.clamp(Number(els.clipBufferInput.value) || 256, 64, 512);
       els.clipBufferInput.value = String(value);
       state.appSettings.clipBufferLimitMb = value;
       try {

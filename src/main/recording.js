@@ -15,6 +15,8 @@ const MAX_INDEX_ENTRIES = 2000;
 // letting writes fail halfway through once the disk is nearly full.
 const MIN_FREE_BYTES_TO_START = 512 * 1024 * 1024;
 const MIN_FREE_BYTES_TO_CONTINUE = 128 * 1024 * 1024;
+const MIN_RECOVERABLE_RECORDING_BYTES = 512;
+const MAX_IPC_CHUNK_BYTES = 64 * 1024 * 1024;
 
 function timestamp(date = new Date()) {
   const pad = (value) => String(value).padStart(2, '0');
@@ -109,20 +111,81 @@ async function moveFile(from, to) {
   }
 }
 
+/**
+ * Replaces a saved recording without ever deleting the only good copy first.
+ * The backup path is included on failures so recovery remains possible even when a
+ * second filesystem error prevents the rollback.
+ */
+async function replaceFileSafely(original, replacement, {
+  move = moveFile,
+  remove = (filePath) => fs.rm(filePath, { force: true })
+} = {}) {
+  const backup = `${original}.backup-${crypto.randomUUID()}`;
+  await move(original, backup);
+
+  try {
+    await move(replacement, original);
+  } catch (error) {
+    try {
+      await move(backup, original);
+    } catch (restoreError) {
+      error.restoreError = restoreError;
+      error.backupPath = backup;
+    }
+    throw error;
+  }
+
+  try {
+    await remove(backup);
+  } catch {
+    // A stale backup costs disk space but is safer than failing a successful save.
+  }
+}
+
+async function writeUniqueFile(dir, baseName, extension, buffer) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const suffix = attempt === 0 ? '' : ` (${attempt + 1})`;
+    const candidate = path.join(dir, `${baseName}${suffix}.${extension}`);
+    let handle;
+    try {
+      handle = await fs.open(candidate, 'wx');
+    } catch (error) {
+      if (error.code === 'EEXIST') continue;
+      throw error;
+    }
+
+    try {
+      await handle.writeFile(buffer);
+      return candidate;
+    } catch (error) {
+      await handle.close().catch(() => {});
+      await fs.rm(candidate, { force: true }).catch(() => {});
+      throw error;
+    } finally {
+      await handle.close().catch(() => {});
+    }
+  }
+
+  return writeUniqueFile(dir, `${baseName}_${crypto.randomUUID().slice(0, 8)}`, extension, buffer);
+}
+
 class RecordingManager {
   /**
    * @param {object} options
    * @param {import('./settings').SettingsStore} options.settings
    * @param {(channel: string, payload: unknown) => void} options.emit
    */
-  constructor({ settings, emit }) {
+  constructor({ settings, emit, move = moveFile }) {
     this.settings = settings;
     this.emit = emit || (() => {});
     this.sessions = new Map();
+    this.finalizing = new Map();
     this.metadata = new Map();
     this.optimizeQueue = [];
     this.optimizing = false;
     this.indexChain = Promise.resolve();
+    this.indexDirty = false;
+    this.moveFile = move;
   }
 
   get activeCount() {
@@ -131,6 +194,10 @@ class RecordingManager {
 
   hasActiveSessions() {
     return this.sessions.size > 0;
+  }
+
+  hasPendingRecordings() {
+    return this.sessions.size > 0 || this.finalizing.size > 0;
   }
 
   indexFile() {
@@ -166,15 +233,30 @@ class RecordingManager {
       await fs.mkdir(path.dirname(target), { recursive: true });
       await fs.writeFile(temporary, JSON.stringify({ version: 1, entries }), 'utf8');
       await fs.rename(temporary, target);
+      this.indexDirty = false;
     };
 
+    this.indexDirty = true;
     this.indexChain = this.indexChain.then(run, run);
     return this.indexChain;
   }
 
-  setMetadata(filePath, meta) {
+  async setMetadata(filePath, meta) {
     this.metadata.set(filePath, meta);
-    void this.saveIndex();
+    try {
+      await this.saveIndex();
+    } catch (error) {
+      this.indexDirty = true;
+      this.emit('app:notice', {
+        level: 'warn',
+        message: `녹화 메타데이터를 저장하지 못했습니다. 종료 전에 다시 시도합니다. (${error?.message || error})`
+      });
+    }
+  }
+
+  async flushIndex() {
+    await this.indexChain.catch(() => {});
+    if (this.indexDirty) await this.saveIndex();
   }
 
   /**
@@ -187,11 +269,12 @@ class RecordingManager {
     try {
       entries = await fs.readdir(tempDir, { withFileTypes: true });
     } catch {
-      return { removed: 0, recovered: [] };
+      return { removed: 0, recovered: [], failed: [] };
     }
 
     const activeTempPaths = new Set([...this.sessions.values()].map((session) => session.tempPath));
     const recovered = [];
+    const failed = [];
     let removed = 0;
 
     for (const entry of entries) {
@@ -210,16 +293,17 @@ class RecordingManager {
 
       // Anything with real content is salvaged into the recordings folder instead of
       // being deleted, so an interrupted take is never silently thrown away.
-      if (stats.size > 64 * 1024 && RECORDING_EXTENSIONS.test(entry.name)) {
+      if (stats.size > MIN_RECOVERABLE_RECORDING_BYTES && RECORDING_EXTENSIONS.test(entry.name)) {
         const extension = path.extname(entry.name).slice(1).toLowerCase();
         const baseName = `${path.basename(entry.name, path.extname(entry.name))}_recovered`;
         const target = await uniquePath(this.settings.recordingsDir, baseName, extension);
         try {
-          await moveFile(fullPath, target);
+          await this.moveFile(fullPath, target);
           recovered.push(target);
           continue;
-        } catch {
-          // fall through to deletion
+        } catch (error) {
+          failed.push({ filePath: fullPath, error: error?.message || String(error) });
+          continue;
         }
       }
 
@@ -227,7 +311,7 @@ class RecordingManager {
       removed += 1;
     }
 
-    return { removed, recovered };
+    return { removed, recovered, failed };
   }
 
   async start(meta = {}, { webContentsId } = {}) {
@@ -242,13 +326,14 @@ class RecordingManager {
     const targetFormat = meta.format === 'webm' ? 'webm' : 'mp4';
     const recordedContainer = containerFromMimeType(meta.mimeType);
     const recordedCodec = videoCodecFromMimeType(meta.mimeType);
+    const sessionId = crypto.randomUUID();
     const baseName = [
       timestamp(),
       sanitizeName(meta.modeLabel || meta.mode, 'recording'),
-      sanitizeName(meta.sourceName, 'source')
+      sanitizeName(meta.sourceName, 'source'),
+      sessionId.slice(0, 8)
     ].join('_');
 
-    const sessionId = crypto.randomUUID();
     const tempPath = path.join(this.settings.tempDir, `${baseName}_${sessionId.slice(0, 8)}.${recordedContainer}`);
     const handle = await fs.open(tempPath, 'w');
 
@@ -261,6 +346,7 @@ class RecordingManager {
       targetFormat,
       recordedContainer,
       recordedCodec,
+      forceRemux: meta.clip === true,
       bytes: 0,
       startedAtMs: Date.now(),
       failed: null,
@@ -298,16 +384,29 @@ class RecordingManager {
 
     const chunk = Buffer.from(payload.buffer);
     if (chunk.length === 0) return { bytes: session.bytes };
+    if (chunk.length > MAX_IPC_CHUNK_BYTES) {
+      throw new Error('녹화 청크가 허용된 최대 크기(64MB)를 초과했습니다.');
+    }
 
     try {
-      await session.handle.write(chunk);
+      let offset = 0;
+      while (offset < chunk.length) {
+        const { bytesWritten } = await session.handle.write(
+          chunk,
+          offset,
+          chunk.length - offset
+        );
+        if (!Number.isFinite(bytesWritten) || bytesWritten <= 0) {
+          throw new Error('파일 쓰기가 진행되지 않았습니다.');
+        }
+        offset += bytesWritten;
+      }
+      session.bytes += offset;
     } catch (error) {
       // Surface the failure instead of continuing to produce a corrupt file.
       session.failed = `녹화 데이터를 디스크에 쓸 수 없습니다. ${error.message}`;
       throw new Error(session.failed, { cause: error });
     }
-
-    session.bytes += chunk.length;
 
     // Periodically re-check headroom so we can stop deliberately near a full disk.
     if (session.bytes - (session.lastSpaceCheckBytes || 0) > 64 * 1024 * 1024) {
@@ -327,11 +426,31 @@ class RecordingManager {
    * the requested format this is a rename and returns immediately; conversion only
    * happens for genuinely mismatched codecs.
    */
-  async stop(payload = {}) {
+  stop(payload = {}, { webContentsId } = {}) {
+    const existing = this.finalizing.get(payload.sessionId);
+    if (existing) {
+      if (existing.webContentsId != null && webContentsId != null
+        && existing.webContentsId !== webContentsId) {
+        return Promise.reject(new Error('녹화 세션에 접근할 수 없습니다.'));
+      }
+      return existing.promise;
+    }
+
     const session = this.sessions.get(payload.sessionId);
-    if (!session) return null;
+    if (!session) return Promise.resolve(null);
+    if (session.webContentsId != null && webContentsId != null
+      && session.webContentsId !== webContentsId) {
+      return Promise.reject(new Error('녹화 세션에 접근할 수 없습니다.'));
+    }
 
     this.sessions.delete(payload.sessionId);
+    const promise = this.finishSession(session, payload)
+      .finally(() => this.finalizing.delete(payload.sessionId));
+    this.finalizing.set(payload.sessionId, { promise, webContentsId: session.webContentsId });
+    return promise;
+  }
+
+  async finishSession(session, payload = {}) {
     try {
       await session.handle.close();
     } catch {
@@ -360,7 +479,7 @@ class RecordingManager {
       bytes: stats?.size || 0
     };
 
-    this.setMetadata(finalized.filePath, meta);
+    await this.setMetadata(finalized.filePath, meta);
 
     if (finalized.optimizable && this.settings.value.optimizeMp4) {
       this.enqueueOptimize(finalized.filePath, durationMs);
@@ -400,7 +519,7 @@ class RecordingManager {
 
     if (recordedContainer === targetFormat) {
       const target = await uniquePath(session.recordingsDir, session.baseName, targetFormat);
-      await moveFile(session.tempPath, target);
+      await this.moveFile(session.tempPath, target);
       return {
         filePath: target,
         format: targetFormat,
@@ -449,7 +568,7 @@ class RecordingManager {
     // Requested WebM but recorded something else: keep the real container rather than
     // lying about the extension.
     const target = await uniquePath(session.recordingsDir, session.baseName, recordedContainer);
-    await moveFile(session.tempPath, target);
+    await this.moveFile(session.tempPath, target);
     return { filePath: target, format: recordedContainer, converted: false, optimizable: false };
   }
 
@@ -461,7 +580,7 @@ class RecordingManager {
       `${session.baseName}_original`,
       session.recordedContainer
     );
-    await moveFile(session.tempPath, target);
+    await this.moveFile(session.tempPath, target);
     return {
       filePath: target,
       format: session.recordedContainer,
@@ -502,17 +621,18 @@ class RecordingManager {
           // Only swap when the result looks sane, so a truncated remux cannot replace a
           // good recording.
           if (after && before && after.size > before.size * 0.5) {
-            await fs.rm(job.filePath, { force: true });
-            await moveFile(optimized, job.filePath);
+            await replaceFileSafely(job.filePath, optimized, { move: this.moveFile });
             const meta = this.metadata.get(job.filePath);
-            if (meta) this.setMetadata(job.filePath, { ...meta, optimized: true, bytes: after.size });
+            if (meta) await this.setMetadata(job.filePath, { ...meta, optimized: true, bytes: after.size });
             this.emit('recording:optimize', { filePath: job.filePath, state: 'done' });
           } else {
             await fs.rm(optimized, { force: true });
             this.emit('recording:optimize', { filePath: job.filePath, state: 'skipped' });
           }
         } catch (error) {
-          await fs.rm(optimized, { force: true });
+          // If rollback itself failed, both the backup path and the replacement are left
+          // intact for recovery. Otherwise the original is safely back in place.
+          if (!error.backupPath) await fs.rm(optimized, { force: true });
           this.emit('recording:optimize', {
             filePath: job.filePath,
             state: 'failed',
@@ -538,6 +658,9 @@ class RecordingManager {
     if (buffer.length === 0) {
       throw new Error('저장할 클립 데이터가 없습니다.');
     }
+    if (buffer.length > MAX_IPC_CHUNK_BYTES) {
+      throw new Error('클립 데이터는 한 번에 64MB를 초과할 수 없습니다. 청크 저장 방식을 사용해 주세요.');
+    }
 
     const targetFormat = meta.format === 'webm' ? 'webm' : 'mp4';
     const recordedContainer = containerFromMimeType(meta.mimeType);
@@ -545,7 +668,8 @@ class RecordingManager {
     const baseName = [
       timestamp(),
       sanitizeName(meta.modeLabel || meta.mode, 'clip'),
-      sanitizeName(meta.sourceName, 'source')
+      sanitizeName(meta.sourceName, 'source'),
+      crypto.randomUUID().slice(0, 8)
     ].join('_');
 
     const tempPath = path.join(
@@ -578,7 +702,7 @@ class RecordingManager {
       bytes: stats?.size || 0
     };
 
-    this.setMetadata(finalized.filePath, dtoMeta);
+    await this.setMetadata(finalized.filePath, dtoMeta);
     if (finalized.optimizable && this.settings.value.optimizeMp4) {
       this.enqueueOptimize(finalized.filePath, durationMs);
     }
@@ -633,7 +757,9 @@ class RecordingManager {
         pruned = true;
       }
     }
-    if (pruned) void this.saveIndex();
+    if (pruned) {
+      void this.saveIndex().catch(() => { this.indexDirty = true; });
+    }
 
     return recordings.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   }
@@ -644,12 +770,14 @@ class RecordingManager {
     if (buffer.length === 0) {
       throw new Error('저장할 스크린샷 데이터가 없습니다.');
     }
+    if (buffer.length > MAX_IPC_CHUNK_BYTES) {
+      throw new Error('스크린샷 데이터는 64MB를 초과할 수 없습니다.');
+    }
 
     const baseName = `${timestamp()}_screenshot`;
     // Screenshots also used a one-second name, so rapid hotkey presses overwrote
     // each other.
-    const filePath = await uniquePath(this.settings.screenshotsDir, baseName, 'png');
-    await fs.writeFile(filePath, buffer);
+    const filePath = await writeUniqueFile(this.settings.screenshotsDir, baseName, 'png', buffer);
     return { filePath, fileName: path.basename(filePath) };
   }
 
@@ -665,6 +793,14 @@ class RecordingManager {
         // ignore
       }
     }));
+
+    await Promise.allSettled([...this.finalizing.values()].map((entry) => entry.promise));
+    await this.flushIndex().catch((error) => {
+      this.emit('app:notice', {
+        level: 'warn',
+        message: `녹화 메타데이터 저장을 완료하지 못했습니다. (${error?.message || error})`
+      });
+    });
 
     return sessions.length;
   }
@@ -684,6 +820,11 @@ class RecordingManager {
         // Best effort: the sweep on next launch recovers anything left behind.
       }
     }
+    const finishing = [...this.finalizing.values()].map((entry) => entry.promise);
+    const settled = await Promise.allSettled(finishing);
+    for (const result of settled) {
+      if (result.status === 'fulfilled' && result.value) saved.push(result.value);
+    }
     return saved;
   }
 }
@@ -695,5 +836,9 @@ module.exports = {
   sanitizeName,
   containerFromMimeType,
   videoCodecFromMimeType,
-  uniquePath
+  uniquePath,
+  moveFile,
+  replaceFileSafely,
+  writeUniqueFile,
+  MAX_IPC_CHUNK_BYTES
 };

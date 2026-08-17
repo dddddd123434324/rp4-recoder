@@ -25,7 +25,7 @@
   }
 
   function clipLimitBytes() {
-    const limitMb = Number(state.appSettings.clipBufferLimitMb) || 2048;
+    const limitMb = Number(state.appSettings.clipBufferLimitMb) || 256;
     return limitMb * 1024 * 1024;
   }
 
@@ -100,7 +100,10 @@
       const recorder = new MediaRecorder(capture.stream, {
         mimeType: codec.mimeType,
         videoBitsPerSecond: profile.bitrateMbps * 1000 * 1000,
-        audioBitsPerSecond: profile.audioBitrateKbps * 1000
+        audioBitsPerSecond: profile.audioBitrateKbps * 1000,
+        // This improves the odds that a retained suffix begins near a decodable frame.
+        // Blob boundaries are still normalized by the main-process remux on save.
+        videoKeyFrameIntervalDuration: CHUNK_MS
       });
 
       const session = {
@@ -211,6 +214,7 @@
 
     state.clipSaving = true;
     RP4.app.updateClipUi();
+    let clipSession = null;
 
     try {
       await flush(session);
@@ -235,31 +239,45 @@
       const lastAt = selected[selected.length - 1].at;
       const estimatedMs = Math.min(windowMs, Math.max(CHUNK_MS, lastAt - firstAt + CHUNK_MS));
 
-      const blob = new Blob([session.initChunk, ...selected.map((entry) => entry.blob)], {
-        type: session.codec.mimeType
-      });
-      const buffer = await blob.arrayBuffer();
-
       RP4.ui.setStatus('클립 저장 중', '최근 장면을 파일로 저장하고 있습니다.', 'warn');
 
-      const saved = await window.rp4.saveClip({
-        buffer,
-        meta: {
-          mode: state.selectedMode,
-          modeLabel: `${RP4.app.getModeLabel(state.selectedMode)} 클립`,
-          sourceName: RP4.app.getSourceTitle(state.selectedSource),
-          format: profile.format,
-          mimeType: session.codec.mimeType,
-          width: session.output.width,
-          height: session.output.height,
-          fps: profile.fps,
-          bitrateMbps: profile.bitrateMbps,
-          audioBitrateKbps: profile.audioBitrateKbps,
-          encoderPreset: profile.encoderPreset,
-          durationMs: estimatedMs,
-          clip: true
-        }
+      const meta = {
+        mode: state.selectedMode,
+        modeLabel: `${RP4.app.getModeLabel(state.selectedMode)} 클립`,
+        sourceName: RP4.app.getSourceTitle(state.selectedSource),
+        format: profile.format,
+        mimeType: session.codec.mimeType,
+        width: session.output.width,
+        height: session.output.height,
+        fps: profile.fps,
+        bitrateMbps: profile.bitrateMbps,
+        audioBitrateKbps: profile.audioBitrateKbps,
+        encoderPreset: profile.encoderPreset,
+        durationMs: estimatedMs,
+        clip: true
+      };
+
+      // Stream each retained MediaRecorder delivery separately. Building one giant Blob,
+      // flattening it to an ArrayBuffer, and cloning it through IPC could otherwise create
+      // several simultaneous copies of a hundreds-of-megabytes clip.
+      clipSession = await window.rp4.startRecording(meta);
+      await window.rp4.writeRecordingChunk({
+        sessionId: clipSession.sessionId,
+        buffer: await session.initChunk.arrayBuffer()
       });
+      for (const entry of selected) {
+        await window.rp4.writeRecordingChunk({
+          sessionId: clipSession.sessionId,
+          buffer: await entry.blob.arrayBuffer()
+        });
+      }
+      const saved = await window.rp4.stopRecording({
+        sessionId: clipSession.sessionId,
+        durationMs: estimatedMs,
+        meta
+      });
+      clipSession = null;
+      if (!saved) throw new Error('클립 저장 결과가 없습니다.');
 
       await RP4.files.render();
 
@@ -280,6 +298,12 @@
       }
     } catch (error) {
       console.error(error);
+      if (clipSession) {
+        await window.rp4.stopRecording({
+          sessionId: clipSession.sessionId,
+          durationMs: 0
+        }).catch(() => {});
+      }
       RP4.ui.setStatus('클립 저장 실패', '클립 파일 저장을 완료하지 못했습니다.', 'warn');
       RP4.ui.showToast('클립 파일 저장을 완료하지 못했습니다.');
     } finally {
