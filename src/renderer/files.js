@@ -7,7 +7,22 @@
   const { state, els, util } = RP4;
 
   const VIDEO_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="13" rx="1.6"/><path d="M8 21h8M12 18v3"/></svg>';
-  const LIST_LIMIT = 8;
+
+  function actionButton({ text, title, className = '', onClick }) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = text;
+    button.title = title;
+    button.setAttribute('aria-label', title);
+    if (className) button.className = className;
+    button.addEventListener('click', () => {
+      void Promise.resolve(onClick()).catch((error) => {
+        console.error(error);
+        RP4.ui.showToast('파일 작업을 완료하지 못했습니다.');
+      });
+    });
+    return button;
+  }
 
   function createItem(recording) {
     const item = document.createElement('div');
@@ -25,6 +40,7 @@
 
     const detail = document.createElement('small');
     detail.textContent = [
+      util.formatDate(recording.createdAt),
       recording.durationMs ? util.formatDuration(recording.durationMs) : null,
       recording.width && recording.height ? `${recording.width}x${recording.height}` : null,
       recording.fps ? `${recording.fps} FPS` : null,
@@ -34,18 +50,45 @@
 
     const actions = document.createElement('div');
     actions.className = 'recording-actions';
-    const date = document.createElement('small');
-    date.textContent = util.formatDate(recording.createdAt);
 
-    const open = document.createElement('button');
-    open.type = 'button';
-    open.textContent = '...';
-    open.title = '파일 위치 열기';
-    open.addEventListener('click', async () => {
-      const shown = await window.rp4.showFile(recording.filePath);
-      if (!shown) RP4.ui.showToast('파일을 찾을 수 없습니다.');
+    const open = actionButton({
+      text: '…',
+      title: '파일 위치 열기',
+      onClick: async () => {
+        const shown = await window.rp4.showFile(recording.filePath);
+        if (!shown) RP4.ui.showToast('파일을 찾을 수 없습니다.');
+      }
     });
-    actions.append(date, open);
+    const play = actionButton({
+      text: '▶',
+      title: '녹화 재생',
+      onClick: async () => {
+        const result = await window.rp4.playRecording(recording.filePath);
+        if (!result?.ok) RP4.ui.showToast(result?.error || '녹화 파일을 재생할 수 없습니다.');
+      }
+    });
+    const remove = actionButton({
+      text: '×',
+      title: '녹화 삭제',
+      className: 'danger',
+      onClick: async () => {
+        const confirmed = await RP4.dialog.confirmAction({
+          title: '녹화 파일 삭제',
+          message: `${recording.name}\n\n이 파일을 휴지통으로 이동할까요?`,
+          confirmLabel: '삭제'
+        });
+        if (!confirmed) return;
+
+        const result = await window.rp4.deleteRecording(recording.filePath);
+        if (!result?.deleted) {
+          RP4.ui.showToast('녹화 파일을 삭제하지 못했습니다.');
+          return;
+        }
+        RP4.ui.showToast('녹화 파일을 휴지통으로 이동했습니다.');
+        await render();
+      }
+    });
+    actions.append(open, play, remove);
 
     item.append(thumb, info, actions);
     return item;
@@ -66,7 +109,7 @@
         return;
       }
 
-      for (const recording of recordings.slice(0, LIST_LIMIT)) {
+      for (const recording of recordings) {
         els.recordingList.append(createItem(recording));
       }
     } catch (error) {

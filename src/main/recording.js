@@ -183,6 +183,7 @@ class RecordingManager {
     this.metadata = new Map();
     this.optimizeQueue = [];
     this.optimizing = false;
+    this.optimizingFilePath = null;
     this.optimizeDrainPromise = null;
     this.optimizationCancelled = false;
     this.indexChain = Promise.resolve();
@@ -751,6 +752,7 @@ class RecordingManager {
         if (!(await paths.pathExists(job.filePath))) continue;
 
         const optimized = `${job.filePath}.optimizing.mp4`;
+        this.optimizingFilePath = job.filePath;
         try {
           this.emit('recording:optimize', { filePath: job.filePath, state: 'start' });
           await ffmpeg.remux(job.filePath, optimized, {
@@ -780,6 +782,8 @@ class RecordingManager {
             state: 'failed',
             error: error?.message || String(error)
           });
+        } finally {
+          this.optimizingFilePath = null;
         }
       }
     } finally {
@@ -918,6 +922,40 @@ class RecordingManager {
     }
 
     return recordings.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  }
+
+  /** Moves a completed top-level recording to the OS recycle bin and prunes its metadata. */
+  async trashRecording(filePath, { trash } = {}) {
+    if (typeof filePath !== 'string' || typeof trash !== 'function') return false;
+    const recordingsDir = path.resolve(this.settings.recordingsDir);
+    const target = path.resolve(filePath);
+    if (path.dirname(target).toLowerCase() !== recordingsDir.toLowerCase()
+      || !RECORDING_EXTENSIONS.test(target)) return false;
+    if (!(await paths.pathExists(target))) return false;
+
+    this.optimizeQueue = this.optimizeQueue.filter((job) => job.filePath !== target);
+    if (this.optimizingFilePath === target) {
+      ffmpeg.cancel(`optimize:${target}`);
+      const deadline = Date.now() + 10000;
+      while (this.optimizingFilePath === target && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      if (this.optimizingFilePath === target) return false;
+    }
+
+    if (!(await paths.pathExists(target))) return false;
+    await trash(target);
+    this.metadata.delete(target);
+    try {
+      await this.saveIndex();
+    } catch (error) {
+      this.indexDirty = true;
+      this.emit('app:notice', {
+        level: 'warn',
+        message: `삭제된 녹화의 메타데이터를 정리하지 못했습니다. (${error?.message || error})`
+      });
+    }
+    return true;
   }
 
   async saveScreenshot(payload = {}) {

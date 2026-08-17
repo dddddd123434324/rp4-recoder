@@ -37,6 +37,8 @@ contextBridge.exposeInMainWorld('rp4', {
   openRecordingsFolder: () => ipcRenderer.invoke('folder:open-recordings'),
   chooseRecordingsFolder: () => ipcRenderer.invoke('folder:choose-recordings'),
   showFile: (filePath) => ipcRenderer.invoke('file:show', filePath),
+  playRecording: (filePath) => ipcRenderer.invoke('file:play', filePath),
+  deleteRecording: (filePath) => ipcRenderer.invoke('file:delete', filePath),
 
   getAppSettings: () => ipcRenderer.invoke('settings:get'),
   setSelectedPreset: (key) => ipcRenderer.invoke('settings:selected-preset', key),

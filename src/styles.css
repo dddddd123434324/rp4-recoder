@@ -1397,22 +1397,31 @@ svg {
   max-height: none;
   flex: 1 1 auto;
   min-height: 0;
+  gap: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding-right: 3px;
 }
 
 .file-panel .recording-item {
-  grid-template-columns: 46px minmax(0, 1fr) auto;
-  gap: 10px;
-  min-height: 54px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 5px;
+  min-height: 42px;
+  padding: 5px 2px;
+  border: 0;
+  border-bottom: 1px solid #20242a;
+  border-radius: 0;
+  background: transparent;
+}
+
+.file-panel .recording-item:hover {
+  background: rgba(255, 255, 255, 0.035);
 }
 
 .file-panel .recording-thumb {
-  width: 46px;
-  height: 32px;
-}
-
-.file-panel .recording-thumb svg {
-  width: 18px;
-  height: 18px;
+  display: none;
 }
 
 .file-panel .recording-info strong {
@@ -1420,24 +1429,29 @@ svg {
 }
 
 .file-panel .recording-info small {
-  margin-top: 3px;
-  font-size: 11px;
+  margin-top: 2px;
+  font-size: 9px;
 }
 
 .file-panel .recording-actions {
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 3px;
-}
-
-.file-panel .recording-actions small {
-  color: #7f868f;
-  font-size: 10px;
+  flex-direction: row;
+  align-items: center;
+  gap: 2px;
 }
 
 .file-panel .recording-actions button {
-  width: 24px;
-  height: 20px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 5px;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.file-panel .recording-actions button.danger:hover {
+  border-color: rgba(255, 74, 55, 0.9);
+  background: rgba(255, 45, 10, 0.16);
+  color: #ff8f7c;
 }
 
 .ready-card {

@@ -174,6 +174,22 @@ function registerIpcHandlers(context) {
     return true;
   });
 
+  ipcMain.handle('file:play', async (_event, filePath) => {
+    if (typeof filePath !== 'string' || !filePath) return { ok: false, error: '파일 경로가 없습니다.' };
+    if (!paths.isInside(settings.recordingsDir, filePath)) {
+      return { ok: false, error: '이 파일을 열 수 없습니다.' };
+    }
+    if (!(await paths.pathExists(filePath))) return { ok: false, error: '파일을 찾을 수 없습니다.' };
+    const error = await shell.openPath(filePath);
+    return error ? { ok: false, error } : { ok: true };
+  });
+
+  ipcMain.handle('file:delete', async (_event, filePath) => ({
+    deleted: await recordings.trashRecording(filePath, {
+      trash: (target) => shell.trashItem(target)
+    })
+  }));
+
   ipcMain.handle('settings:get', async () => settingsDto());
 
   ipcMain.handle('settings:selected-preset', async (_event, key) => {
