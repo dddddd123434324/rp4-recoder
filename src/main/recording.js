@@ -69,6 +69,14 @@ function videoCodecFromMimeType(mimeType) {
   return 'unknown';
 }
 
+function audioCodecFromMimeType(mimeType) {
+  const value = String(mimeType || '').toLowerCase();
+  if (value.includes('mp4a') || value.includes('aac')) return 'aac';
+  if (value.includes('opus')) return 'opus';
+  if (value.includes('vorbis')) return 'vorbis';
+  return 'unknown';
+}
+
 async function statFile(filePath) {
   try {
     return await fs.stat(filePath);
@@ -348,6 +356,7 @@ class RecordingManager {
     const targetFormat = meta.format === 'webm' ? 'webm' : 'mp4';
     const recordedContainer = containerFromMimeType(meta.mimeType);
     const recordedCodec = videoCodecFromMimeType(meta.mimeType);
+    const recordedAudioCodec = audioCodecFromMimeType(meta.mimeType);
     const sessionId = crypto.randomUUID();
     const baseName = [
       timestamp(),
@@ -368,6 +377,7 @@ class RecordingManager {
       targetFormat,
       recordedContainer,
       recordedCodec,
+      recordedAudioCodec,
       forceRemux: meta.clip === true,
       bytes: 0,
       startedAtMs: Date.now(),
@@ -378,6 +388,7 @@ class RecordingManager {
         targetFormat,
         recordedContainer,
         recordedCodec,
+        recordedAudioCodec,
         startedAt: new Date().toISOString()
       }
     });
@@ -388,7 +399,8 @@ class RecordingManager {
       // matches the target, which is what makes stopping instant.
       directToTarget: recordedContainer === targetFormat,
       recordedContainer,
-      recordedCodec
+      recordedCodec,
+      recordedAudioCodec
     };
   }
 
@@ -401,7 +413,7 @@ class RecordingManager {
     if (session.webContentsId != null && webContentsId != null && session.webContentsId !== webContentsId) {
       throw new Error('녹화 세션에 접근할 수 없습니다.');
     }
-    if (session.failed) {
+    if (session.failed && payload.terminal !== true) {
       throw new Error(session.failed);
     }
 
@@ -547,7 +559,7 @@ class RecordingManager {
    *  3. re-encode     – codec cannot go into the target container at all
    */
   async finalize(session, { durationMs }) {
-    const { targetFormat, recordedContainer, recordedCodec } = session;
+    const { targetFormat, recordedContainer, recordedCodec, recordedAudioCodec } = session;
     const canStreamCopyToMp4 = targetFormat === 'mp4' && recordedCodec === 'h264';
 
     // Clip epochs contain every Blob from one MediaRecorder in order. FFmpeg can therefore
@@ -612,10 +624,16 @@ class RecordingManager {
       const target = await uniquePath(session.recordingsDir, session.baseName, 'mp4');
       try {
         this.emit('recording:convert-progress', { phase: 'remux', ratio: 0 });
-        await ffmpeg.remux(session.tempPath, target, {
+        const remuxOptions = {
           totalDurationMs: durationMs,
+          audioBitrateKbps: session.meta.audioBitrateKbps,
           onProgress: (ratio) => this.emit('recording:convert-progress', { phase: 'remux', ratio })
-        });
+        };
+        if (recordedAudioCodec === 'opus') {
+          await ffmpeg.remuxH264ToMp4(session.tempPath, target, remuxOptions);
+        } else {
+          await ffmpeg.remux(session.tempPath, target, remuxOptions);
+        }
         await fs.rm(session.tempPath, { force: true });
         return { filePath: target, format: 'mp4', converted: true, optimizable: false };
       } catch (error) {
@@ -1003,12 +1021,12 @@ class RecordingManager {
    * Finalizes every in-flight recording. Used when the window is closing so a take is
    * saved properly instead of being stranded in `.temp`.
    */
-  async finalizeAllSessions() {
+  async finalizeAllSessions({ failureReason = null } = {}) {
     const ids = [...this.sessions.keys()];
     const saved = [];
     for (const sessionId of ids) {
       try {
-        const result = await this.stop({ sessionId });
+        const result = await this.stop({ sessionId, failureReason });
         if (result) saved.push(result);
       } catch {
         // Best effort: the sweep on next launch recovers anything left behind.
@@ -1030,6 +1048,7 @@ module.exports = {
   sanitizeName,
   containerFromMimeType,
   videoCodecFromMimeType,
+  audioCodecFromMimeType,
   uniquePath,
   moveFile,
   replaceFileSafely,

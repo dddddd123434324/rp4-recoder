@@ -43,6 +43,7 @@ contextBridge.exposeInMainWorld('rp4', {
   getAppSettings: () => ipcRenderer.invoke('settings:get'),
   setSelectedPreset: (key) => ipcRenderer.invoke('settings:selected-preset', key),
   saveProfile: (profile) => ipcRenderer.invoke('settings:profile', profile),
+  saveProfileState: (payload) => ipcRenderer.invoke('settings:profile-state', payload),
   setOptions: (options) => ipcRenderer.invoke('settings:options', options),
   saveCustomPreset: (preset) => ipcRenderer.invoke('settings:custom-preset:save', preset),
   deleteCustomPreset: (id) => ipcRenderer.invoke('settings:custom-preset:delete', id),
@@ -61,6 +62,7 @@ contextBridge.exposeInMainWorld('rp4', {
   // Fired when the app is closing so the renderer can flush and finalize a recording
   // before the window goes away.
   onFinalizeRecordings: (callback) => subscribe('app:finalize-recordings', callback),
+  reportFinalizeComplete: (requestId) => ipcRenderer.send('app:shutdown-ready', { requestId }),
 
   window: {
     minimize: () => ipcRenderer.invoke('window:minimize'),

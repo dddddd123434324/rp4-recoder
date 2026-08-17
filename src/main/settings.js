@@ -110,6 +110,8 @@ function normalizeCustomPresets(value) {
 }
 
 function normalizeSelectedPreset(value, customPresets = []) {
+  // null explicitly means the live profile was adjusted and no preset is active.
+  if (value === null) return null;
   const key = typeof value === 'string' ? value : DEFAULT_SELECTED_PRESET;
   if (BUILTIN_PRESET_KEYS.has(key)) return key;
 

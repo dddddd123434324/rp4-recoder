@@ -1,6 +1,15 @@
 'use strict';
 
-const { BrowserWindow, app, desktopCapturer, dialog, ipcMain, screen, shell } = require('electron/main');
+const {
+  BrowserWindow,
+  app,
+  desktopCapturer,
+  dialog,
+  globalShortcut,
+  ipcMain,
+  screen,
+  shell
+} = require('electron/main');
 const crypto = require('node:crypto');
 
 const displays = require('./displays');
@@ -22,6 +31,7 @@ const { parseWindowHandle } = require('./window-crop');
  */
 function registerIpcHandlers(context) {
   const { settings, recordings, windowCrop, hotkeys, isSmoke } = context;
+  let folderDialogActive = false;
 
   function settingsDto() {
     const value = settings.value;
@@ -105,9 +115,12 @@ function registerIpcHandlers(context) {
 
   ipcMain.handle('recordings:list', async () => recordings.list());
 
-  ipcMain.handle('recording:start', async (event, meta = {}) => recordings.start(meta, {
-    webContentsId: event.sender.id
-  }));
+  ipcMain.handle('recording:start', async (event, meta = {}) => {
+    if (folderDialogActive) {
+      throw new Error('저장 폴더를 선택하는 동안에는 녹화를 시작할 수 없습니다.');
+    }
+    return recordings.start(meta, { webContentsId: event.sender.id });
+  });
 
   ipcMain.handle('recording:write', async (event, payload = {}) => recordings.write(payload, {
     webContentsId: event.sender.id
@@ -130,39 +143,67 @@ function registerIpcHandlers(context) {
   });
 
   ipcMain.handle('folder:choose-recordings', async (event) => {
-    const win = BrowserWindow.fromWebContents(event.sender);
-    const result = await dialog.showOpenDialog(win, {
-      title: '녹화 파일 저장 경로 선택',
-      defaultPath: settings.recordingsDir,
-      properties: ['openDirectory', 'createDirectory']
-    });
-
-    if (result.canceled || !result.filePaths[0]) {
-      return { canceled: true, recordingsDir: settings.recordingsDir };
-    }
-
-    const chosen = result.filePaths[0];
-    if (!paths.isPlausibleRecordingsDir(chosen)) {
+    if (folderDialogActive || recordings.hasPendingRecordings()) {
       return {
         canceled: false,
         failed: true,
-        error: '이 위치는 저장 폴더로 사용할 수 없습니다.',
-        recordingsDir: settings.recordingsDir
-      };
-    }
-    // Confirm we can actually write there before committing the setting.
-    if (!(await paths.isDirectoryWritable(chosen))) {
-      return {
-        canceled: false,
-        failed: true,
-        error: '선택한 폴더에 쓸 수 없습니다. 다른 폴더를 선택해 주세요.',
+        error: '녹화 또는 저장 작업 중에는 저장 경로를 바꿀 수 없습니다.',
         recordingsDir: settings.recordingsDir
       };
     }
 
-    await settings.update({ recordingsDir: chosen });
-    await paths.ensureRecordingDirs(settings.recordingsDir);
-    return { canceled: false, failed: false, recordingsDir: settings.recordingsDir };
+    folderDialogActive = true;
+    try {
+      globalShortcut.setSuspended(true);
+      const win = BrowserWindow.fromWebContents(event.sender);
+      const result = await dialog.showOpenDialog(win, {
+        title: '녹화 파일 저장 경로 선택',
+        defaultPath: settings.recordingsDir,
+        properties: ['openDirectory', 'createDirectory']
+      });
+
+      if (result.canceled || !result.filePaths[0]) {
+        return { canceled: true, recordingsDir: settings.recordingsDir };
+      }
+
+      const chosen = result.filePaths[0];
+      if (!paths.isPlausibleRecordingsDir(chosen)) {
+        return {
+          canceled: false,
+          failed: true,
+          error: '이 위치는 저장 폴더로 사용할 수 없습니다.',
+          recordingsDir: settings.recordingsDir
+        };
+      }
+      // Confirm we can actually write there before committing the setting.
+      if (!(await paths.isDirectoryWritable(chosen))) {
+        return {
+          canceled: false,
+          failed: true,
+          error: '선택한 폴더에 쓸 수 없습니다. 다른 폴더를 선택해 주세요.',
+          recordingsDir: settings.recordingsDir
+        };
+      }
+      if (recordings.hasPendingRecordings()) {
+        return {
+          canceled: false,
+          failed: true,
+          error: '녹화가 시작되어 저장 경로 변경을 취소했습니다.',
+          recordingsDir: settings.recordingsDir
+        };
+      }
+
+      await settings.update({ recordingsDir: chosen });
+      await paths.ensureRecordingDirs(settings.recordingsDir);
+      return { canceled: false, failed: false, recordingsDir: settings.recordingsDir };
+    } finally {
+      try {
+        globalShortcut.setSuspended(false);
+      } catch {
+        // App shutdown may have released the shortcut service while the dialog closed.
+      }
+      folderDialogActive = false;
+    }
   });
 
   ipcMain.handle('file:show', async (_event, filePath) => {
@@ -204,6 +245,14 @@ function registerIpcHandlers(context) {
     return settingsDto();
   });
 
+  ipcMain.handle('settings:profile-state', async (_event, payload = {}) => {
+    await settings.update({
+      selectedPreset: payload.selectedPreset == null ? null : payload.selectedPreset,
+      profile: payload.profile
+    });
+    return settingsDto();
+  });
+
   ipcMain.handle('settings:options', async (_event, options = {}) => {
     const patch = {};
     if (typeof options.optimizeMp4 === 'boolean') patch.optimizeMp4 = options.optimizeMp4;
@@ -237,7 +286,8 @@ function registerIpcHandlers(context) {
     const dropped = Math.max(0, existing.length - settingsModule.MAX_CUSTOM_PRESETS);
     await settings.update({
       selectedPreset: `custom:${id}`,
-      customPresets: existing.slice(0, settingsModule.MAX_CUSTOM_PRESETS)
+      customPresets: existing.slice(0, settingsModule.MAX_CUSTOM_PRESETS),
+      profile: nextPreset.profile
     });
 
     return { ...settingsDto(), dropped };
@@ -250,10 +300,14 @@ function registerIpcHandlers(context) {
       ? settingsModule.DEFAULT_SELECTED_PRESET
       : value.selectedPreset;
 
-    await settings.update({
+    const patch = {
       selectedPreset,
       customPresets: value.customPresets.filter((preset) => preset.id !== targetId)
-    });
+    };
+    if (value.selectedPreset === `custom:${targetId}`) {
+      patch.profile = settingsModule.DEFAULT_PROFILE;
+    }
+    await settings.update(patch);
     return settingsDto();
   });
 

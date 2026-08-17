@@ -64,22 +64,26 @@ async function shutdown() {
   if (isQuitting) return;
   isQuitting = true;
 
-  try {
-    hotkeys?.unregisterAll();
-    windows.closeAreaSelector();
-
-    if (recordings) {
-      await windows.drainRecordings(mainWindow, recordings, { timeoutMs: 20000 });
-      await recordings.closeAllSessions();
-      await recordings.cancelAndDrainOptimizations();
+  const cleanup = async (label, task) => {
+    try {
+      await task();
+    } catch (error) {
+      process.stderr.write(`shutdown ${label} error: ${error?.message || error}\n`);
     }
+  };
 
-    // Also covers an FFmpeg job that was started outside RecordingManager.
-    ffmpeg.cancelAll();
-    windowCrop.dispose();
-  } catch (error) {
-    process.stderr.write(`shutdown error: ${error?.message || error}\n`);
+  await cleanup('hotkeys', () => hotkeys?.unregisterAll());
+  await cleanup('area selector', () => windows.closeAreaSelector());
+  if (recordings) {
+    await cleanup('recordings', () => (
+      windows.drainRecordings(mainWindow, recordings, { timeoutMs: 20000 })
+    ));
+    await cleanup('session handles', () => recordings.closeAllSessions());
+    await cleanup('optimizations', () => recordings.cancelAndDrainOptimizations());
   }
+  // Also covers an FFmpeg job that was started outside RecordingManager.
+  await cleanup('ffmpeg', () => ffmpeg.cancelAll());
+  await cleanup('window crop', () => windowCrop.dispose());
 
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.rp4AllowClose = true;
@@ -251,12 +255,8 @@ async function bootstrap() {
   });
 }
 
-process.on('uncaughtException', (error) => {
+process.on('uncaughtExceptionMonitor', (error) => {
   process.stderr.write(`uncaught: ${error?.stack || error}\n`);
-  if (!app.isReady()) {
-    dialog.showErrorBox('RP4 Recorder', `예기치 않은 오류가 발생했습니다.\n\n${error?.message || error}`);
-    app.exit(1);
-  }
 });
 
 process.on('unhandledRejection', (reason) => {

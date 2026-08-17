@@ -116,6 +116,13 @@
     return state.appSettings.customPresets.find((preset) => preset.id === id) || null;
   }
 
+  function matchesPreset(profile, key) {
+    const preset = getPresetByKey(key);
+    if (!preset || !profile) return false;
+    const expected = preset.profile || preset;
+    return Object.entries(expected).every(([name, value]) => String(profile[name]) === String(value));
+  }
+
   function setActivePreset(key) {
     state.selectedPreset = key || null;
     for (const button of RP4.$$('.preset-card')) {
@@ -130,13 +137,35 @@
    */
   function scheduleProfileSave() {
     window.clearTimeout(state.profileSaveTimer);
-    state.profileSaveTimer = window.setTimeout(async () => {
-      try {
-        await window.rp4.saveProfile(getPersistable());
-      } catch {
+    state.profileSaveTimer = window.setTimeout(() => {
+      state.profileSaveTimer = null;
+      const promise = window.rp4.saveProfileState({
+        selectedPreset: null,
+        profile: getPersistable()
+      });
+      state.profileSavePromise = promise;
+      void promise.catch(() => {
         // Non-fatal: the session keeps working with the in-memory values.
-      }
+      }).finally(() => {
+        if (state.profileSavePromise === promise) state.profileSavePromise = null;
+      });
     }, 400);
+  }
+
+  async function flushSave() {
+    if (state.profileSaveTimer != null) {
+      window.clearTimeout(state.profileSaveTimer);
+      state.profileSaveTimer = null;
+      const promise = window.rp4.saveProfileState({
+        selectedPreset: state.selectedPreset,
+        profile: getPersistable()
+      });
+      state.profileSavePromise = promise;
+      await promise.catch(() => {});
+      if (state.profileSavePromise === promise) state.profileSavePromise = null;
+      return;
+    }
+    await state.profileSavePromise?.catch(() => {});
   }
 
   /** Applies volume changes to a live recording instead of only to the next one. */
@@ -172,14 +201,20 @@
     RP4.app.updateClipUi();
 
     if (persist) {
+      const profile = getPersistable();
       try {
-        const settings = await window.rp4.setSelectedPreset(key);
+        window.clearTimeout(state.profileSaveTimer);
+        state.profileSaveTimer = null;
+        await state.profileSavePromise?.catch(() => {});
+        const settings = await window.rp4.saveProfileState({
+          selectedPreset: key,
+          profile
+        });
         RP4.app.applyAppSettings(settings);
         setActivePreset(key);
       } catch {
         RP4.ui.showToast('선택한 프리셋을 저장하지 못했습니다.');
       }
-      scheduleProfileSave();
     }
 
     if (state.selectedSource) {
@@ -206,6 +241,9 @@
     if (!name) return;
 
     try {
+      window.clearTimeout(state.profileSaveTimer);
+      state.profileSaveTimer = null;
+      await state.profileSavePromise?.catch(() => {});
       const settings = await window.rp4.saveCustomPreset({ name, profile: getPersistable() });
       RP4.app.applyAppSettings(settings);
       await applyPreset(settings.selectedPreset, { persist: false });
@@ -229,6 +267,9 @@
     if (!name) return;
 
     try {
+      window.clearTimeout(state.profileSaveTimer);
+      state.profileSaveTimer = null;
+      await state.profileSavePromise?.catch(() => {});
       const settings = await window.rp4.saveCustomPreset({ id, name, profile: getPersistable() });
       RP4.app.applyAppSettings(settings);
       await applyPreset(`custom:${id}`, { persist: false });
@@ -251,10 +292,16 @@
     if (!confirmed) return;
 
     try {
+      const wasSelected = state.selectedPreset === `custom:${id}`;
       const settings = await window.rp4.deleteCustomPreset(id);
       RP4.app.applyAppSettings(settings);
-      if (settings.selectedPreset) {
-        await applyPreset(settings.selectedPreset, { persist: false });
+      if (wasSelected) {
+        applyToForm(settings.profile || BUILTIN_PRESETS.normal);
+        setActivePreset(settings.selectedPreset);
+        RP4.app.updateVolumeLabels();
+        RP4.app.updatePreviewMeta();
+        RP4.app.updateClipUi();
+        if (state.selectedSource) await RP4.recorder.restartPreview();
       }
       RP4.ui.showToast('프리셋을 삭제했습니다.');
     } catch (error) {
@@ -276,11 +323,13 @@
     getPersistable,
     applyToForm,
     getPresetByKey,
+    matchesPreset,
     setActivePreset,
     markChanged,
     applyPreset,
     applyLiveGains,
     scheduleProfileSave,
+    flushSave,
     createCustomPreset,
     updateCustomPreset,
     deleteCustomPreset,

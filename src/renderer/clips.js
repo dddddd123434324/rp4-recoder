@@ -269,10 +269,7 @@
     if (!failed) RP4.ui.setStatus('준비 완료', '녹화 준비가\n완료되었습니다.', 'ready');
   }
 
-  async function saveClip() {
-    const session = state.clip;
-    if (!session || state.clipSaving || state.captureLifecycle !== 'clip') return;
-
+  async function performSaveClip(session) {
     const requestedAt = Date.now();
     session.pendingSaveRequests += 1;
     state.clipSaving = true;
@@ -372,6 +369,25 @@
     }
   }
 
+  function saveClip() {
+    const session = state.clip;
+    if (!session || state.captureLifecycle !== 'clip') return Promise.resolve();
+    if (state.clipSavePromise) return state.clipSavePromise;
+
+    const promise = performSaveClip(session);
+    state.clipSavePromise = promise;
+    void promise.finally(() => {
+      if (state.clipSavePromise === promise) state.clipSavePromise = null;
+    });
+    return promise;
+  }
+
+  /** Waits for a snapshot/write/conversion already in progress before releasing capture. */
+  async function finalizeForShutdown() {
+    await state.clipSavePromise?.catch(() => {});
+    if (state.clip) await stopClipMode(state.clip);
+  }
+
   function bufferStatus() {
     const session = state.clip;
     const epoch = session?.currentEpoch;
@@ -391,6 +407,7 @@
     startClipMode,
     stopClipMode,
     saveClip,
+    finalizeForShutdown,
     pruneActiveBuffer,
     bufferStatus
   };

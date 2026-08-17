@@ -242,7 +242,7 @@
 
   function applyAppSettings(settings = {}) {
     state.appSettings = {
-      selectedPreset: settings.selectedPreset || 'normal',
+      selectedPreset: Object.hasOwn(settings, 'selectedPreset') ? settings.selectedPreset : 'normal',
       customPresets: Array.isArray(settings.customPresets) ? settings.customPresets : [],
       profile: settings.profile || null,
       recordingsDir: settings.recordingsDir || state.appInfo?.recordingsDir || '',
@@ -322,7 +322,19 @@
       // Restore the saved working profile, falling back to the selected preset.
       if (settings.profile) {
         RP4.profile.applyToForm(settings.profile);
-        RP4.profile.setActivePreset(state.appSettings.selectedPreset);
+        if (RP4.profile.matchesPreset(settings.profile, state.appSettings.selectedPreset)) {
+          RP4.profile.setActivePreset(state.appSettings.selectedPreset);
+        } else {
+          RP4.profile.setActivePreset(null);
+          if (state.appSettings.selectedPreset != null) {
+            const corrected = await window.rp4.saveProfileState({
+              selectedPreset: null,
+              profile: settings.profile
+            });
+            applyAppSettings(corrected);
+            RP4.profile.setActivePreset(null);
+          }
+        }
       } else {
         await RP4.profile.applyPreset(state.appSettings.selectedPreset || 'normal', { persist: false });
       }
@@ -520,10 +532,11 @@
         return;
       }
 
+      const captureStartedWhileDialogClosed = RP4.lifecycle.isBusy();
       state.appSettings.recordingsDir = result.recordingsDir;
       if (state.appInfo) state.appInfo.recordingsDir = result.recordingsDir;
       updateRecordingFolderUi();
-      await RP4.files.render();
+      if (!captureStartedWhileDialogClosed) await RP4.files.render();
       RP4.ui.showToast(`저장 경로를 변경했습니다: ${result.recordingsDir}`);
     } catch (error) {
       console.error(error);
@@ -707,8 +720,13 @@
       void RP4.recorder.stopRecording();
     });
 
-    window.rp4.onFinalizeRecordings(async () => {
-      await RP4.recorder.finalizeForShutdown();
+    window.rp4.onFinalizeRecordings(async ({ requestId } = {}) => {
+      await Promise.allSettled([
+        RP4.recorder.finalizeForShutdown(),
+        RP4.clips.finalizeForShutdown(),
+        RP4.profile.flushSave()
+      ]);
+      window.rp4.reportFinalizeComplete(requestId);
     });
   }
 

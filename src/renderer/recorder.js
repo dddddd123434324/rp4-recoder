@@ -183,6 +183,7 @@
         writeQueue: Promise.resolve(),
         queuedBytes: 0,
         failure: null,
+        finalized: false,
         stopping: false,
         startedAt: Date.now(),
         pausedAccumMs: 0,
@@ -198,7 +199,11 @@
       RP4.lifecycle.transition(operationId, 'recording');
 
       recorder.addEventListener('dataavailable', (event) => {
-        if (event.data && event.data.size > 0) enqueueChunk(context, event.data);
+        if (event.data && event.data.size > 0) {
+          enqueueChunk(context, event.data, {
+            terminal: Boolean(context.failure || context.stopping || recorder.state === 'inactive')
+          });
+        }
       });
       recorder.addEventListener('error', (event) => {
         failRecording(
@@ -261,17 +266,21 @@
     }
   }
 
-  function enqueueChunk(context, blob) {
-    if (!context || context.failure) return;
-    if (context.queuedBytes + blob.size > MAX_QUEUED_BYTES) {
+  function enqueueChunk(context, blob, { terminal = false } = {}) {
+    if (!context || context.finalized) return;
+    if (!context.failure && context.queuedBytes + blob.size > MAX_QUEUED_BYTES) {
       failRecording(context, new Error('디스크 쓰기 대기열이 256MB를 초과했습니다.'));
-      return;
+      terminal = true;
     }
 
     context.queuedBytes += blob.size;
     context.writeQueue = context.writeQueue
       .then(async () => {
-        const result = await util.writeBlobInSlices(context.sessionId, blob);
+        // MediaRecorder emits its last dataavailable immediately before stop. Preserve
+        // that terminal Blob even when the recording is already marked failed.
+        const result = await util.writeBlobInSlices(context.sessionId, blob, {
+          terminal: terminal || Boolean(context.failure)
+        });
         if (result?.warning) {
           RP4.ui.showToast(result.warning);
           failRecording(context, new Error(result.warning));
@@ -301,6 +310,7 @@
   async function finalizeRecording(context) {
     if (!context) return;
 
+    context.finalized = true;
     const durationMs = elapsedMs(context);
     await context.writeQueue;
 

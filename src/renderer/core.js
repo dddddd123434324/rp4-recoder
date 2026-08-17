@@ -37,6 +37,7 @@ window.RP4 = window.RP4 || {};
     // Clip mode
     clip: null,
     clipSaving: false,
+    clipSavePromise: null,
 
     timerId: null,
     toastTimer: null,
@@ -60,7 +61,8 @@ window.RP4 = window.RP4 || {};
     areaSelection: { x: 0, y: 0, width: 1, height: 1 },
     hasAreaSelection: false,
 
-    profileSaveTimer: null
+    profileSaveTimer: null,
+    profileSavePromise: null
   };
 
   const els = {};
@@ -185,12 +187,13 @@ window.RP4 = window.RP4 || {};
 
   const IPC_SLICE_BYTES = 8 * 1024 * 1024;
 
-  async function writeBlobInSlices(sessionId, blob) {
+  async function writeBlobInSlices(sessionId, blob, { terminal = false } = {}) {
     for (let offset = 0; offset < blob.size; offset += IPC_SLICE_BYTES) {
       const part = blob.slice(offset, Math.min(blob.size, offset + IPC_SLICE_BYTES));
       const result = await window.rp4.writeRecordingChunk({
         sessionId,
-        buffer: await part.arrayBuffer()
+        buffer: await part.arrayBuffer(),
+        terminal
       });
       if (result?.warning) return result;
     }

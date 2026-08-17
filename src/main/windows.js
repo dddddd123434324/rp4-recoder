@@ -1,6 +1,7 @@
 'use strict';
 
 const { BrowserWindow, ipcMain, shell, dialog } = require('electron/main');
+const crypto = require('node:crypto');
 const path = require('node:path');
 
 const displays = require('./displays');
@@ -81,13 +82,39 @@ function createMainWindow({ isSmoke, onQuitRequested }) {
  * invisible to the user.
  */
 async function drainRecordings(win, recordingManager, { timeoutMs = 20000 } = {}) {
-  if (!recordingManager.hasPendingRecordings()) return { drained: true, saved: [] };
+  const requestId = crypto.randomUUID();
+  const deadline = Date.now() + timeoutMs;
+  let rendererReady = !win || win.isDestroyed();
 
-  if (recordingManager.hasActiveSessions() && win && !win.isDestroyed()) {
-    win.webContents.send('app:finalize-recordings');
+  if (win && !win.isDestroyed()) {
+    rendererReady = await new Promise((resolve) => {
+      let settled = false;
+      let timer = null;
+      const finish = (ready) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        ipcMain.removeListener('app:shutdown-ready', onReady);
+        win.webContents.removeListener('destroyed', onDestroyed);
+        resolve(ready);
+      };
+      const onReady = (event, payload = {}) => {
+        if (event.sender !== win.webContents || payload.requestId !== requestId) return;
+        finish(true);
+      };
+      const onDestroyed = () => finish(false);
+      timer = setTimeout(() => finish(false), timeoutMs);
+
+      ipcMain.on('app:shutdown-ready', onReady);
+      win.webContents.once('destroyed', onDestroyed);
+      try {
+        win.webContents.send('app:finalize-recordings', { requestId });
+      } catch {
+        finish(false);
+      }
+    });
   }
 
-  const deadline = Date.now() + timeoutMs;
   while (recordingManager.hasActiveSessions() && Date.now() < deadline) {
     await sleep(150);
   }
@@ -95,8 +122,11 @@ async function drainRecordings(win, recordingManager, { timeoutMs = 20000 } = {}
   // Safety net for anything the renderer could not finish on its own. Once finalization
   // starts it is intentionally not timed out: cancelling ffmpeg here could corrupt the
   // only copy of the recording.
-  const saved = await recordingManager.finalizeAllSessions();
-  return { drained: !recordingManager.hasPendingRecordings(), saved };
+  const timedOut = !rendererReady || recordingManager.hasActiveSessions();
+  const saved = await recordingManager.finalizeAllSessions({
+    failureReason: timedOut ? '앱 종료 대기 시간이 지나 부분 저장했습니다.' : null
+  });
+  return { drained: !recordingManager.hasPendingRecordings(), rendererReady, timedOut, saved };
 }
 
 async function confirmCloseWhileRecording(win) {

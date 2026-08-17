@@ -14,6 +14,7 @@
 
 const { app, BrowserWindow } = require('electron');
 const { execFile } = require('node:child_process');
+const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const os = require('node:os');
@@ -50,6 +51,7 @@ function ffprobe(file) {
         const duration = /Duration:\s*(\d+):(\d+):(\d+\.\d+)/.exec(text);
         const start = /start:\s*(-?\d+\.\d+)/.exec(text);
         const video = /Stream #\d+:\d+.*Video:\s*([a-z0-9]+).*?(\d{2,5})x(\d{2,5})/i.exec(text);
+        const audio = /Stream #\d+:\d+.*Audio:\s*([a-z0-9_]+)/i.exec(text);
         resolve({
           raw: text,
           // ffmpeg names the MP4 demuxer "mov,mp4,m4a,3gp,3g2,mj2", so keep the whole list.
@@ -59,11 +61,27 @@ function ffprobe(file) {
             : null,
           startSec: start ? Number(start[1]) : null,
           codec: video?.[1] || null,
+          audioCodec: audio?.[1] || null,
           width: video ? Number(video[2]) : null,
           height: video ? Number(video[3]) : null
         });
       }
     );
+  });
+}
+
+function runFfmpeg(args) {
+  return new Promise((resolve, reject) => {
+    execFile(ffmpegStatic, ['-hide_banner', '-y', ...args], {
+      windowsHide: true,
+      maxBuffer: 1024 * 1024 * 8
+    }, (error, _stdout, stderr) => {
+      if (error) {
+        reject(new Error(String(stderr || error.message)));
+        return;
+      }
+      resolve();
+    });
   });
 }
 
@@ -156,6 +174,14 @@ async function run() {
   check('profile values are clamped',
     require('../src/main/settings').normalize({ profile: { fps: '9999', bitrate: '-4' } })
       .profile.fps === '240');
+  await settings.update({
+    selectedPreset: null,
+    profile: { resolution: '2560x1440', fps: '120', bitrate: '24' }
+  });
+  check('profile and inactive preset persist atomically',
+    settings.value.selectedPreset === null
+      && settings.value.profile?.resolution === '2560x1440'
+      && settings.value.profile?.fps === '120');
 
   // A drive root must never be accepted as a recordings folder.
   check('drive root rejected as recordings dir', paths.isPlausibleRecordingsDir('D:\\') === false);
@@ -167,6 +193,61 @@ async function run() {
 
   const recordings = new RecordingManager({ settings, emit: () => {} });
   await recordings.loadIndex();
+
+  // A stale crop host must never satisfy or clear a request belonging to its successor.
+  const { WindowCropService } = require('../src/main/window-crop');
+  const cropService = new WindowCropService();
+  const staleChild = {};
+  const currentChild = {};
+  cropService.unsupported = false;
+  cropService.child = currentChild;
+  cropService.generation = 2;
+  let cropResolved = false;
+  const cropResult = new Promise((resolve) => {
+    cropService.pending.set('q-test', {
+      child: currentChild,
+      generation: 2,
+      timer: setTimeout(() => resolve(null), 1000),
+      resolve: (value) => {
+        cropResolved = true;
+        resolve(value);
+      }
+    });
+  });
+  cropService.handleLine(staleChild, 1, 'RP4:q-test:null');
+  check('stale crop host response is ignored', !cropResolved && cropService.pending.has('q-test'));
+  cropService.handleLine(currentChild, 2, 'RP4:q-test:{"x":1,"y":2,"width":3,"height":4}');
+  check('current crop host owns its response', (await cropResult)?.width === 3);
+  cropService.child = null;
+
+  // Main waits for an explicit renderer ACK even before a recording session exists.
+  const fakeContents = new EventEmitter();
+  fakeContents.send = (channel, payload) => {
+    if (channel === 'app:finalize-recordings') {
+      setImmediate(() => require('electron').ipcMain.emit(
+        'app:shutdown-ready',
+        { sender: fakeContents },
+        { requestId: payload.requestId }
+      ));
+    }
+  };
+  const fakeWindow = { isDestroyed: () => false, webContents: fakeContents };
+  let shutdownOptions = null;
+  const fakeRecordings = {
+    hasActiveSessions: () => false,
+    hasPendingRecordings: () => false,
+    finalizeAllSessions: async (options) => {
+      shutdownOptions = options;
+      return [];
+    }
+  };
+  const drained = await require('../src/main/windows').drainRecordings(
+    fakeWindow,
+    fakeRecordings,
+    { timeoutMs: 1000 }
+  );
+  check('shutdown waits for matching renderer ACK',
+    drained.rendererReady === true && drained.timedOut === false && shutdownOptions.failureReason === null);
 
   // ---- capture real MediaRecorder output ----------------------------------------
   const win = new BrowserWindow({
@@ -264,6 +345,63 @@ async function run() {
     `${savedA?.name} vs ${savedB?.name}`);
   check('both same-second files still exist',
     fs.existsSync(savedA.filePath) && fs.existsSync(savedB.filePath));
+
+  // Once a session is marked failed, ordinary writes stop but the terminal
+  // dataavailable Blob is still accepted as a best-effort salvage.
+  const failedSession = await recordings.start(meta, { webContentsId: win.webContents.id });
+  await recordings.write({ sessionId: failedSession.sessionId, buffer: recorded.buffers[0] },
+    { webContentsId: win.webContents.id });
+  recordings.sessions.get(failedSession.sessionId).failed = 'simulated recording failure';
+  let failedWriteRejected = false;
+  try {
+    await recordings.write({ sessionId: failedSession.sessionId, buffer: recorded.buffers[1] },
+      { webContentsId: win.webContents.id });
+  } catch {
+    failedWriteRejected = true;
+  }
+  const terminalWrite = await recordings.write({
+    sessionId: failedSession.sessionId,
+    buffer: recorded.buffers[1],
+    terminal: true
+  }, { webContentsId: win.webContents.id });
+  const failedSaved = await recordings.stop({ sessionId: failedSession.sessionId, durationMs: 1000 });
+  check('failed session rejects non-terminal writes', failedWriteRejected);
+  check('failed session preserves terminal chunk',
+    terminalWrite.bytes === recorded.buffers[0].length + recorded.buffers[1].length
+      && failedSaved?.status === 'partial');
+
+  // Chromium may fall back to Matroska H.264 + Opus. MP4 keeps the video bitstream but
+  // must convert Opus audio to AAC for broad player compatibility.
+  const opusInput = path.join(SANDBOX, 'h264-opus.mkv');
+  await runFfmpeg([
+    '-f', 'lavfi', '-i', 'color=c=blue:s=320x180:r=30',
+    '-f', 'lavfi', '-i', 'sine=frequency=880:sample_rate=48000',
+    '-t', '1.2',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+    '-c:a', 'libopus',
+    opusInput
+  ]);
+  const fallbackMeta = {
+    ...meta,
+    mimeType: 'video/x-matroska;codecs=avc1,opus',
+    width: 320,
+    height: 180
+  };
+  const fallbackSession = await recordings.start(fallbackMeta, { webContentsId: win.webContents.id });
+  await recordings.write({
+    sessionId: fallbackSession.sessionId,
+    buffer: await fsp.readFile(opusInput)
+  }, { webContentsId: win.webContents.id });
+  const fallbackSaved = await recordings.stop({
+    sessionId: fallbackSession.sessionId,
+    durationMs: 1200
+  });
+  const fallbackProbe = await ffprobe(fallbackSaved.filePath);
+  check('H.264 Opus fallback becomes H.264 AAC MP4',
+    fallbackProbe.codec === 'h264'
+      && fallbackProbe.audioCodec === 'aac'
+      && /\bmp4\b/.test(fallbackProbe.container || ''),
+    `video=${fallbackProbe.codec} audio=${fallbackProbe.audioCodec} container=${fallbackProbe.container}`);
 
   // ---- clip mode: init segment + suffix of fragments ----------------------------
   const clipBuffer = Buffer.concat([

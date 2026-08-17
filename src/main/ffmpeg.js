@@ -155,6 +155,28 @@ async function remux(inputPath, outputPath, { jobId, onProgress, totalDurationMs
   ], { jobId, onProgress, totalDurationMs });
 }
 
+/** Keeps H.264 lossless while converting Opus audio to MP4-compatible AAC. */
+async function remuxH264ToMp4(inputPath, outputPath, options = {}) {
+  const audioBitrateKbps = Math.max(64, Math.min(320, Number(options.audioBitrateKbps) || 192));
+  await fs.rm(outputPath, { force: true });
+  await run([
+    '-y',
+    '-fflags', '+genpts',
+    '-i', inputPath,
+    '-map', '0:v:0',
+    '-map', '0:a?',
+    '-c:v', 'copy',
+    '-c:a', 'aac',
+    '-b:a', `${audioBitrateKbps}k`,
+    '-movflags', '+faststart',
+    outputPath
+  ], {
+    jobId: options.jobId,
+    onProgress: options.onProgress,
+    totalDurationMs: options.totalDurationMs
+  });
+}
+
 /** Extracts the most recent interval from one complete MediaRecorder stream. */
 async function trimRecent(inputPath, outputPath, {
   durationMs,
@@ -266,6 +288,7 @@ module.exports = {
   hasActiveJobs,
   validateMedia,
   remux,
+  remuxH264ToMp4,
   trimRecent,
   trimRecentToMp4,
   transcodeToMp4

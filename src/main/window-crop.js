@@ -141,6 +141,7 @@ class WindowCropService {
     this.ready = null;
     this.pending = new Map();
     this.nextId = 1;
+    this.generation = 0;
     this.disposed = false;
     this.unsupported = process.platform !== 'win32';
   }
@@ -156,7 +157,8 @@ class WindowCropService {
     if (this.unsupported || this.disposed) return null;
     if (this.ready) return this.ready;
 
-    this.ready = (async () => {
+    const generation = ++this.generation;
+    const ready = (async () => {
       const scriptPath = await this.hostScriptPath();
       const child = spawn('powershell.exe', [
         '-NoProfile',
@@ -165,53 +167,90 @@ class WindowCropService {
         '-File', scriptPath
       ], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
 
+      if (this.disposed || generation !== this.generation) {
+        child.kill();
+        return null;
+      }
       this.child = child;
       child.stderr.resume();
 
       const rl = readline.createInterface({ input: child.stdout });
-      rl.on('line', (line) => this.handleLine(line.trim()));
-
+      let readySettled = false;
+      let cleaned = false;
+      let resolveReady;
+      let rejectReady;
+      const readySignal = new Promise((resolve, reject) => {
+        resolveReady = resolve;
+        rejectReady = reject;
+      });
       const cleanup = () => {
+        if (cleaned) return;
+        cleaned = true;
         rl.close();
-        this.child = null;
-        this.ready = null;
-        for (const entry of this.pending.values()) {
+        if (!readySettled) {
+          readySettled = true;
+          rejectReady(new Error('window crop host exited'));
+        }
+        if (this.child === child && this.generation === generation) {
+          this.child = null;
+          this.ready = null;
+        }
+        for (const [id, entry] of this.pending) {
+          if (entry.child !== child || entry.generation !== generation) continue;
           clearTimeout(entry.timer);
           entry.resolve(null);
+          this.pending.delete(id);
         }
-        this.pending.clear();
       };
-      child.on('error', cleanup);
-      child.on('exit', cleanup);
-
-      await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('window crop host timed out')), READY_TIMEOUT_MS);
-        this.onReady = () => {
-          clearTimeout(timer);
-          resolve();
-        };
-        child.on('exit', () => {
-          clearTimeout(timer);
-          reject(new Error('window crop host exited'));
-        });
+      rl.on('line', (value) => {
+        const line = value.trim();
+        if (line === READY_TOKEN) {
+          if (!readySettled && this.child === child && this.generation === generation) {
+            readySettled = true;
+            resolveReady();
+          }
+          return;
+        }
+        this.handleLine(child, generation, line);
       });
+      child.once('error', cleanup);
+      child.once('exit', cleanup);
+
+      const timer = setTimeout(() => {
+        if (!readySettled) {
+          readySettled = true;
+          rejectReady(new Error('window crop host timed out'));
+        }
+        if (!child.killed) child.kill();
+        cleanup();
+      }, READY_TIMEOUT_MS);
+
+      try {
+        await readySignal;
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (this.child !== child || this.generation !== generation || this.disposed) {
+        if (!child.killed) child.kill();
+        cleanup();
+        return null;
+      }
 
       return child;
     })().catch(() => {
-      this.ready = null;
-      this.child = null;
+      if (this.generation === generation) {
+        this.ready = null;
+      }
       return null;
     });
 
-    return this.ready;
+    this.ready = ready;
+    return ready;
   }
 
-  handleLine(line) {
-    if (line === READY_TOKEN) {
-      this.onReady?.();
-      this.onReady = null;
-      return;
-    }
+  handleLine(child, generation, line) {
+    if (this.child !== child || this.generation !== generation) return;
     if (!line.startsWith(RESPONSE_PREFIX)) return;
 
     const rest = line.slice(RESPONSE_PREFIX.length);
@@ -256,7 +295,7 @@ class WindowCropService {
         resolve(null);
       }, REQUEST_TIMEOUT_MS);
 
-      this.pending.set(id, { resolve, timer });
+      this.pending.set(id, { resolve, timer, child, generation: this.generation });
       try {
         child.stdin.write(`${id} ${numeric}\n`);
       } catch {
@@ -269,7 +308,15 @@ class WindowCropService {
 
   dispose() {
     this.disposed = true;
+    this.generation += 1;
     const child = this.child;
+    this.child = null;
+    this.ready = null;
+    for (const entry of this.pending.values()) {
+      clearTimeout(entry.timer);
+      entry.resolve(null);
+    }
+    this.pending.clear();
     if (!child) return;
     try {
       child.stdin.write('quit\n');
