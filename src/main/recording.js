@@ -400,8 +400,8 @@ class RecordingManager {
           throw new Error('파일 쓰기가 진행되지 않았습니다.');
         }
         offset += bytesWritten;
+        session.bytes += bytesWritten;
       }
-      session.bytes += offset;
     } catch (error) {
       // Surface the failure instead of continuing to produce a corrupt file.
       session.failed = `녹화 데이터를 디스크에 쓸 수 없습니다. ${error.message}`;
@@ -457,6 +457,8 @@ class RecordingManager {
       // Already closed; the bytes on disk are still valid.
     }
 
+    const tempStats = await statFile(session.tempPath);
+    session.bytes = Math.max(session.bytes, tempStats?.size || 0);
     if (session.bytes === 0) {
       await fs.rm(session.tempPath, { force: true });
       return null;
@@ -466,7 +468,14 @@ class RecordingManager {
       ? Math.round(Number(payload.durationMs))
       : Math.max(0, Date.now() - session.startedAtMs);
 
-    const finalized = await this.finalize(session, { durationMs });
+    const failureReason = session.failed || (
+      typeof payload.failureReason === 'string' && payload.failureReason.trim()
+        ? payload.failureReason.trim().slice(0, 500)
+        : null
+    );
+    const finalized = failureReason
+      ? await this.keepPartial(session, failureReason)
+      : await this.finalize(session, { durationMs });
     const stats = await statFile(finalized.filePath);
     const meta = {
       ...session.meta,
@@ -474,6 +483,9 @@ class RecordingManager {
       format: finalized.format,
       converted: finalized.converted,
       conversionError: finalized.conversionError || null,
+      status: finalized.partial ? 'partial' : 'complete',
+      partial: Boolean(finalized.partial),
+      failureReason: finalized.failureReason || null,
       durationMs,
       stoppedAt: new Date().toISOString(),
       bytes: stats?.size || 0
@@ -488,7 +500,9 @@ class RecordingManager {
     return {
       ...this.toDto(finalized.filePath, stats, meta),
       converted: finalized.converted,
-      conversionError: finalized.conversionError || null
+      conversionError: finalized.conversionError || null,
+      status: meta.status,
+      failureReason: meta.failureReason
     };
   }
 
@@ -502,18 +516,19 @@ class RecordingManager {
     const { targetFormat, recordedContainer, recordedCodec } = session;
     const canStreamCopyToMp4 = targetFormat === 'mp4' && recordedCodec === 'h264';
 
-    // A clip is spliced from a buffered init segment plus a suffix of media fragments, so
-    // its timestamps start partway through the stream. A stream copy rebuilds the
-    // container so the clip starts at zero and reports its real length. Measured at about
-    // 100 ms for 11 MB, versus the minutes a re-encode would cost.
-    if (session.forceRemux && recordedContainer === targetFormat && targetFormat === 'mp4') {
-      const target = await uniquePath(session.recordingsDir, session.baseName, 'mp4');
+    // Clip epochs contain every Blob from one MediaRecorder in order. FFmpeg can therefore
+    // seek from the end of a complete stream without assuming any Blob is independently
+    // decodable.
+    if (session.forceRemux && recordedContainer === targetFormat) {
+      const target = await uniquePath(session.recordingsDir, session.baseName, targetFormat);
       try {
-        await ffmpeg.remux(session.tempPath, target, { totalDurationMs: durationMs });
+        await ffmpeg.trimRecent(session.tempPath, target, {
+          durationMs: Number(session.meta.trimRecentMs) || durationMs
+        });
         await fs.rm(session.tempPath, { force: true });
-        return { filePath: target, format: 'mp4', converted: true, optimizable: false };
-      } catch {
-        // Fall through: an un-normalized clip is still perfectly playable.
+        return { filePath: target, format: targetFormat, converted: true, optimizable: false };
+      } catch (error) {
+        return this.keepOriginal(session, target, error);
       }
     }
 
@@ -587,6 +602,24 @@ class RecordingManager {
       converted: false,
       optimizable: false,
       conversionError: error?.message || String(error)
+    };
+  }
+
+  /** A write failed: preserve every byte under an explicit partial name. */
+  async keepPartial(session, failureReason) {
+    const target = await uniquePath(
+      session.recordingsDir,
+      `${session.baseName}_partial`,
+      session.recordedContainer
+    );
+    await this.moveFile(session.tempPath, target);
+    return {
+      filePath: target,
+      format: session.recordedContainer,
+      converted: false,
+      optimizable: false,
+      partial: true,
+      failureReason
     };
   }
 

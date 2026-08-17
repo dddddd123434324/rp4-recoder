@@ -8,20 +8,19 @@
  * hints. That produced a visible hitch at every boundary, drifting audio, and a full
  * re-encode on save.
  *
- * A single recorder now runs continuously. Its first chunk is the container
- * initialisation segment, which is kept aside; the following chunks are independent media
- * fragments held in a ring. A clip is the init segment plus a suffix of that ring, so there
- * are no seams and no re-encode.
+ * A recorder epoch is kept intact from its first Blob onward. Saving sends the complete
+ * epoch and FFmpeg extracts its most recent interval. Blob boundaries are never treated as
+ * independently decodable media boundaries. When the memory ceiling is reached, a new
+ * intact epoch begins.
  */
 (function initClips(RP4) {
   const { state, els, util } = RP4;
 
   const CHUNK_MS = 1000;
-  // A little slack so the requested duration is always fully covered.
-  const PRUNE_MARGIN_MS = 3000;
 
   function bufferedBytes(session) {
-    return session.chunks.reduce((total, entry) => total + entry.blob.size, 0);
+    return (session.initChunk?.size || 0)
+      + session.chunks.reduce((total, entry) => total + entry.blob.size, 0);
   }
 
   function clipLimitBytes() {
@@ -29,25 +28,56 @@
     return limitMb * 1024 * 1024;
   }
 
-  /**
-   * Trims the ring by age and by size. The byte ceiling matters: a 7200 second buffer at
-   * 35 Mbps would otherwise try to hold about 31 GB in memory.
-   */
-  function pruneBuffer(session, now = Date.now()) {
+  /** Starts a fresh, independently valid recording epoch at the memory ceiling. */
+  function pruneBuffer(session) {
     if (!session) return;
+    if (bufferedBytes(session) <= clipLimitBytes() || session.rotationPromise) return;
+    session.trimmedForSize = true;
+    session.rotationPromise = rotateBuffer(session).finally(() => {
+      session.rotationPromise = null;
+    });
+  }
 
-    const durationMs = RP4.profile.get().clipDurationSeconds * 1000;
-    const cutoff = now - durationMs - PRUNE_MARGIN_MS;
-    while (session.chunks.length > 0 && session.chunks[0].at < cutoff) {
-      session.chunks.shift();
-    }
+  function createClipRecorder(session, profile) {
+    const recorder = new MediaRecorder(session.stream, {
+      mimeType: session.codec.mimeType,
+      videoBitsPerSecond: profile.bitrateMbps * 1000 * 1000,
+      audioBitsPerSecond: profile.audioBitrateKbps * 1000,
+      videoKeyFrameIntervalDuration: CHUNK_MS
+    });
 
-    const limit = clipLimitBytes();
-    let total = bufferedBytes(session);
-    while (session.chunks.length > 1 && total > limit) {
-      total -= session.chunks.shift().blob.size;
-      session.trimmedForSize = true;
+    recorder.addEventListener('dataavailable', (event) => {
+      if (!event.data || event.data.size === 0) {
+        session.pendingFlush?.resolve();
+        return;
+      }
+      if (!session.initChunk) session.initChunk = event.data;
+      else session.chunks.push({ blob: event.data, at: Date.now() });
+      pruneBuffer(session);
+      session.pendingFlush?.resolve();
+    });
+    recorder.addEventListener('error', (event) => {
+      console.error(event.error || event);
+      RP4.ui.showToast('클립 녹화 중 오류가 발생했습니다.');
+    });
+    return recorder;
+  }
+
+  async function rotateBuffer(session) {
+    if (state.clip !== session || state.captureLifecycle !== 'clip') return;
+    const previous = session.recorder;
+    if (previous.state !== 'inactive') {
+      const stopped = new Promise((resolve) => previous.addEventListener('stop', resolve, { once: true }));
+      previous.stop();
+      await stopped;
     }
+    if (state.clip !== session) return;
+
+    session.initChunk = null;
+    session.chunks = [];
+    session.bufferStartedAt = Date.now();
+    session.recorder = createClipRecorder(session, session.profile);
+    session.recorder.start(CHUNK_MS);
   }
 
   function pruneActiveBuffer() {
@@ -55,27 +85,30 @@
   }
 
   async function toggleClipMode() {
-    if (state.clip) {
+    if (state.captureLifecycle === 'clip') {
       await stopClipMode();
       return;
     }
+    if (RP4.lifecycle.isBusy()) return;
     await startClipMode();
   }
 
   async function startClipMode() {
-    if (state.isRecording) {
-      RP4.ui.showToast('일반 녹화 중에는 클립 녹화 모드를 시작할 수 없습니다.');
-      return;
-    }
+    const operationId = RP4.lifecycle.begin('starting-clip');
+    if (operationId == null) return;
 
     if (!state.selectedSource) {
       await RP4.app.selectDefaultScreen();
     }
-    if (!state.selectedSource) return;
+    if (!state.selectedSource) {
+      RP4.lifecycle.finish(operationId);
+      return;
+    }
 
     const profile = RP4.profile.get();
     const codec = RP4.capture.pickRecorderMime(profile.format);
     if (!codec) {
+      RP4.lifecycle.finish(operationId);
       RP4.ui.showToast('이 시스템에서 지원하는 녹화 코덱을 찾지 못했습니다.');
       return;
     }
@@ -92,55 +125,35 @@
         includeMic: profile.micEnabled
       });
 
+      if (!RP4.lifecycle.isCurrent(operationId, 'starting-clip')) {
+        capture.cleanup();
+        return;
+      }
+
       els.previewVideo.srcObject = capture.stream;
       els.previewVideo.muted = true;
       await els.previewVideo.play().catch(() => {});
       els.previewPlaceholder.classList.add('hidden');
 
-      const recorder = new MediaRecorder(capture.stream, {
-        mimeType: codec.mimeType,
-        videoBitsPerSecond: profile.bitrateMbps * 1000 * 1000,
-        audioBitsPerSecond: profile.audioBitrateKbps * 1000,
-        // This improves the odds that a retained suffix begins near a decodable frame.
-        // Blob boundaries are still normalized by the main-process remux on save.
-        videoKeyFrameIntervalDuration: CHUNK_MS
-      });
-
       const session = {
         ...capture,
-        recorder,
+        operationId,
+        recorder: null,
         codec,
+        profile,
         initChunk: null,
         chunks: [],
         startedAt: Date.now(),
+        bufferStartedAt: Date.now(),
         trimmedForSize: false,
-        pendingFlush: null
+        pendingFlush: null,
+        rotationPromise: null
       };
-
-      recorder.addEventListener('dataavailable', (event) => {
-        if (!event.data || event.data.size === 0) {
-          session.pendingFlush?.resolve();
-          return;
-        }
-
-        if (!session.initChunk) {
-          // First delivery carries the container header the other fragments depend on.
-          session.initChunk = event.data;
-        } else {
-          session.chunks.push({ blob: event.data, at: Date.now() });
-          pruneBuffer(session);
-        }
-        session.pendingFlush?.resolve();
-      });
-
-      recorder.addEventListener('error', (event) => {
-        console.error(event.error || event);
-        RP4.ui.showToast('클립 녹화 중 오류가 발생했습니다.');
-      });
-
-      recorder.start(CHUNK_MS);
+      session.recorder = createClipRecorder(session, profile);
+      session.recorder.start(CHUNK_MS);
 
       state.clip = session;
+      RP4.lifecycle.transition(operationId, 'clip');
       RP4.app.startTimer();
       RP4.app.updateClipUi();
       RP4.ui.setStatus(
@@ -151,7 +164,8 @@
     } catch (error) {
       console.error(error);
       capture?.cleanup();
-      state.clip = null;
+      if (state.clip?.operationId === operationId) state.clip = null;
+      RP4.lifecycle.finish(operationId);
       RP4.app.updateClipUi();
       await RP4.recorder.startPreview();
       RP4.ui.setStatus('클립 모드 실패', '클립 녹화 모드를 시작하지 못했습니다.', 'warn');
@@ -160,7 +174,8 @@
   }
 
   /** Asks the recorder for everything buffered so far and waits for it to arrive. */
-  function flush(session) {
+  async function flush(session) {
+    if (session?.rotationPromise) await session.rotationPromise;
     if (!session || session.recorder.state !== 'recording') return Promise.resolve();
 
     return new Promise((resolve) => {
@@ -186,8 +201,9 @@
 
   async function stopClipMode() {
     const session = state.clip;
-    if (!session) return;
+    if (!session || state.captureLifecycle !== 'clip') return;
 
+    RP4.lifecycle.transition(session.operationId, 'stopping-clip');
     RP4.ui.setStatus('클립 모드 중지 중', '클립 버퍼를 정리하고 있습니다.', 'warn');
     state.clip = null;
 
@@ -203,6 +219,7 @@
     }
 
     RP4.app.stopTimer();
+    RP4.lifecycle.finish(session.operationId);
     RP4.app.updateClipUi();
     await RP4.recorder.startPreview();
     RP4.ui.setStatus('준비 완료', '녹화 준비가 완료되었습니다.', 'ready');
@@ -210,9 +227,10 @@
 
   async function saveClip() {
     const session = state.clip;
-    if (!session || state.clipSaving) return;
+    if (!session || state.clipSaving || state.captureLifecycle !== 'clip') return;
 
     state.clipSaving = true;
+    RP4.lifecycle.transition(session.operationId, 'saving-clip');
     RP4.app.updateClipUi();
     let clipSession = null;
 
@@ -222,22 +240,16 @@
       const profile = RP4.profile.get();
       const savePoint = Date.now();
       const windowMs = profile.clipDurationSeconds * 1000;
-      const cutoff = savePoint - windowMs;
 
       if (!session.initChunk || session.chunks.length === 0) {
         RP4.ui.showToast('아직 저장할 클립 데이터가 없습니다.');
         return;
       }
 
-      // A chunk delivered at `at` covers roughly the interval ending at `at`.
-      let selected = session.chunks.filter((entry) => entry.at > cutoff);
-      if (selected.length === 0) {
-        selected = session.chunks.slice(-1);
-      }
-
-      const firstAt = selected[0].at;
-      const lastAt = selected[selected.length - 1].at;
-      const estimatedMs = Math.min(windowMs, Math.max(CHUNK_MS, lastAt - firstAt + CHUNK_MS));
+      // Every Blob from this recorder epoch is sent in order. FFmpeg trims the complete
+      // stream from the end, so no arbitrary Blob suffix is treated as self-contained.
+      const selected = session.chunks;
+      const estimatedMs = Math.min(windowMs, Math.max(CHUNK_MS, savePoint - session.bufferStartedAt));
 
       RP4.ui.setStatus('클립 저장 중', '최근 장면을 파일로 저장하고 있습니다.', 'warn');
 
@@ -254,6 +266,7 @@
         audioBitrateKbps: profile.audioBitrateKbps,
         encoderPreset: profile.encoderPreset,
         durationMs: estimatedMs,
+        trimRecentMs: estimatedMs,
         clip: true
       };
 
@@ -261,15 +274,11 @@
       // flattening it to an ArrayBuffer, and cloning it through IPC could otherwise create
       // several simultaneous copies of a hundreds-of-megabytes clip.
       clipSession = await window.rp4.startRecording(meta);
-      await window.rp4.writeRecordingChunk({
-        sessionId: clipSession.sessionId,
-        buffer: await session.initChunk.arrayBuffer()
-      });
+      const initResult = await util.writeBlobInSlices(clipSession.sessionId, session.initChunk);
+      if (initResult?.warning) throw new Error(initResult.warning);
       for (const entry of selected) {
-        await window.rp4.writeRecordingChunk({
-          sessionId: clipSession.sessionId,
-          buffer: await entry.blob.arrayBuffer()
-        });
+        const result = await util.writeBlobInSlices(clipSession.sessionId, entry.blob);
+        if (result?.warning) throw new Error(result.warning);
       }
       const saved = await window.rp4.stopRecording({
         sessionId: clipSession.sessionId,
@@ -278,6 +287,7 @@
       });
       clipSession = null;
       if (!saved) throw new Error('클립 저장 결과가 없습니다.');
+      if (saved.status === 'partial') throw new Error(saved.failureReason || '클립이 일부만 저장됐습니다.');
 
       await RP4.files.render();
 
@@ -301,13 +311,15 @@
       if (clipSession) {
         await window.rp4.stopRecording({
           sessionId: clipSession.sessionId,
-          durationMs: 0
+          durationMs: 0,
+          failureReason: error?.message || '클립 저장 중 오류가 발생했습니다.'
         }).catch(() => {});
       }
       RP4.ui.setStatus('클립 저장 실패', '클립 파일 저장을 완료하지 못했습니다.', 'warn');
       RP4.ui.showToast('클립 파일 저장을 완료하지 못했습니다.');
     } finally {
       state.clipSaving = false;
+      if (state.clip === session) RP4.lifecycle.transition(session.operationId, 'clip');
       RP4.app.updateClipUi();
     }
   }

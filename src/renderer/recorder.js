@@ -7,6 +7,7 @@
   const { state, els, util } = RP4;
 
   const CHUNK_INTERVAL_MS = 2000;
+  const MAX_QUEUED_BYTES = 256 * 1024 * 1024;
 
   function cleanupPreview() {
     if (state.preview) {
@@ -34,7 +35,7 @@
    * leak a live capture (leaving the screen-capture indicator lit).
    */
   async function startPreview() {
-    if (!state.selectedSource || state.isRecording || state.clip) return;
+    if (!state.selectedSource || RP4.lifecycle.isBusy()) return;
 
     const generation = ++state.previewGeneration;
     cleanupPreview();
@@ -74,7 +75,7 @@
   }
 
   async function restartPreview() {
-    if (state.isRecording || state.clip) return;
+    if (RP4.lifecycle.isBusy()) return;
     await startPreview();
   }
 
@@ -88,36 +89,37 @@
   }
 
   /** Elapsed recording time with paused stretches excluded. */
-  function elapsedMs() {
-    if (!state.startedAt) return 0;
-    const pausedNow = state.isPaused && state.pausedAt ? Date.now() - state.pausedAt : 0;
-    return Math.max(0, Date.now() - state.startedAt - state.pausedAccumMs - pausedNow);
+  function elapsedMs(context = state.recording) {
+    if (!context?.startedAt) return 0;
+    const pausedNow = context.isPaused && context.pausedAt ? Date.now() - context.pausedAt : 0;
+    return Math.max(0, Date.now() - context.startedAt - context.pausedAccumMs - pausedNow);
   }
 
   async function toggleRecording() {
-    if (state.isRecording) {
+    if (state.captureLifecycle === 'recording') {
       await stopRecording();
       return;
     }
+    if (RP4.lifecycle.isBusy()) return;
     await startRecording();
   }
 
   async function startRecording() {
-    if (state.isRecording) return;
-
-    if (state.clip) {
-      RP4.ui.showToast('클립 녹화 모드를 중지한 뒤 일반 녹화를 시작해 주세요.');
-      return;
-    }
+    const operationId = RP4.lifecycle.begin('starting-recording');
+    if (operationId == null) return;
 
     if (!state.selectedSource) {
       await RP4.app.selectDefaultScreen();
     }
-    if (!state.selectedSource) return;
+    if (!state.selectedSource) {
+      RP4.lifecycle.finish(operationId);
+      return;
+    }
 
     const profile = RP4.profile.get();
     const codec = RP4.capture.pickRecorderMime(profile.format);
     if (!codec) {
+      RP4.lifecycle.finish(operationId);
       RP4.ui.showToast('이 시스템에서 지원하는 녹화 코덱을 찾지 못했습니다.');
       return;
     }
@@ -135,6 +137,11 @@
         cropArea: state.selectedMode === 'area',
         includeMic: profile.micEnabled
       });
+
+      if (!RP4.lifecycle.isCurrent(operationId, 'starting-recording')) {
+        capture.cleanup();
+        return;
+      }
 
       els.previewVideo.srcObject = capture.stream;
       els.previewVideo.muted = true;
@@ -159,31 +166,46 @@
         audioBitrateKbps: profile.audioBitrateKbps
       });
 
+      if (!RP4.lifecycle.isCurrent(operationId, 'starting-recording')) {
+        await window.rp4.stopRecording({ sessionId: session.sessionId }).catch(() => {});
+        capture.cleanup();
+        return;
+      }
+
       const recorder = new MediaRecorder(capture.stream, recorderOptions(profile, codec.mimeType));
 
-      state.recording = {
+      const context = {
         ...capture,
+        operationId,
         recorder,
         sessionId: session.sessionId,
         codec,
         writeQueue: Promise.resolve(),
-        aborted: false
+        queuedBytes: 0,
+        failure: null,
+        stopping: false,
+        startedAt: Date.now(),
+        pausedAccumMs: 0,
+        pausedAt: 0,
+        isPaused: false
       };
+      state.recording = context;
       state.isRecording = true;
       state.isPaused = false;
-      state.startedAt = Date.now();
+      state.startedAt = context.startedAt;
       state.pausedAccumMs = 0;
       state.pausedAt = 0;
+      RP4.lifecycle.transition(operationId, 'recording');
 
       recorder.addEventListener('dataavailable', (event) => {
-        if (event.data && event.data.size > 0) enqueueChunk(event.data);
+        if (event.data && event.data.size > 0) enqueueChunk(context, event.data);
       });
       recorder.addEventListener('error', (event) => {
         console.error(event.error || event);
         RP4.ui.showToast('녹화 중 오류가 발생했습니다.');
       });
       recorder.addEventListener('stop', () => {
-        void finalizeRecording();
+        void finalizeRecording(context);
       }, { once: true });
 
       recorder.start(CHUNK_INTERVAL_MS);
@@ -204,7 +226,8 @@
         }
       }
       capture?.cleanup();
-      resetRecordingState();
+      resetRecordingState(state.recording?.operationId === operationId ? state.recording : null);
+      RP4.lifecycle.finish(operationId);
       RP4.app.updateRecordingUi();
       await startPreview();
       RP4.ui.setStatus('녹화 실패', '녹화를 시작하지 못했습니다.', 'warn');
@@ -216,61 +239,69 @@
    * Queues a chunk write. A failure now aborts the recording instead of only showing a
    * toast and continuing to produce a file with a hole in it.
    */
-  function enqueueChunk(blob) {
-    const session = state.recording;
-    if (!session || session.aborted) return;
+  function failRecording(context, error) {
+    if (context.failure) return;
+    context.failure = error?.message || String(error || '데이터를 저장할 수 없습니다.');
+    console.error(error);
+    RP4.ui.showToast(`녹화를 중지합니다. ${context.failure}`);
+    RP4.ui.setStatus('녹화 오류', '데이터를 저장할 수 없어 부분 저장합니다.', 'warn');
+    try {
+      if (context.recorder.state !== 'inactive') context.recorder.stop();
+    } catch {
+      // ignore
+    }
+  }
 
-    const sessionId = session.sessionId;
-    session.writeQueue = session.writeQueue
+  function enqueueChunk(context, blob) {
+    if (!context || context.failure) return;
+    if (context.queuedBytes + blob.size > MAX_QUEUED_BYTES) {
+      failRecording(context, new Error('디스크 쓰기 대기열이 256MB를 초과했습니다.'));
+      return;
+    }
+
+    context.queuedBytes += blob.size;
+    context.writeQueue = context.writeQueue
       .then(async () => {
-        if (session.aborted) return;
-        const buffer = await blob.arrayBuffer();
-        const result = await window.rp4.writeRecordingChunk({ sessionId, buffer });
+        const result = await util.writeBlobInSlices(context.sessionId, blob);
         if (result?.warning) {
           RP4.ui.showToast(result.warning);
+          failRecording(context, new Error(result.warning));
         }
       })
       .catch((error) => {
-        if (session.aborted) return;
-        session.aborted = true;
-        console.error(error);
-        RP4.ui.showToast(`녹화를 중지합니다. ${error?.message || '데이터를 저장할 수 없습니다.'}`);
-        RP4.ui.setStatus('녹화 오류', '데이터를 저장할 수 없어 녹화를 중지했습니다.', 'warn');
-        try {
-          if (session.recorder.state !== 'inactive') session.recorder.stop();
-        } catch {
-          // ignore
-        }
+        failRecording(context, error);
+      })
+      .finally(() => {
+        context.queuedBytes = Math.max(0, context.queuedBytes - blob.size);
       });
   }
 
   async function stopRecording() {
-    const session = state.recording;
-    if (!session || session.recorder.state === 'inactive') return;
+    const context = state.recording;
+    if (!context || context.recorder.state === 'inactive' || context.stopping) return;
+    context.stopping = true;
+    RP4.lifecycle.transition(context.operationId, 'stopping-recording');
     RP4.ui.setStatus('저장 중', '녹화 파일을 마무리하고 있습니다.', 'warn');
-    session.recorder.stop();
+    context.recorder.stop();
   }
 
   /**
    * Finishes the recording. In the normal path the file is already complete on disk, so
    * this is a close plus a rename and returns immediately.
    */
-  async function finalizeRecording() {
-    const session = state.recording;
-    if (!session) return;
+  async function finalizeRecording(context) {
+    if (!context) return;
 
-    const sessionId = session.sessionId;
-    const durationMs = elapsedMs();
-
-    try {
-      await session.writeQueue;
-    } catch {
-      // Already surfaced by enqueueChunk.
-    }
+    const durationMs = elapsedMs(context);
+    await context.writeQueue;
 
     try {
-      const saved = await window.rp4.stopRecording({ sessionId, durationMs });
-      resetRecordingState();
+      const saved = await window.rp4.stopRecording({
+        sessionId: context.sessionId,
+        durationMs,
+        failureReason: context.failure
+      });
+      resetRecordingState(context);
       RP4.app.updateRecordingUi();
       await RP4.files.render();
       await startPreview();
@@ -280,15 +311,19 @@
         return;
       }
 
-      RP4.ui.setStatus('저장 완료', saved.name, 'ready');
-      if (saved.conversionError) {
+      if (saved.status === 'partial') {
+        RP4.ui.setStatus('부분 저장됨', saved.name, 'warn');
+        RP4.ui.showToast(`녹화 오류로 일부만 저장했습니다: ${saved.name}`);
+      } else if (saved.conversionError) {
+        RP4.ui.setStatus('원본 저장됨', saved.name, 'warn');
         RP4.ui.showToast(`원본을 그대로 저장했습니다: ${saved.name}`);
       } else {
+        RP4.ui.setStatus('저장 완료', saved.name, 'ready');
         RP4.ui.showToast(`저장 완료: ${saved.name}`);
       }
     } catch (error) {
       console.error(error);
-      resetRecordingState();
+      resetRecordingState(context);
       RP4.app.updateRecordingUi();
       await startPreview();
       RP4.ui.setStatus('저장 실패', '녹화 파일 저장을 완료하지 못했습니다.', 'warn');
@@ -303,10 +338,12 @@
 
     if (recorder.state === 'recording') {
       recorder.pause();
+      session.isPaused = true;
       state.isPaused = true;
       // Remember when the pause began so neither the timer nor the saved duration counts
       // paused time.
       state.pausedAt = Date.now();
+      session.pausedAt = state.pausedAt;
       RP4.app.updateRecordingUi();
       RP4.ui.setStatus('일시정지', '녹화가 일시정지되었습니다.', 'warn');
       return;
@@ -316,37 +353,45 @@
       recorder.resume();
       if (state.pausedAt) {
         state.pausedAccumMs += Date.now() - state.pausedAt;
+        session.pausedAccumMs = state.pausedAccumMs;
         state.pausedAt = 0;
+        session.pausedAt = 0;
       }
       state.isPaused = false;
+      session.isPaused = false;
       RP4.app.updateRecordingUi();
       RP4.ui.setStatus('녹화 중', `${RP4.app.getSourceTitle(state.selectedSource)} 녹화 중입니다.`, 'recording');
     }
   }
 
-  function resetRecordingState() {
-    RP4.app.stopTimer();
-    if (state.recording) {
+  function resetRecordingState(context = state.recording) {
+    if (context) {
       try {
-        state.recording.cleanup();
+        context.cleanup();
       } catch {
         // best effort
       }
     }
+    if (context && state.recording !== context) {
+      RP4.lifecycle.finish(context.operationId);
+      return;
+    }
+    RP4.app.stopTimer();
     state.recording = null;
     state.isRecording = false;
     state.isPaused = false;
     state.startedAt = 0;
     state.pausedAccumMs = 0;
     state.pausedAt = 0;
+    if (context) RP4.lifecycle.finish(context.operationId);
   }
 
   /** Waits for an in-flight recording to finish, used while the app is shutting down. */
   async function finalizeForShutdown() {
-    if (!state.isRecording) return;
+    if (!state.recording) return;
     const done = new Promise((resolve) => {
       const poll = () => {
-        if (!state.isRecording) {
+        if (!state.recording) {
           resolve();
           return;
         }

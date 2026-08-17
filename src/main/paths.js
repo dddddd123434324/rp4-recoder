@@ -132,9 +132,14 @@ async function migrateLegacySettings() {
  */
 async function resolveRecordingsDir(configuredDir) {
   const candidates = [];
+  const requestedDir = typeof configuredDir === 'string' && configuredDir.trim()
+    ? configuredDir.trim()
+    : null;
+  const requestedValid = requestedDir != null && isPlausibleRecordingsDir(requestedDir);
+  const requestedResolved = requestedValid ? path.resolve(requestedDir) : null;
 
-  if (isPlausibleRecordingsDir(configuredDir)) {
-    candidates.push(path.resolve(String(configuredDir).trim()));
+  if (requestedResolved) {
+    candidates.push(requestedResolved);
   }
   if (await pathExists(LEGACY_RECORDINGS_DIR)) {
     candidates.push(LEGACY_RECORDINGS_DIR);
@@ -142,15 +147,30 @@ async function resolveRecordingsDir(configuredDir) {
   candidates.push(defaultRecordingsDir());
   candidates.push(fallbackRecordingsDir());
 
-  for (const candidate of candidates) {
+  for (const candidate of [...new Set(candidates)]) {
     if (await isDirectoryWritable(candidate)) {
-      return { recordingsDir: candidate, fellBack: candidate !== candidates[0] };
+      const fallbackReason = requestedDir == null
+        ? null
+        : !requestedValid
+          ? 'invalid'
+          : candidate !== requestedResolved ? 'unwritable' : null;
+      return {
+        recordingsDir: candidate,
+        fellBack: fallbackReason != null,
+        fallbackReason,
+        requestedDir
+      };
     }
   }
 
   // Every candidate failed; hand back userData so callers still get a real path and the
   // caller-level error handling can surface the problem.
-  return { recordingsDir: fallbackRecordingsDir(), fellBack: true };
+  return {
+    recordingsDir: fallbackRecordingsDir(),
+    fellBack: requestedDir != null,
+    fallbackReason: requestedDir == null ? null : requestedValid ? 'unwritable' : 'invalid',
+    requestedDir
+  };
 }
 
 async function ensureRecordingDirs(recordingsDir) {

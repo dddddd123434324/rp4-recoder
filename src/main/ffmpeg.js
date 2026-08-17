@@ -143,6 +143,27 @@ async function remux(inputPath, outputPath, { jobId, onProgress, totalDurationMs
   ], { jobId, onProgress, totalDurationMs });
 }
 
+/** Extracts the most recent interval from one complete MediaRecorder stream. */
+async function trimRecent(inputPath, outputPath, { durationMs, jobId, onProgress } = {}) {
+  const seconds = Math.max(0.1, Number(durationMs) / 1000 || 0.1);
+  const args = [
+    '-y',
+    '-sseof', `-${seconds.toFixed(3)}`,
+    '-fflags', '+genpts',
+    '-i', inputPath,
+    '-map', '0:v:0',
+    '-map', '0:a?',
+    '-c', 'copy',
+    '-avoid_negative_ts', 'make_zero'
+  ];
+  if (path.extname(outputPath).toLowerCase() === '.mp4') {
+    args.push('-movflags', '+faststart');
+  }
+  args.push(outputPath);
+  await fs.rm(outputPath, { force: true });
+  await run(args, { jobId, onProgress, totalDurationMs: durationMs });
+}
+
 /**
  * Full software re-encode. Only reached when the recorder could not produce H.264 at
  * all, so it is a compatibility fallback rather than part of the normal path.
@@ -183,5 +204,6 @@ module.exports = {
   cancelAll,
   hasActiveJobs,
   remux,
+  trimRecent,
   transcodeToMp4
 };

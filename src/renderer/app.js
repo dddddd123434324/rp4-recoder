@@ -167,10 +167,12 @@
   function updateRecordingUi() {
     const recording = state.isRecording;
     const clipActive = Boolean(state.clip);
+    const transitioning = ['starting-recording', 'stopping-recording', 'starting-clip', 'stopping-clip']
+      .includes(state.captureLifecycle);
 
     els.recordButton.classList.toggle('recording', recording);
     els.recordButton.querySelector('span').textContent = recording ? 'STOP' : 'REC';
-    els.recordButton.disabled = clipActive;
+    els.recordButton.disabled = clipActive || transitioning;
 
     els.pauseButton.disabled = !recording;
     els.pauseButton.querySelector('span').textContent = state.isPaused ? '재개' : '일시정지';
@@ -181,10 +183,13 @@
 
   function updateClipUi() {
     const active = Boolean(state.clip);
+    const transitioning = ['starting-recording', 'stopping-recording', 'starting-clip', 'stopping-clip']
+      .includes(state.captureLifecycle);
     els.clipModeButton.classList.toggle('active', active);
     els.clipModeButton.querySelector('span').textContent =
       active ? '클립 녹화 모드 중지' : '클립 녹화 모드 시작';
-    els.clipSaveButton.disabled = !active || state.clipSaving;
+    els.clipModeButton.disabled = transitioning || state.captureLifecycle === 'saving-clip';
+    els.clipSaveButton.disabled = !active || state.clipSaving || transitioning;
     els.clipSaveButton.querySelector('span').textContent =
       state.clipSaving ? '클립 저장 중' : '클립 저장';
     updateRecordingUi();
@@ -343,13 +348,13 @@
     if (mode !== 'area') state.hasAreaSelection = false;
     setActiveMode(mode);
     updatePreviewMeta();
-    if (!state.isRecording && !state.clip) {
+    if (!RP4.lifecycle.isBusy()) {
       await RP4.recorder.startPreview();
     }
   }
 
   async function setMode(mode) {
-    if (state.isRecording || state.clip) {
+    if (RP4.lifecycle.isBusy()) {
       RP4.ui.showToast('녹화 중에는 캡처 모드를 바꿀 수 없습니다.');
       return;
     }
@@ -449,7 +454,7 @@
   }
 
   async function openSourceModal(mode) {
-    if (state.isRecording || state.clip) {
+    if (RP4.lifecycle.isBusy()) {
       RP4.ui.showToast('녹화 중에는 소스를 바꿀 수 없습니다.');
       return;
     }
@@ -492,7 +497,7 @@
   }
 
   async function chooseRecordingsFolder() {
-    if (state.isRecording || state.clip) {
+    if (RP4.lifecycle.isBusy()) {
       RP4.ui.showToast('녹화 중에는 저장 경로를 바꿀 수 없습니다.');
       return;
     }

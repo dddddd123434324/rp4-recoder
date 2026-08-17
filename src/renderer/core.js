@@ -21,6 +21,11 @@ window.RP4 = window.RP4 || {};
     preview: null,
     previewGeneration: 0,
 
+    // Shared capture lifecycle. Recording and clip mode must claim this synchronously
+    // before their first await so two starts can never overlap.
+    captureLifecycle: 'idle',
+    captureOperationId: 0,
+
     // Normal recording
     recording: null,
     isRecording: false,
@@ -144,6 +149,48 @@ window.RP4 = window.RP4 || {};
     return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
 
+  function beginCapture(phase) {
+    if (state.captureLifecycle !== 'idle') return null;
+    state.captureOperationId += 1;
+    state.captureLifecycle = phase;
+    return state.captureOperationId;
+  }
+
+  function isCurrentCapture(operationId, phase = null) {
+    return state.captureOperationId === operationId
+      && (phase == null || state.captureLifecycle === phase);
+  }
+
+  function transitionCapture(operationId, phase) {
+    if (!isCurrentCapture(operationId)) return false;
+    state.captureLifecycle = phase;
+    return true;
+  }
+
+  function finishCapture(operationId) {
+    if (!isCurrentCapture(operationId)) return false;
+    state.captureLifecycle = 'idle';
+    return true;
+  }
+
+  function captureBusy() {
+    return state.captureLifecycle !== 'idle';
+  }
+
+  const IPC_SLICE_BYTES = 8 * 1024 * 1024;
+
+  async function writeBlobInSlices(sessionId, blob) {
+    for (let offset = 0; offset < blob.size; offset += IPC_SLICE_BYTES) {
+      const part = blob.slice(offset, Math.min(blob.size, offset + IPC_SLICE_BYTES));
+      const result = await window.rp4.writeRecordingChunk({
+        sessionId,
+        buffer: await part.arrayBuffer()
+      });
+      if (result?.warning) return result;
+    }
+    return null;
+  }
+
   RP4.state = state;
   RP4.els = els;
   RP4.$ = $;
@@ -157,7 +204,15 @@ window.RP4 = window.RP4 || {};
     formatSeconds,
     isTypingTarget,
     stopStream,
-    sleep
+    sleep,
+    writeBlobInSlices
+  };
+  RP4.lifecycle = {
+    begin: beginCapture,
+    isCurrent: isCurrentCapture,
+    transition: transitionCapture,
+    finish: finishCapture,
+    isBusy: captureBusy
   };
   RP4.ui = { showToast, setStatus };
 }(window.RP4));

@@ -163,9 +163,12 @@ async function bootstrap() {
     const sweep = await recordings.sweepTempDir();
     mainWindow.webContents.once('did-finish-load', () => {
       if (loaded.recordingsDirFellBack) {
+        const reason = loaded.recordingsDirFallbackReason === 'invalid'
+          ? '올바른 절대 경로가 아닙니다.'
+          : '폴더를 만들거나 쓸 수 없습니다.';
         send('app:notice', {
           level: 'warn',
-          message: `설정된 저장 폴더를 사용할 수 없어 ${settings.recordingsDir} 로 변경했습니다.`
+          message: `설정된 저장 폴더(${loaded.requestedRecordingsDir})를 사용할 수 없습니다: ${reason} ${settings.recordingsDir} 로 변경했습니다.`
         });
       }
       if (sweep.recovered.length > 0) {

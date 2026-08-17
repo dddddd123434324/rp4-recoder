@@ -184,13 +184,18 @@ class SettingsStore {
 
     // Validate the configured folder before trusting it, so a missing drive downgrades
     // to a writable default instead of breaking startup.
-    const resolved = await paths.resolveRecordingsDir(staged.recordingsDir);
+    const resolved = await paths.resolveRecordingsDir(raw?.recordingsDir);
     this.current = normalize(
       { ...staged, recordingsDir: resolved.recordingsDir },
       { recordingsDirFallback: resolved.recordingsDir }
     );
 
-    return { settings: this.current, recordingsDirFellBack: resolved.fellBack };
+    return {
+      settings: this.current,
+      recordingsDirFellBack: resolved.fellBack,
+      recordingsDirFallbackReason: resolved.fallbackReason,
+      requestedRecordingsDir: resolved.requestedDir
+    };
   }
 
   /** Merges a patch, normalizes the result, and persists it. */
