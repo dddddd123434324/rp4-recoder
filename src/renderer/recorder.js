@@ -201,12 +201,21 @@
         if (event.data && event.data.size > 0) enqueueChunk(context, event.data);
       });
       recorder.addEventListener('error', (event) => {
-        console.error(event.error || event);
-        RP4.ui.showToast('녹화 중 오류가 발생했습니다.');
+        failRecording(
+          context,
+          event.error || new Error('MediaRecorder가 녹화 중 실패했습니다.')
+        );
       });
       recorder.addEventListener('stop', () => {
         void finalizeRecording(context);
       }, { once: true });
+      for (const track of capture.stream.getTracks()) {
+        track.addEventListener('ended', () => {
+          if (!context.stopping) {
+            failRecording(context, new Error('캡처 소스가 종료되었습니다.'));
+          }
+        }, { once: true });
+      }
 
       recorder.start(CHUNK_INTERVAL_MS);
       RP4.app.updateRecordingUi();

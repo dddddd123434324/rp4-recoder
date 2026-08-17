@@ -214,8 +214,18 @@
     if (state.isRecording) {
       elapsed = RP4.recorder.elapsedMs();
     } else if (state.clip) {
-      elapsed = Math.max(0, Date.now() - state.clip.startedAt);
+      const buffer = RP4.clips.bufferStatus();
+      if (buffer) {
+        els.recordingTimer.textContent =
+          `${util.formatDuration(buffer.availableMs)} / ${util.formatDuration(buffer.targetMs)}`;
+        els.recordingTimer.title = buffer.limitedByCapacity
+          ? '메모리 한도로 인해 현재 확보 길이가 목표보다 짧을 수 있습니다.'
+          : '현재 확보 길이 / 목표 클립 길이';
+        return;
+      }
+      elapsed = 0;
     }
+    els.recordingTimer.title = '';
     els.recordingTimer.textContent = util.formatDuration(elapsed);
   }
 

@@ -125,6 +125,18 @@ function hasActiveJobs() {
   return activeJobs.size > 0;
 }
 
+/** Parses a media file end-to-end without decoding it, catching truncated swap artifacts. */
+async function validateMedia(inputPath) {
+  await run([
+    '-v', 'error',
+    '-i', inputPath,
+    '-map', '0:v:0',
+    '-c', 'copy',
+    '-f', 'null',
+    '-'
+  ]);
+}
+
 /**
  * Stream-copy remux. No re-encoding, so this is I/O bound (measured ~75 ms for 11.5 MB)
  * rather than the minutes a libx264 pass costs.
@@ -144,13 +156,20 @@ async function remux(inputPath, outputPath, { jobId, onProgress, totalDurationMs
 }
 
 /** Extracts the most recent interval from one complete MediaRecorder stream. */
-async function trimRecent(inputPath, outputPath, { durationMs, jobId, onProgress } = {}) {
+async function trimRecent(inputPath, outputPath, {
+  durationMs,
+  endOffsetMs = 0,
+  jobId,
+  onProgress
+} = {}) {
   const seconds = Math.max(0.1, Number(durationMs) / 1000 || 0.1);
+  const seekSeconds = seconds + Math.max(0, Number(endOffsetMs) || 0) / 1000;
   const args = [
     '-y',
-    '-sseof', `-${seconds.toFixed(3)}`,
+    '-sseof', `-${seekSeconds.toFixed(3)}`,
     '-fflags', '+genpts',
     '-i', inputPath,
+    '-t', seconds.toFixed(3),
     '-map', '0:v:0',
     '-map', '0:a?',
     '-c', 'copy',
@@ -165,6 +184,39 @@ async function trimRecent(inputPath, outputPath, { durationMs, jobId, onProgress
 }
 
 /**
+ * Extracts a recent H.264 interval into MP4. The video remains a stream copy while audio
+ * is normalized to AAC, since MediaRecorder fallbacks commonly pair H.264 with Opus and
+ * that combination is not reliably playable in an MP4 container.
+ */
+async function trimRecentToMp4(inputPath, outputPath, options = {}) {
+  const durationMs = Math.max(100, Number(options.durationMs) || 100);
+  const seconds = durationMs / 1000;
+  const seekSeconds = seconds + Math.max(0, Number(options.endOffsetMs) || 0) / 1000;
+  const audioBitrateKbps = Math.max(64, Math.min(320, Number(options.audioBitrateKbps) || 192));
+
+  await fs.rm(outputPath, { force: true });
+  await run([
+    '-y',
+    '-sseof', `-${seekSeconds.toFixed(3)}`,
+    '-fflags', '+genpts',
+    '-i', inputPath,
+    '-t', seconds.toFixed(3),
+    '-map', '0:v:0',
+    '-map', '0:a?',
+    '-c:v', 'copy',
+    '-c:a', 'aac',
+    '-b:a', `${audioBitrateKbps}k`,
+    '-avoid_negative_ts', 'make_zero',
+    '-movflags', '+faststart',
+    outputPath
+  ], {
+    jobId: options.jobId,
+    onProgress: options.onProgress,
+    totalDurationMs: durationMs
+  });
+}
+
+/**
  * Full software re-encode. Only reached when the recorder could not produce H.264 at
  * all, so it is a compatibility fallback rather than part of the normal path.
  */
@@ -175,10 +227,19 @@ async function transcodeToMp4(inputPath, outputPath, options = {}) {
   const preset = ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium']
     .includes(options.encoderPreset) ? options.encoderPreset : 'veryfast';
 
+  const inputArgs = [];
+  const recentDurationMs = Number(options.recentDurationMs);
+  const recentEndOffsetMs = Math.max(0, Number(options.recentEndOffsetMs) || 0);
+  if (Number.isFinite(recentDurationMs) && recentDurationMs > 0) {
+    inputArgs.push('-sseof', `-${((recentDurationMs + recentEndOffsetMs) / 1000).toFixed(3)}`);
+  }
+
   await fs.rm(outputPath, { force: true });
   await run([
     '-y',
+    ...inputArgs,
     '-i', inputPath,
+    ...(recentDurationMs > 0 ? ['-t', (recentDurationMs / 1000).toFixed(3)] : []),
     '-map', '0:v:0',
     '-map', '0:a?',
     '-vf', `fps=${fps},pad=ceil(iw/2)*2:ceil(ih/2)*2`,
@@ -193,7 +254,7 @@ async function transcodeToMp4(inputPath, outputPath, options = {}) {
   ], {
     jobId: options.jobId,
     onProgress: options.onProgress,
-    totalDurationMs: options.totalDurationMs
+    totalDurationMs: recentDurationMs > 0 ? recentDurationMs : options.totalDurationMs
   });
 }
 
@@ -203,7 +264,9 @@ module.exports = {
   cancel,
   cancelAll,
   hasActiveJobs,
+  validateMedia,
   remux,
   trimRecent,
+  trimRecentToMp4,
   transcodeToMp4
 };

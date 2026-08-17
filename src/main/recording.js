@@ -82,7 +82,7 @@ async function freeBytes(target) {
     const stats = await fs.statfs(target);
     return Number(stats.bsize) * Number(stats.bavail);
   } catch {
-    return Number.POSITIVE_INFINITY;
+    return null;
   }
 }
 
@@ -183,6 +183,8 @@ class RecordingManager {
     this.metadata = new Map();
     this.optimizeQueue = [];
     this.optimizing = false;
+    this.optimizeDrainPromise = null;
+    this.optimizationCancelled = false;
     this.indexChain = Promise.resolve();
     this.indexDirty = false;
     this.moveFile = move;
@@ -212,14 +214,28 @@ class RecordingManager {
   async loadIndex() {
     try {
       const raw = JSON.parse(await fs.readFile(this.indexFile(), 'utf8'));
-      if (!raw || typeof raw !== 'object' || !Array.isArray(raw.entries)) return;
+      if (!raw || typeof raw !== 'object' || !Array.isArray(raw.entries)) {
+        throw new SyntaxError('녹화 인덱스 형식이 올바르지 않습니다.');
+      }
       for (const entry of raw.entries) {
         if (entry && typeof entry.filePath === 'string' && entry.meta) {
           this.metadata.set(entry.filePath, entry.meta);
         }
       }
-    } catch {
-      // A missing or corrupt index is not fatal: file listings simply lose extra detail.
+      return { recovered: false, backupPath: null };
+    } catch (error) {
+      if (error?.code === 'ENOENT') return { recovered: false, backupPath: null };
+      const source = this.indexFile();
+      const backup = path.join(
+        path.dirname(source),
+        `recordings-index.corrupt-${timestamp().replace('_', '-')}.json`
+      );
+      try {
+        await this.moveFile(source, backup);
+        return { recovered: true, backupPath: backup };
+      } catch {
+        return { recovered: true, backupPath: null };
+      }
     }
   }
 
@@ -319,7 +335,12 @@ class RecordingManager {
 
     const recordingsDir = this.settings.recordingsDir;
     const available = await freeBytes(recordingsDir);
-    if (available < MIN_FREE_BYTES_TO_START) {
+    if (available == null) {
+      this.emit('app:notice', {
+        level: 'warn',
+        message: '저장 장치의 여유 공간을 확인할 수 없습니다. 녹화를 계속하지만 디스크 공간을 확인해 주세요.'
+      });
+    } else if (available < MIN_FREE_BYTES_TO_START) {
       throw new Error('저장 공간이 부족합니다. 최소 512MB 이상의 여유 공간이 필요합니다.');
     }
 
@@ -350,6 +371,7 @@ class RecordingManager {
       bytes: 0,
       startedAtMs: Date.now(),
       failed: null,
+      diskCheckUnavailableWarned: available == null,
       meta: {
         ...meta,
         targetFormat,
@@ -412,7 +434,13 @@ class RecordingManager {
     if (session.bytes - (session.lastSpaceCheckBytes || 0) > 64 * 1024 * 1024) {
       session.lastSpaceCheckBytes = session.bytes;
       const available = await freeBytes(session.recordingsDir);
-      if (available < MIN_FREE_BYTES_TO_CONTINUE) {
+      if (available == null && !session.diskCheckUnavailableWarned) {
+        session.diskCheckUnavailableWarned = true;
+        this.emit('app:notice', {
+          level: 'warn',
+          message: '녹화 중 저장 장치의 여유 공간을 확인할 수 없습니다. 디스크 공간을 확인해 주세요.'
+        });
+      } else if (available != null && available < MIN_FREE_BYTES_TO_CONTINUE) {
         session.failed = '저장 공간이 거의 없어 녹화를 중지해야 합니다.';
         this.emit('recording:disk-full', { sessionId: payload.sessionId });
       }
@@ -477,6 +505,9 @@ class RecordingManager {
       ? await this.keepPartial(session, failureReason)
       : await this.finalize(session, { durationMs });
     const stats = await statFile(finalized.filePath);
+    const outcome = finalized.partial
+      ? 'partial'
+      : finalized.conversionError ? 'original-preserved' : 'exact';
     const meta = {
       ...session.meta,
       ...(payload.meta && typeof payload.meta === 'object' ? payload.meta : {}),
@@ -486,6 +517,7 @@ class RecordingManager {
       status: finalized.partial ? 'partial' : 'complete',
       partial: Boolean(finalized.partial),
       failureReason: finalized.failureReason || null,
+      outcome,
       durationMs,
       stoppedAt: new Date().toISOString(),
       bytes: stats?.size || 0
@@ -502,7 +534,8 @@ class RecordingManager {
       converted: finalized.converted,
       conversionError: finalized.conversionError || null,
       status: meta.status,
-      failureReason: meta.failureReason
+      failureReason: meta.failureReason,
+      outcome
     };
   }
 
@@ -519,12 +552,41 @@ class RecordingManager {
     // Clip epochs contain every Blob from one MediaRecorder in order. FFmpeg can therefore
     // seek from the end of a complete stream without assuming any Blob is independently
     // decodable.
-    if (session.forceRemux && recordedContainer === targetFormat) {
+    if (session.forceRemux) {
       const target = await uniquePath(session.recordingsDir, session.baseName, targetFormat);
+      const recentDurationMs = Number(session.meta.trimRecentMs) || durationMs;
+      const endOffsetMs = Math.max(0, Number(session.meta.trimEndOffsetMs) || 0);
       try {
-        await ffmpeg.trimRecent(session.tempPath, target, {
-          durationMs: Number(session.meta.trimRecentMs) || durationMs
-        });
+        this.emit('recording:convert-progress', { phase: 'clip', ratio: 0 });
+        const progress = (ratio) => this.emit('recording:convert-progress', { phase: 'clip', ratio });
+
+        if (targetFormat === 'mp4' && recordedCodec !== 'h264') {
+          await ffmpeg.transcodeToMp4(session.tempPath, target, {
+            fps: session.meta.fps,
+            bitrateMbps: session.meta.bitrateMbps,
+            audioBitrateKbps: session.meta.audioBitrateKbps,
+            encoderPreset: session.meta.encoderPreset,
+            recentDurationMs,
+            recentEndOffsetMs: endOffsetMs,
+            jobId: `clip:${session.baseName}`,
+            onProgress: progress
+          });
+        } else if (targetFormat === 'mp4' && recordedContainer !== 'mp4') {
+          await ffmpeg.trimRecentToMp4(session.tempPath, target, {
+            durationMs: recentDurationMs,
+            endOffsetMs,
+            audioBitrateKbps: session.meta.audioBitrateKbps,
+            jobId: `clip:${session.baseName}`,
+            onProgress: progress
+          });
+        } else {
+          await ffmpeg.trimRecent(session.tempPath, target, {
+            durationMs: recentDurationMs,
+            endOffsetMs,
+            jobId: `clip:${session.baseName}`,
+            onProgress: progress
+          });
+        }
         await fs.rm(session.tempPath, { force: true });
         return { filePath: target, format: targetFormat, converted: true, optimizable: false };
       } catch (error) {
@@ -627,9 +689,56 @@ class RecordingManager {
    * Background faststart pass. The recording is already saved and listed before this
    * runs, so the user never waits for it.
    */
+  async reconcileRecordingsDir() {
+    const recordingsDir = this.settings.recordingsDir;
+    await paths.ensureRecordingDirs(recordingsDir);
+    const entries = await fs.readdir(recordingsDir, { withFileTypes: true }).catch(() => []);
+    const result = { restored: 0, removed: 0, failed: [] };
+
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const fullPath = path.join(recordingsDir, entry.name);
+      let original = null;
+
+      if (entry.name.endsWith('.optimizing.mp4')) {
+        original = fullPath.slice(0, -'.optimizing.mp4'.length);
+      } else {
+        const marker = fullPath.lastIndexOf('.backup-');
+        if (marker >= 0) original = fullPath.slice(0, marker);
+      }
+      if (!original) continue;
+
+      try {
+        if (await paths.pathExists(original)) {
+          await fs.rm(fullPath, { force: true });
+          result.removed += 1;
+          continue;
+        }
+
+        const stats = await statFile(fullPath);
+        if (stats && stats.size > MIN_RECOVERABLE_RECORDING_BYTES) {
+          await ffmpeg.validateMedia(fullPath);
+          await this.moveFile(fullPath, original);
+          result.restored += 1;
+        } else {
+          await fs.rm(fullPath, { force: true });
+          result.removed += 1;
+        }
+      } catch (error) {
+        result.failed.push({ filePath: fullPath, error: error?.message || String(error) });
+      }
+    }
+
+    return result;
+  }
+
   enqueueOptimize(filePath, durationMs) {
+    if (this.optimizationCancelled) return;
     this.optimizeQueue.push({ filePath, durationMs });
-    void this.drainOptimizeQueue();
+    if (!this.optimizeDrainPromise) {
+      this.optimizeDrainPromise = this.drainOptimizeQueue()
+        .finally(() => { this.optimizeDrainPromise = null; });
+    }
   }
 
   async drainOptimizeQueue() {
@@ -676,6 +785,13 @@ class RecordingManager {
     } finally {
       this.optimizing = false;
     }
+  }
+
+  async cancelAndDrainOptimizations() {
+    this.optimizationCancelled = true;
+    this.optimizeQueue.length = 0;
+    ffmpeg.cancelAll();
+    await this.optimizeDrainPromise?.catch(() => {});
   }
 
   /**
@@ -725,11 +841,13 @@ class RecordingManager {
 
     const finalized = await this.finalize(session, { durationMs });
     const stats = await statFile(finalized.filePath);
+    const outcome = finalized.conversionError ? 'original-preserved' : 'exact';
     const dtoMeta = {
       ...session.meta,
       format: finalized.format,
       converted: finalized.converted,
       conversionError: finalized.conversionError || null,
+      outcome,
       durationMs,
       stoppedAt: new Date().toISOString(),
       bytes: stats?.size || 0
@@ -740,7 +858,12 @@ class RecordingManager {
       this.enqueueOptimize(finalized.filePath, durationMs);
     }
 
-    return this.toDto(finalized.filePath, stats, dtoMeta);
+    return {
+      ...this.toDto(finalized.filePath, stats, dtoMeta),
+      converted: finalized.converted,
+      conversionError: finalized.conversionError || null,
+      outcome
+    };
   }
 
   toDto(filePath, stats, meta = {}) {

@@ -71,8 +71,10 @@ async function shutdown() {
     if (recordings) {
       await windows.drainRecordings(mainWindow, recordings, { timeoutMs: 20000 });
       await recordings.closeAllSessions();
+      await recordings.cancelAndDrainOptimizations();
     }
 
+    // Also covers an FFmpeg job that was started outside RecordingManager.
     ffmpeg.cancelAll();
     windowCrop.dispose();
   } catch (error) {
@@ -116,7 +118,8 @@ async function bootstrap() {
     await paths.ensureRecordingDirs(settings.recordingsDir);
 
     recordings = new RecordingManager({ settings, emit: send });
-    await recordings.loadIndex();
+    const indexRecovery = await recordings.loadIndex();
+    const reconciliation = await recordings.reconcileRecordingsDir();
 
     hotkeys = new HotkeyManager({
       onTrigger: (action) => send('hotkey:trigger', action)
@@ -162,6 +165,22 @@ async function bootstrap() {
     // configured folder was not usable.
     const sweep = await recordings.sweepTempDir();
     mainWindow.webContents.once('did-finish-load', () => {
+      if (loaded.settingsRecovered) {
+        send('app:notice', {
+          level: 'warn',
+          message: loaded.settingsBackupPath
+            ? `손상된 설정 파일을 ${loaded.settingsBackupPath}에 백업하고 기본 설정으로 복구했습니다.`
+            : '설정 파일이 손상되어 기본 설정으로 복구했지만 원본 백업을 만들지 못했습니다.'
+        });
+      }
+      if (indexRecovery.recovered) {
+        send('app:notice', {
+          level: 'warn',
+          message: indexRecovery.backupPath
+            ? `손상된 녹화 인덱스를 ${indexRecovery.backupPath}에 백업하고 새 인덱스로 복구했습니다.`
+            : '녹화 인덱스를 읽지 못해 빈 인덱스로 시작했습니다. 원본 파일은 보존했습니다.'
+        });
+      }
       if (loaded.recordingsDirFellBack) {
         const reason = loaded.recordingsDirFallbackReason === 'invalid'
           ? '올바른 절대 경로가 아닙니다.'
@@ -181,6 +200,18 @@ async function bootstrap() {
         send('app:notice', {
           level: 'warn',
           message: `이전 녹화 ${sweep.failed.length}개를 복구하지 못했습니다. 원본은 ${settings.tempDir}에 보존했습니다.`
+        });
+      }
+      if (reconciliation.restored > 0) {
+        send('app:notice', {
+          level: 'info',
+          message: `중단된 MP4 최적화에서 녹화 ${reconciliation.restored}개를 복구했습니다.`
+        });
+      }
+      if (reconciliation.failed.length > 0) {
+        send('app:notice', {
+          level: 'warn',
+          message: `최적화 잔여 파일 ${reconciliation.failed.length}개를 자동 복구하지 못했습니다.`
         });
       }
     });

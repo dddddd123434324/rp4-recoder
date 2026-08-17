@@ -161,9 +161,33 @@ function normalize(value = {}, { recordingsDirFallback } = {}) {
 
 async function readJson(filePath) {
   try {
-    return JSON.parse(await fs.readFile(filePath, 'utf8'));
-  } catch {
-    return null;
+    return { value: JSON.parse(await fs.readFile(filePath, 'utf8')), recovery: null };
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { value: null, recovery: null };
+
+    const extension = path.extname(filePath);
+    const stem = path.basename(filePath, extension);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupPath = path.join(
+      path.dirname(filePath),
+      `${stem}.corrupt-${stamp}-${crypto.randomUUID().slice(0, 8)}${extension || '.json'}`
+    );
+    try {
+      await fs.rename(filePath, backupPath);
+      return {
+        value: null,
+        recovery: { backupPath, error: error?.message || String(error) }
+      };
+    } catch (backupError) {
+      return {
+        value: null,
+        recovery: {
+          backupPath: null,
+          error: error?.message || String(error),
+          backupError: backupError?.message || String(backupError)
+        }
+      };
+    }
   }
 }
 
@@ -179,7 +203,8 @@ class SettingsStore {
 
   async load() {
     await paths.migrateLegacySettings();
-    const raw = await readJson(paths.settingsFile());
+    const loaded = await readJson(paths.settingsFile());
+    const raw = loaded.value;
     const staged = normalize(raw || {});
 
     // Validate the configured folder before trusting it, so a missing drive downgrades
@@ -194,7 +219,10 @@ class SettingsStore {
       settings: this.current,
       recordingsDirFellBack: resolved.fellBack,
       recordingsDirFallbackReason: resolved.fallbackReason,
-      requestedRecordingsDir: resolved.requestedDir
+      requestedRecordingsDir: resolved.requestedDir,
+      settingsRecovered: Boolean(loaded.recovery),
+      settingsBackupPath: loaded.recovery?.backupPath || null,
+      settingsRecoveryError: loaded.recovery?.error || null
     };
   }
 

@@ -121,17 +121,17 @@
   }
 
   function alignRect(rect, frameWidth, frameHeight) {
-    const maxWidth = Math.max(2, util.makeEven(frameWidth));
-    const maxHeight = Math.max(2, util.makeEven(frameHeight));
+    const maxWidth = util.makeEvenSize(frameWidth);
+    const maxHeight = util.makeEvenSize(frameHeight);
 
-    let width = util.makeEven(util.clamp(rect.width, 2, maxWidth));
-    let height = util.makeEven(util.clamp(rect.height, 2, maxHeight));
+    let width = util.makeEvenSize(util.clamp(rect.width, 2, maxWidth));
+    let height = util.makeEvenSize(util.clamp(rect.height, 2, maxHeight));
     // visibleRect offsets must be even too, or chroma planes land on a half sample.
-    const x = util.makeEven(util.clamp(rect.x, 0, maxWidth - width));
-    const y = util.makeEven(util.clamp(rect.y, 0, maxHeight - height));
+    const x = util.makeEvenOffset(util.clamp(rect.x, 0, maxWidth - width));
+    const y = util.makeEvenOffset(util.clamp(rect.y, 0, maxHeight - height));
 
-    if (x + width > frameWidth) width = util.makeEven(frameWidth - x);
-    if (y + height > frameHeight) height = util.makeEven(frameHeight - y);
+    if (x + width > frameWidth) width = util.makeEvenSize(frameWidth - x);
+    if (y + height > frameHeight) height = util.makeEvenSize(frameHeight - y);
 
     return { x, y, width: Math.max(2, width), height: Math.max(2, height) };
   }

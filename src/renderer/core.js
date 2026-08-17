@@ -73,9 +73,15 @@ window.RP4 = window.RP4 || {};
   }
 
   /** H.264 requires even dimensions; chroma planes are half resolution. */
-  function makeEven(value) {
+  function makeEvenSize(value) {
     const rounded = Math.max(2, Math.round(value));
     return rounded % 2 === 0 ? rounded : rounded - 1;
+  }
+
+  /** Keeps zero and negative multi-monitor offsets intact while aligning chroma samples. */
+  function makeEvenOffset(value) {
+    const rounded = Math.round(Number(value) || 0);
+    return rounded % 2 === 0 ? rounded : rounded - Math.sign(rounded);
   }
 
   function formatBytes(bytes) {
@@ -197,7 +203,9 @@ window.RP4 = window.RP4 || {};
   RP4.$$ = $$;
   RP4.util = {
     clamp,
-    makeEven,
+    makeEven: makeEvenSize,
+    makeEvenSize,
+    makeEvenOffset,
     formatBytes,
     formatDuration,
     formatDate,
