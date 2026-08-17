@@ -104,7 +104,7 @@
       if (!recordings.length) {
         const empty = document.createElement('div');
         empty.className = 'empty-state';
-        empty.textContent = '아직 녹화 파일이 없습니다.';
+        empty.textContent = '아직 녹화 파일이\n없습니다.';
         els.recordingList.append(empty);
         return;
       }
