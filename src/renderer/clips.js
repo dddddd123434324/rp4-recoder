@@ -266,7 +266,7 @@
     RP4.lifecycle.finish(session.operationId);
     RP4.app.updateClipUi();
     await RP4.recorder.startPreview();
-    if (!failed) RP4.ui.setStatus('준비 완료', '녹화 준비가 완료되었습니다.', 'ready');
+    if (!failed) RP4.ui.setStatus('준비 완료', '녹화 준비가\n완료되었습니다.', 'ready');
   }
 
   async function saveClip() {

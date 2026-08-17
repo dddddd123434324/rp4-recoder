@@ -1,6 +1,30 @@
+@font-face {
+  font-family: "PyeojinGothic";
+  src: url("./fonts/PyeojinGothic-Light.woff2") format("woff2");
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "PyeojinGothic";
+  src: url("./fonts/PyeojinGothic-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "PyeojinGothic";
+  src: url("./fonts/PyeojinGothic-Bold.woff2") format("woff2");
+  font-weight: 700 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   --accent: #ff2d0a;
-  font-family: "Segoe UI", "Malgun Gothic", Arial, sans-serif;
+  font-family: "PyeojinGothic", "Malgun Gothic", Arial, sans-serif;
   color: #fff;
 }
 
@@ -63,7 +87,7 @@ body {
 
 .actions button.primary {
   border-color: rgba(255, 45, 10, 0.9);
-  background: linear-gradient(180deg, #ff4a17, #f22b08);
+  background: #f22b08;
 }
 
 .selection {
@@ -127,4 +151,22 @@ body {
   right: -8px;
   bottom: -8px;
   cursor: nwse-resize;
+}
+
+/* Square-corner UI experiment. Remove this block to restore original radii. */
+*,
+*::before,
+*::after {
+  border-radius: 0 !important;
+}
+
+/* Match the main window's lifted mid-gray palette. */
+.hint,
+.selection::after {
+  background: rgba(42, 46, 52, 0.94);
+}
+
+.hint button,
+.actions button {
+  background: #3a3f47;
 }

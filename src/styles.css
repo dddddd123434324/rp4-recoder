@@ -1,3 +1,27 @@
+@font-face {
+  font-family: "PyeojinGothic";
+  src: url("./fonts/PyeojinGothic-Light.woff2") format("woff2");
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "PyeojinGothic";
+  src: url("./fonts/PyeojinGothic-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "PyeojinGothic";
+  src: url("./fonts/PyeojinGothic-Bold.woff2") format("woff2");
+  font-weight: 700 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   --bg: #060708;
   --bg-soft: #0d0f12;
@@ -15,7 +39,7 @@
   --warn: #f3b33d;
   --danger: #ff1010;
   --shadow: 0 18px 45px rgba(0, 0, 0, 0.45);
-  font-family: "Segoe UI", "Malgun Gothic", Arial, sans-serif;
+  font-family: "PyeojinGothic", "Malgun Gothic", Arial, sans-serif;
   color: var(--text);
   background: var(--bg);
   letter-spacing: 0;
@@ -34,10 +58,7 @@ body {
 }
 
 body {
-  background:
-    linear-gradient(145deg, rgba(255, 86, 42, 0.2), rgba(41, 12, 8, 0.74) 38%, #08090b 100%),
-    linear-gradient(180deg, rgba(255, 45, 10, 0.12), rgba(255, 45, 10, 0) 34%),
-    var(--bg);
+  background: var(--bg);
 }
 
 button,
@@ -66,9 +87,7 @@ svg {
   grid-template-columns: 232px minmax(0, 1fr);
   width: 100%;
   height: 100%;
-  background:
-    linear-gradient(135deg, rgba(255, 70, 28, 0.12), rgba(6, 7, 8, 0.9) 32%, rgba(17, 9, 8, 0.96)),
-    rgba(6, 7, 8, 0.92);
+  background: #08090b;
 }
 
 .sidebar {
@@ -89,7 +108,7 @@ svg {
   z-index: 0;
   height: 48%;
   pointer-events: none;
-  background: linear-gradient(0deg, rgba(255, 83, 38, 0.23), rgba(255, 45, 10, 0.08) 48%, rgba(255, 45, 10, 0));
+  background: transparent;
 }
 
 .sidebar > * {
@@ -103,6 +122,7 @@ svg {
   align-items: center;
   font-size: 36px;
   font-weight: 900;
+  font-family: "Segoe UI Black", "Arial Black", "Segoe UI", sans-serif;
   line-height: 1;
 }
 
@@ -147,7 +167,7 @@ svg {
 .nav-item:hover,
 .nav-item.active {
   color: var(--accent-2);
-  background: linear-gradient(90deg, rgba(255, 45, 10, 0.18), rgba(255, 45, 10, 0.03));
+  background: rgba(255, 45, 10, 0.12);
   border-color: rgba(255, 45, 10, 0.18);
 }
 
@@ -163,9 +183,10 @@ svg {
 }
 
 .nav-sub-action {
-  justify-self: stretch;
+  justify-self: center;
+  width: calc(100% - 36px);
   min-height: 30px;
-  margin: -2px 18px 2px 60px;
+  margin: -2px 0 2px;
   border: 1px solid #2d323a;
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.035);
@@ -191,8 +212,7 @@ svg {
   padding: 20px;
   border: 1px solid #24272d;
   border-radius: 8px;
-  background: linear-gradient(180deg, #191c21, #111317);
-  box-shadow: var(--shadow);
+  background: #15171b;
 }
 
 .ready-card strong {
@@ -206,6 +226,7 @@ svg {
   color: var(--muted);
   font-size: 13px;
   line-height: 1.45;
+  white-space: pre-line;
 }
 
 .status-dot {
@@ -253,12 +274,21 @@ svg {
 }
 
 .window-actions button {
+  display: grid;
+  place-items: center;
   width: 48px;
   height: 34px;
+  padding: 0;
   border: 0;
   background: transparent;
   color: #b6bcc7;
   cursor: pointer;
+}
+
+.window-actions button svg {
+  width: 15px;
+  height: 15px;
+  stroke-width: 1.8;
 }
 
 .window-actions button:hover {
@@ -274,7 +304,7 @@ svg {
   min-height: 0;
   height: 100%;
   display: grid;
-  grid-template-columns: minmax(420px, 1fr) minmax(300px, 390px);
+  grid-template-columns: minmax(420px, 1fr) minmax(270px, 330px);
   grid-template-rows: minmax(0, 1fr);
   gap: 8px;
   overflow: hidden;
@@ -286,9 +316,7 @@ svg {
   min-height: 0;
   border: 1px solid #252930;
   border-radius: 8px;
-  background:
-    linear-gradient(150deg, rgba(255, 73, 28, 0.08), rgba(24, 27, 32, 0.96) 32%, rgba(14, 16, 19, 0.98)),
-    #111317;
+  background: #111317;
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.01) inset;
 }
 
@@ -442,11 +470,7 @@ svg {
   overflow: hidden;
   border: 1px solid #2a2f38;
   border-radius: 8px;
-  background:
-    linear-gradient(135deg, rgba(255, 45, 10, 0.08), transparent 34%),
-    repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.035) 0 1px, transparent 1px 78px),
-    repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.025) 0 1px, transparent 1px 78px),
-    #0b0d10;
+  background: #0b0d10;
 }
 
 #previewVideo {
@@ -470,6 +494,7 @@ svg {
 
 .preview-placeholder span {
   color: rgba(255, 45, 10, 0.9);
+  font-family: "Segoe UI Black", "Arial Black", "Segoe UI", sans-serif;
   font-size: clamp(44px, 7vw, 84px);
   font-weight: 900;
   line-height: 1;
@@ -547,7 +572,7 @@ svg {
   padding: 0 16px;
   border-radius: 8px;
   border: 1px solid #282d35;
-  background: linear-gradient(180deg, #1a1d22, #14171b);
+  background: #171a1f;
   color: #ecf0f5;
   font-weight: 900;
   cursor: pointer;
@@ -583,7 +608,7 @@ svg {
 
 .record-button {
   border-color: rgba(255, 45, 10, 0.88);
-  background: linear-gradient(180deg, #ff4a17, #f22b08);
+  background: #f22b08;
   box-shadow:
     0 0 0 1px rgba(255, 125, 75, 0.45) inset,
     0 14px 26px rgba(255, 45, 10, 0.18);
@@ -596,14 +621,14 @@ svg {
 }
 
 .record-button.recording {
-  background: linear-gradient(180deg, #e7e9ed, #cfd4dc);
+  background: #d7dbe1;
   border-color: rgba(255, 255, 255, 0.6);
   color: #16181d;
 }
 
 .clip-toolbar {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
 
@@ -629,9 +654,10 @@ svg {
 
 .clip-duration-row {
   display: grid;
-  grid-template-columns: auto minmax(112px, 170px) auto;
+  grid-template-columns: auto minmax(80px, 170px) auto;
   align-items: center;
-  justify-content: start;
+  justify-content: center;
+  width: calc((100% - 12px) / 2);
   gap: 10px;
   min-height: 38px;
   color: #eef1f5;
@@ -680,7 +706,7 @@ svg {
   display: grid;
   grid-template-rows: 1fr 1fr;
   border-left: 1px solid #2b3038;
-  background: linear-gradient(180deg, rgba(255, 45, 10, 0.11), rgba(255, 255, 255, 0.02));
+  background: rgba(255, 45, 10, 0.08);
 }
 
 .clip-duration-stepper button {
@@ -739,7 +765,7 @@ svg {
   padding: 12px 8px;
   border-radius: 8px;
   border: 1px solid #282d35;
-  background: linear-gradient(180deg, #1a1d22, #14171b);
+  background: #171a1f;
   color: #ecf0f5;
   cursor: pointer;
 }
@@ -760,7 +786,7 @@ svg {
 .mode-card:hover,
 .mode-card.active {
   border-color: rgba(255, 45, 10, 0.88);
-  background: linear-gradient(180deg, #f13b10, #c92308);
+  background: #d92f0b;
   color: #fff;
   box-shadow: 0 0 0 1px rgba(255, 111, 65, 0.42) inset;
 }
@@ -781,23 +807,16 @@ svg {
 
 .preset-card {
   display: grid;
-  grid-template-columns: 28px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   align-items: center;
-  gap: 10px;
   min-height: 48px;
   padding: 8px 10px;
   border: 1px solid #282c33;
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.03);
   color: #edf0f5;
-  text-align: left;
+  text-align: center;
   cursor: pointer;
-}
-
-.preset-card svg {
-  width: 23px;
-  height: 23px;
-  color: #dce1e9;
 }
 
 .preset-card:hover,
@@ -938,10 +957,15 @@ svg {
 .field-grid select {
   width: 100%;
   min-height: 36px;
-  padding: 0 11px;
+  appearance: none;
+  padding: 0 38px 0 11px;
   border-radius: 8px;
   border: 1px solid #272b32;
-  background: #1a1d22;
+  background-color: #1a1d22;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'%3E%3Cpath d='m3 5 5 5 5-5' fill='none' stroke='%23aab0bb' stroke-width='1.8'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 14px center;
+  background-size: 16px 16px;
   color: #f5f7fa;
   font-size: 13px;
   outline: 0;
@@ -1129,9 +1153,7 @@ svg {
   border-radius: 6px;
   overflow: hidden;
   color: rgba(255, 255, 255, 0.78);
-  background:
-    linear-gradient(135deg, rgba(255, 45, 10, 0.35), transparent 52%),
-    #0b0d10;
+  background: #0b0d10;
 }
 
 .recording-thumb svg {
@@ -1224,9 +1246,7 @@ svg {
 .settings-modal-card {
   width: min(620px, 100%);
   max-height: min(690px, 88vh);
-  background:
-    linear-gradient(160deg, rgba(255, 58, 18, 0.08), rgba(16, 18, 22, 0.98) 38%),
-    #101216;
+  background: #101216;
 }
 
 .settings-popup-scroll {
@@ -1314,38 +1334,28 @@ svg {
 
 @media (max-width: 1240px) {
   .app-shell {
-    grid-template-columns: 86px minmax(0, 1fr);
+    grid-template-columns: 200px minmax(0, 1fr);
   }
 
-  .brand {
-    justify-content: center;
-    font-size: 26px;
-  }
-
-  .nav-item {
-    grid-template-columns: 1fr;
-    justify-items: center;
-    padding: 0;
-  }
-
-  .nav-item span,
-  .ready-card,
-  .version {
-    display: none;
-  }
-
-  .nav-item.active::before {
-    left: -20px;
+  .sidebar {
+    gap: 18px;
+    padding-right: 16px;
+    padding-left: 16px;
   }
 
   .content-grid {
-    grid-template-columns: minmax(420px, 1fr) minmax(300px, 360px);
+    grid-template-columns: minmax(400px, 1fr) minmax(260px, 310px);
   }
 }
 
 @media (max-width: 980px) {
   .app-shell {
-    grid-template-columns: 72px minmax(0, 1fr);
+    grid-template-columns: 176px minmax(0, 1fr);
+  }
+
+  .sidebar {
+    gap: 16px;
+    padding: 20px 14px 14px;
   }
 
   .main {
@@ -1353,7 +1363,7 @@ svg {
   }
 
   .content-grid {
-    grid-template-columns: minmax(330px, 1fr) minmax(260px, 320px);
+    grid-template-columns: minmax(330px, 1fr) minmax(240px, 280px);
     grid-template-rows: minmax(0, 1fr);
     overflow: hidden;
   }
@@ -1381,6 +1391,8 @@ svg {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  width: calc(100% - 8px);
+  align-self: center;
 }
 
 .file-panel-header h2 {
@@ -1389,6 +1401,8 @@ svg {
   font-size: 13px;
   font-weight: 900;
   letter-spacing: 0.02em;
+  white-space: nowrap;
+  word-break: keep-all;
 }
 
 .file-panel-actions {
@@ -1397,6 +1411,8 @@ svg {
 }
 
 .file-panel .recording-list {
+  width: calc(100% - 8px);
+  align-self: center;
   max-height: none;
   flex: 1 1 auto;
   min-height: 0;
@@ -1404,8 +1420,8 @@ svg {
   overflow-y: auto;
   overflow-x: hidden;
   overscroll-behavior: contain;
-  scrollbar-gutter: stable;
-  padding-right: 3px;
+  scrollbar-gutter: auto;
+  padding-right: 0;
 }
 
 .file-panel .recording-item {
@@ -1481,7 +1497,7 @@ svg {
   height: 100%;
   width: 0;
   border-radius: 999px;
-  background: linear-gradient(90deg, #ff4a17, #f22b08);
+  background: #f22b08;
   transition: width 160ms ease;
 }
 
@@ -1641,6 +1657,93 @@ svg {
 
 .dialog-button.primary {
   border-color: rgba(255, 45, 10, 0.9);
-  background: linear-gradient(180deg, #ff4a17, #f22b08);
+  background: #f22b08;
   color: #fff;
+}
+
+/* Square-corner UI experiment. Remove this block to restore original radii. */
+*,
+*::before,
+*::after {
+  border-radius: 0 !important;
+}
+
+/* Keep only the readiness indicator circular in the square-corner experiment. */
+.status-dot {
+  border-radius: 50% !important;
+}
+
+/* Mid-gray palette experiment: lift the near-black surfaces without losing contrast. */
+:root {
+  --bg: #202328;
+  --bg-soft: #292d33;
+  --panel: #2d3138;
+  --panel-strong: #363a42;
+  --line: #474c55;
+}
+
+body,
+.app-shell {
+  background: #202328;
+}
+
+.sidebar {
+  background: #272a30;
+}
+
+.panel,
+.settings-panel {
+  background: #2d3138;
+}
+
+.ready-card,
+.modal-card,
+.settings-modal-card,
+.toast {
+  background: #363a42;
+}
+
+.preview-stage,
+.recording-thumb,
+.source-card img,
+.source-thumb-fallback,
+.progress-track {
+  background: #25282e;
+}
+
+#previewVideo {
+  background: #1c1f23;
+}
+
+.preview-meta,
+.recording-pill {
+  background: rgba(42, 46, 52, 0.92);
+}
+
+.nav-sub-action,
+.ghost-button,
+.text-button,
+.icon-button,
+.transport-button,
+.clip-button,
+.clip-duration-control,
+.clip-duration-stepper,
+.mode-card,
+.preset-card,
+.custom-preset-actions button,
+.field-grid select,
+.hotkey-input,
+.switch span,
+.recording-actions button,
+.source-card,
+.advanced-input input,
+.dialog-input,
+.dialog-button {
+  background-color: #3a3f47;
+}
+
+.window-actions button:hover,
+.transport-button:hover,
+.clip-button:hover {
+  background-color: #484e58;
 }

@@ -141,14 +141,15 @@
     if (!els.pipelineNote) return;
     const profile = RP4.profile.get();
     const codec = RP4.capture.pickRecorderMime(profile.format);
+    els.pipelineNote.classList.remove('hidden');
 
     if (!codec) {
       els.pipelineNote.textContent = '지원되는 녹화 코덱을 찾지 못했습니다.';
       return;
     }
     if (codec.finish === 'direct') {
-      els.pipelineNote.textContent =
-        `${profile.format.toUpperCase()} 파일로 바로 기록합니다. 중지하면 변환 없이 즉시 저장됩니다.`;
+      els.pipelineNote.textContent = '';
+      els.pipelineNote.classList.add('hidden');
       return;
     }
     if (codec.finish === 'stream-copy') {
@@ -271,7 +272,6 @@
     card.className = 'preset-card';
     card.type = 'button';
     card.dataset.presetKey = `custom:${preset.id}`;
-    card.innerHTML = RP4.files.VIDEO_ICON;
 
     const text = document.createElement('span');
     const title = document.createElement('strong');
@@ -400,7 +400,7 @@
 
     if (!result?.selection) {
       setActiveMode(previousMode);
-      RP4.ui.setStatus('준비 완료', '녹화 준비가 완료되었습니다.', 'ready');
+      RP4.ui.setStatus('준비 완료', '녹화 준비가\n완료되었습니다.', 'ready');
       return;
     }
 

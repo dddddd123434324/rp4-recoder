@@ -61,7 +61,7 @@
 
       els.previewPlaceholder.classList.add('hidden');
       RP4.app.updatePreviewMeta(capture.output);
-      RP4.ui.setStatus('준비 완료', '녹화 준비가 완료되었습니다.', 'ready');
+      RP4.ui.setStatus('준비 완료', '녹화 준비가\n완료되었습니다.', 'ready');
     } catch (error) {
       console.error(error);
       capture?.cleanup();
