@@ -458,21 +458,30 @@ async function run() {
   const i18nSource = await fsp.readFile(path.join(__dirname, '..', 'src', 'renderer', 'i18n.js'), 'utf8');
   const i18nResult = JSON.parse(await win.webContents.executeJavaScript(`
     (async () => {
-      document.body.innerHTML = '<button id="translated" aria-label="닫기">스크린샷</button>';
+      document.body.innerHTML = [
+        '<button id="translated" aria-label="닫기">스크린샷</button>',
+        '<span id="untranslated" title="번역 목록에 없는 속성">번역 목록에 없는 문장</span>'
+      ].join('');
       window.RP4 = {};
       eval(${JSON.stringify(i18nSource)});
       window.RP4.i18n.setLanguage('en');
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      // Unknown Korean used to be assigned back to itself by MutationObserver
+      // forever, preventing this timer (and the whole app) from ever progressing.
+      await new Promise((resolve) => setTimeout(resolve, 20));
       const button = document.getElementById('translated');
+      const untranslated = document.getElementById('untranslated');
       const english = { text: button.textContent, label: button.getAttribute('aria-label') };
+      const unknown = { text: untranslated.textContent, title: untranslated.title };
       window.RP4.i18n.setLanguage('ko');
       const korean = { text: button.textContent, label: button.getAttribute('aria-label') };
-      return JSON.stringify({ english, korean });
+      return JSON.stringify({ english, unknown, korean });
     })()
   `));
   check('UI language switches to English and back to Korean',
     i18nResult.english.text === 'Screenshot'
       && i18nResult.english.label === 'Close'
+      && i18nResult.unknown.text === '번역 목록에 없는 문장'
+      && i18nResult.unknown.title === '번역 목록에 없는 속성'
       && i18nResult.korean.text === '스크린샷'
       && i18nResult.korean.label === '닫기');
 

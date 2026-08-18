@@ -224,8 +224,21 @@
     }
     const current = node.nodeValue || '';
     if (/[가-힣]/.test(current)) {
-      originalText.set(node, current);
-      node.nodeValue = translate(current);
+      const translated = translate(current);
+      const previousOriginal = originalText.get(node);
+      if (translated === current) {
+        // Assigning the same untranslated Korean text still emits a characterData
+        // mutation. The observer would then assign it again forever and freeze the
+        // renderer, including on every later launch while English is persisted.
+        if (previousOriginal != null && current !== translate(previousOriginal)) {
+          originalText.delete(node);
+        }
+        return;
+      }
+      if (previousOriginal == null || current !== translate(previousOriginal)) {
+        originalText.set(node, current);
+      }
+      node.nodeValue = translated;
     } else if (originalText.has(node) && current !== translate(originalText.get(node))) {
       originalText.delete(node);
     }
@@ -242,14 +255,29 @@
         continue;
       }
       if (current && /[가-힣]/.test(current)) {
+        const translated = translate(current);
+        const previousOriginal = originals?.get(name);
+        if (translated === current) {
+          // setAttribute() also reports a mutation when the assigned value is
+          // identical, so unknown Korean attributes need the same no-op guard.
+          if (previousOriginal != null && current !== translate(previousOriginal)) {
+            originals.delete(name);
+          }
+          continue;
+        }
         if (!originals) {
           originals = new Map();
           originalAttributes.set(element, originals);
         }
-        originals.set(name, current);
-        element.setAttribute(name, translate(current));
+        if (previousOriginal == null || current !== translate(previousOriginal)) {
+          originals.set(name, current);
+        }
+        element.setAttribute(name, translated);
+      } else if (originals?.has(name) && current !== translate(originals.get(name))) {
+        originals.delete(name);
       }
     }
+    if (language === 'en' && originals?.size === 0) originalAttributes.delete(element);
     if (language === 'ko' && originals) originalAttributes.delete(element);
   }
 
