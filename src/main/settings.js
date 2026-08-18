@@ -32,6 +32,7 @@ const SCREENSHOT_QUALITIES = [70, 80, 90, 95, 100];
 const DEFAULT_CLIP_BUFFER_LIMIT_MB = 256;
 const MIN_CLIP_BUFFER_LIMIT_MB = 64;
 const MAX_CLIP_BUFFER_LIMIT_MB = 512;
+const MAX_SETTINGS_BYTES = 1024 * 1024;
 
 const DEFAULT_PROFILE = {
   format: 'mp4',
@@ -186,14 +187,22 @@ function normalize(value = {}, { recordingsDirFallback } = {}) {
 
 async function readJson(filePath) {
   let text;
+  let tooLarge;
+  let handle = null;
   try {
-    text = await fs.readFile(filePath, 'utf8');
+    handle = await fs.open(filePath, 'r');
+    const stats = await handle.stat();
+    tooLarge = stats.size > MAX_SETTINGS_BYTES;
+    if (!tooLarge) text = await handle.readFile('utf8');
   } catch (error) {
     if (error?.code === 'ENOENT') return { value: null, recovery: null };
     throw error;
+  } finally {
+    await handle?.close().catch(() => {});
   }
 
   try {
+    if (tooLarge) throw new SyntaxError('설정 파일 크기가 허용 범위를 초과했습니다.');
     return { value: JSON.parse(text), recovery: null };
   } catch (error) {
 
@@ -318,6 +327,7 @@ module.exports = {
   SCREENSHOT_QUALITIES,
   MIN_CLIP_BUFFER_LIMIT_MB,
   MAX_CLIP_BUFFER_LIMIT_MB,
+  MAX_SETTINGS_BYTES,
   clampNumber,
   normalize,
   normalizeProfile,
@@ -328,5 +338,6 @@ module.exports = {
   normalizeEncoderPreset,
   normalizeCustomPresets,
   normalizeSelectedPreset,
-  sanitizePresetName
+  sanitizePresetName,
+  readJson
 };

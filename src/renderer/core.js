@@ -18,6 +18,7 @@ window.RP4 = window.RP4 || {};
     modalMode: 'screen',
     modalGeneration: 0,
     sourceSelectionGeneration: 0,
+    sourceSelectionPending: false,
 
     // Preview
     preview: null,

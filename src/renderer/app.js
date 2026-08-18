@@ -406,6 +406,10 @@
   }
 
   async function setMode(mode) {
+    if (state.sourceSelectionPending) {
+      RP4.ui.showToast('진행 중인 캡처 소스 선택을 먼저 완료해 주세요.');
+      return;
+    }
     if (RP4.lifecycle.isBusy()) {
       RP4.ui.showToast('녹화 중에는 캡처 모드를 바꿀 수 없습니다.');
       return;
@@ -419,11 +423,16 @@
     }
 
     if (mode === 'screen') {
-      await refreshSources();
-      if (generation !== state.sourceSelectionGeneration || RP4.lifecycle.isBusy()) return;
-      const screens = getScreenSources();
-      const source = screens.find((item) => item.display?.primary) || screens[0];
-      if (source) await chooseSource(source, mode, { generation });
+      state.sourceSelectionPending = true;
+      try {
+        await refreshSources();
+        if (generation !== state.sourceSelectionGeneration || RP4.lifecycle.isBusy()) return;
+        const screens = getScreenSources();
+        const source = screens.find((item) => item.display?.primary) || screens[0];
+        if (source) await chooseSource(source, mode, { generation });
+      } finally {
+        state.sourceSelectionPending = false;
+      }
       return;
     }
 
@@ -431,6 +440,16 @@
   }
 
   async function chooseDesktopArea(generation) {
+    if (state.sourceSelectionPending) return;
+    state.sourceSelectionPending = true;
+    try {
+      await performChooseDesktopArea(generation);
+    } finally {
+      state.sourceSelectionPending = false;
+    }
+  }
+
+  async function performChooseDesktopArea(generation) {
     const previousMode = state.selectedMode;
     setActiveMode('area');
     RP4.ui.setStatus('영역 선택', '실제 화면에서 녹화할 영역을 드래그하세요.', 'warn');
@@ -517,10 +536,14 @@
       return;
     }
 
+    state.sourceSelectionPending = true;
     state.modalMode = mode;
     state.modalGeneration = generation;
     await refreshSources();
-    if (generation !== state.sourceSelectionGeneration || RP4.lifecycle.isBusy()) return;
+    if (generation !== state.sourceSelectionGeneration || RP4.lifecycle.isBusy()) {
+      state.sourceSelectionPending = false;
+      return;
+    }
 
     els.sourceModalTitle.textContent = mode === 'window'
       ? '창 선택'
@@ -532,6 +555,7 @@
 
   function closeSourceModal() {
     els.sourceModal.classList.add('hidden');
+    state.sourceSelectionPending = false;
   }
 
   function openSettingsModal(type) {
@@ -833,12 +857,21 @@
         report.windowCrop = crop ? `${crop.width}x${crop.height}` : 'unavailable';
       }
 
+      state.sourceSelectionPending = true;
+      await RP4.recorder.toggleRecording();
+      await RP4.clips.toggleClipMode();
+      await RP4.files.takeScreenshot();
+      report.sourceSelectionGuard = !state.recording && !state.clip && !state.screenshotPromise;
+      state.sourceSelectionPending = false;
+
       report.ok = Boolean(codec)
         && Boolean(state.appInfo.recordingsDir)
         && report.screenSources > 0
         && report.previewWidth > 0
-        && report.previewHeight > 0;
+        && report.previewHeight > 0
+        && report.sourceSelectionGuard;
     } catch (error) {
+      state.sourceSelectionPending = false;
       report.ok = false;
       report.error = String(error?.message || error);
     }

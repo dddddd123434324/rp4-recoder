@@ -143,8 +143,8 @@ async function recordChunks(win, { seconds = 5, timeslice = 1000 }) {
 
 async function run() {
   const paths = require('../src/main/paths');
-  const { SettingsStore } = require('../src/main/settings');
-  const { RecordingManager, toBoundedBuffer } = require('../src/main/recording');
+  const { SettingsStore, readJson, MAX_SETTINGS_BYTES } = require('../src/main/settings');
+  const { RecordingManager, toBoundedBuffer, MAX_INDEX_BYTES } = require('../src/main/recording');
 
   // ---- settings + path handling -------------------------------------------------
   const settings = new SettingsStore();
@@ -201,6 +201,13 @@ async function run() {
   }
   check('bounded binary validation rejects before copying', oversizedBinaryRejected);
 
+  const settingsSnapshot = await fsp.readFile(paths.settingsFile());
+  await fsp.truncate(paths.settingsFile(), MAX_SETTINGS_BYTES + 1);
+  const oversizedSettings = await readJson(paths.settingsFile());
+  check('oversized settings file is backed up without parsing',
+    oversizedSettings.value === null && Boolean(oversizedSettings.recovery?.backupPath));
+  await fsp.writeFile(paths.settingsFile(), settingsSnapshot);
+
   for (const conflict of ['foreign-temp', 'temp-file', 'screenshots-file']) {
     const root = path.join(SANDBOX, conflict);
     await fsp.mkdir(root, { recursive: true });
@@ -239,8 +246,13 @@ async function run() {
         === null);
   }
 
+  const oversizedIndexPath = path.join(USER_DATA, 'recordings-index.json');
+  await fsp.writeFile(oversizedIndexPath, 'x');
+  await fsp.truncate(oversizedIndexPath, MAX_INDEX_BYTES + 1);
   const recordings = new RecordingManager({ settings, emit: () => {} });
-  await recordings.loadIndex();
+  const oversizedIndex = await recordings.loadIndex();
+  check('oversized recording index is backed up without parsing',
+    oversizedIndex.recovered && Boolean(oversizedIndex.backupPath));
 
   // A stale crop host must never satisfy or clear a request belonging to its successor.
   const { WindowCropService } = require('../src/main/window-crop');
@@ -379,6 +391,17 @@ async function run() {
     `${probe.durationSec}s`);
   check('reported duration excludes nothing unexpected',
     Math.abs((probe.durationSec || 0) - 5) < 1.5, `${probe.durationSec}s vs 5s`);
+
+  const concurrentStarts = await Promise.allSettled([
+    recordings.start(meta, { webContentsId: win.webContents.id }),
+    recordings.start(meta, { webContentsId: win.webContents.id })
+  ]);
+  const concurrentSuccesses = concurrentStarts.filter((result) => result.status === 'fulfilled');
+  check('simultaneous starts reserve the renderer atomically',
+    concurrentSuccesses.length === 1 && concurrentStarts.filter((result) => result.status === 'rejected').length === 1);
+  if (concurrentSuccesses[0]) {
+    await recordings.stop({ sessionId: concurrentSuccesses[0].value.sessionId });
+  }
 
   // ---- unique file names --------------------------------------------------------
   const first = await recordings.start(meta, { webContentsId: win.webContents.id });

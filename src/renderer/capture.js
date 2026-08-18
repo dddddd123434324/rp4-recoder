@@ -480,6 +480,12 @@
 
       if (audioSources.length > 0) {
         audioContext = new AudioContext();
+        if (audioContext.state === 'suspended') {
+          await audioContext.resume();
+        }
+        if (audioContext.state !== 'running') {
+          throw new Error('오디오 처리기를 시작할 수 없습니다. 창을 한 번 클릭한 뒤 다시 시도해 주세요.');
+        }
         const destination = audioContext.createMediaStreamDestination();
 
         for (const entry of audioSources) {

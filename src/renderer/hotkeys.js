@@ -233,7 +233,8 @@
 
   /** Runs the action for a hotkey, whether it arrived globally or locally. */
   async function dispatch(action) {
-    if (state.editingHotkey || RP4.dialog.isDialogOpen()) return;
+    if (state.editingHotkey || state.sourceSelectionPending || RP4.dialog.isDialogOpen()) return;
+    if (!RP4.els.sourceModal?.classList.contains('hidden')) return;
 
     if (action === 'recordToggle') {
       await RP4.recorder.toggleRecording();

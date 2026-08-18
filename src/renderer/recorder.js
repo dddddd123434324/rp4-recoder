@@ -96,6 +96,7 @@
   }
 
   async function toggleRecording() {
+    if (state.sourceSelectionPending) return;
     if (state.captureLifecycle === 'recording') {
       await stopRecording();
       return;
@@ -267,7 +268,7 @@
   }
 
   function startRecording() {
-    if (state.shuttingDown) return Promise.resolve();
+    if (state.shuttingDown || state.sourceSelectionPending) return Promise.resolve();
     if (state.recordingStartPromise) return state.recordingStartPromise;
     const promise = performStartRecording();
     state.recordingStartPromise = promise;

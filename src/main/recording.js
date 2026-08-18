@@ -10,6 +10,7 @@ const paths = require('./paths');
 const RECORDING_EXTENSIONS = /\.(webm|mp4|mkv)$/i;
 const INDEX_FILE_NAME = 'recordings-index.json';
 const MAX_INDEX_ENTRIES = 2000;
+const MAX_INDEX_BYTES = 16 * 1024 * 1024;
 
 // Refuse to start a recording without some headroom, and stop cleanly rather than
 // letting writes fail halfway through once the disk is nearly full.
@@ -266,6 +267,7 @@ class RecordingManager {
     this.thumbnailQueue = Promise.resolve();
     this.thumbnailInflight = new Map();
     this.screenshotJobs = new Set();
+    this.startingWebContentsIds = new Set();
     this.moveFile = move;
   }
 
@@ -278,7 +280,8 @@ class RecordingManager {
   }
 
   hasPendingRecordings() {
-    return this.sessions.size > 0 || this.finalizing.size > 0 || this.screenshotJobs.size > 0;
+    return this.startingWebContentsIds.size > 0 || this.sessions.size > 0
+      || this.finalizing.size > 0 || this.screenshotJobs.size > 0;
   }
 
   indexFile() {
@@ -292,20 +295,29 @@ class RecordingManager {
    */
   async loadIndex() {
     let text;
+    let tooLarge;
+    let handle = null;
     try {
-      text = await fs.readFile(this.indexFile(), 'utf8');
+      handle = await fs.open(this.indexFile(), 'r');
+      const stats = await handle.stat();
+      tooLarge = stats.size > MAX_INDEX_BYTES;
+      if (!tooLarge) text = await handle.readFile('utf8');
     } catch (error) {
       if (error?.code === 'ENOENT') return { recovered: false, backupPath: null };
       throw error;
+    } finally {
+      await handle?.close().catch(() => {});
     }
 
     try {
+      if (tooLarge) throw new SyntaxError('녹화 인덱스 크기가 허용 범위를 초과했습니다.');
       const raw = JSON.parse(text);
       if (!raw || typeof raw !== 'object' || !Array.isArray(raw.entries)) {
         throw new SyntaxError('녹화 인덱스 형식이 올바르지 않습니다.');
       }
-      for (const entry of raw.entries) {
-        if (entry && typeof entry.filePath === 'string' && entry.meta) {
+      for (const entry of raw.entries.slice(-MAX_INDEX_ENTRIES)) {
+        if (entry && typeof entry.filePath === 'string' && entry.filePath.length <= 32768
+          && entry.meta && typeof entry.meta === 'object' && !Array.isArray(entry.meta)) {
           this.metadata.set(entry.filePath, entry.meta);
         }
       }
@@ -428,11 +440,21 @@ class RecordingManager {
   }
 
   async start(meta = {}, { webContentsId } = {}) {
-    const senderBusy = [...this.sessions.values()].some((session) => session.webContentsId === webContentsId)
+    const senderBusy = this.startingWebContentsIds.has(webContentsId)
+      || [...this.sessions.values()].some((session) => session.webContentsId === webContentsId)
       || [...this.finalizing.values()].some((entry) => entry.webContentsId === webContentsId);
     if (webContentsId != null && senderBusy) {
       throw new Error('이 창에는 이미 활성 녹화 세션이 있습니다.');
     }
+    if (webContentsId != null) this.startingWebContentsIds.add(webContentsId);
+    try {
+      return await this.startReserved(meta, { webContentsId });
+    } finally {
+      if (webContentsId != null) this.startingWebContentsIds.delete(webContentsId);
+    }
+  }
+
+  async startReserved(meta = {}, { webContentsId } = {}) {
     await paths.ensureRecordingDirs(this.settings.recordingsDir);
 
     const recordingsDir = this.settings.recordingsDir;
@@ -1127,7 +1149,7 @@ class RecordingManager {
 
   /**
    * Finalizes every in-flight recording. Used when the window is closing so a take is
-   * saved properly instead of being stranded in `.temp`.
+   * saved properly instead of being stranded in the app-owned temporary directory.
    */
   async finalizeAllSessions({ failureReason = null } = {}) {
     const ids = [...this.sessions.keys()];
@@ -1166,5 +1188,6 @@ module.exports = {
   toBoundedBuffer,
   pruneThumbnailCache,
   MAX_IPC_CHUNK_BYTES,
-  MAX_SCREENSHOT_BYTES
+  MAX_SCREENSHOT_BYTES,
+  MAX_INDEX_BYTES
 };

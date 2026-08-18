@@ -1,6 +1,6 @@
 {
   "name": "rp4-recorder",
-  "version": "0.2.12",
+  "version": "0.2.13",
   "productName": "RP4 Recorder",
   "description": "RP4 desktop game recorder",
   "author": "RP4",
@@ -10,7 +10,7 @@
     "start": "set ELECTRON_RUN_AS_NODE=&& electron .",
     "lint": "eslint src scripts",
     "lint:syntax": "node scripts/check-syntax.js",
-    "smoke": "set ELECTRON_RUN_AS_NODE=&& set RP4_SMOKE=1&& electron .",
+    "smoke": "node scripts/smoke-test.js",
     "test:integration": "set ELECTRON_RUN_AS_NODE=&& electron scripts/integration-test.js",
     "test": "npm run lint && npm run smoke && npm run test:integration",
     "dist": "set CSC_IDENTITY_AUTO_DISCOVERY=false&& set ELECTRON_BUILDER_DISABLE_BUILD_CACHE=true&& electron-builder --win --x64"
