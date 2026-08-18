@@ -142,7 +142,9 @@ async function handleQuitRequest(win) {
 
   let saveActiveClip = false;
   if (rendererCaptureState.clipActive || rendererCaptureState.clipSaving) {
-    const decision = await windows.confirmCloseWhileClip(win);
+    const decision = await windows.confirmCloseWhileClip(win, {
+      saving: rendererCaptureState.clipSaving
+    });
     if (decision === 'cancel') return;
     saveActiveClip = decision === 'save';
   } else if (recordings?.hasPendingRecordings()) {
@@ -245,6 +247,7 @@ async function bootstrap() {
     // Recover anything a previous crash left behind, and tell the user if their
     // configured folder was not usable.
     const sweep = await recordings.sweepTempDir();
+    void recordings.resumePendingMediaJobs();
     await rendererLoaded;
     {
       if (loaded.settingsRecovered) {

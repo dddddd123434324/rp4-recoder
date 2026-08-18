@@ -322,6 +322,20 @@ async function run() {
   check('current crop host owns its response', (await cropResult)?.width === 3);
   cropService.child = null;
 
+  const pipeFailureService = new WindowCropService();
+  const pipeChild = new EventEmitter();
+  pipeChild.killed = false;
+  pipeChild.kill = () => { pipeChild.killed = true; };
+  pipeChild.stdin = new EventEmitter();
+  pipeChild.stdin.writable = true;
+  pipeChild.stdin.write = (_value, callback) => setImmediate(() => callback(new Error('EPIPE')));
+  pipeFailureService.unsupported = false;
+  pipeFailureService.child = pipeChild;
+  pipeFailureService.generation = 7;
+  pipeFailureService.ensureHost = async () => pipeChild;
+  const pipeFailureResult = await pipeFailureService.query('1234');
+  check('window crop pipe failure resolves safely', pipeFailureResult === null && pipeChild.killed);
+
   // Main waits for an explicit renderer ACK even before a recording session exists.
   const fakeContents = new EventEmitter();
   fakeContents.send = (channel, payload) => {
@@ -597,6 +611,39 @@ async function run() {
     terminalWrite.bytes === recorded.buffers[0].length + recorded.buffers[1].length
       && failedSaved?.status === 'partial');
 
+  const boundedRecordings = new RecordingManager({
+    settings,
+    emit: () => {},
+    maxSessionQueuedBytes: 1024
+  });
+  const bounded = await boundedRecordings.start(meta, { webContentsId: win.webContents.id + 500 });
+  const boundedSession = boundedRecordings.sessions.get(bounded.sessionId);
+  const originalBoundedWrite = boundedSession.handle.write.bind(boundedSession.handle);
+  let releaseBoundedWrite;
+  boundedSession.handle.write = (...args) => new Promise((resolve, reject) => {
+    releaseBoundedWrite = () => originalBoundedWrite(...args).then(resolve, reject);
+  });
+  const queuedWrite = boundedRecordings.write({
+    sessionId: bounded.sessionId,
+    buffer: Buffer.alloc(800, 0x11)
+  }, { webContentsId: win.webContents.id + 500 });
+  await new Promise((resolve) => setImmediate(resolve));
+  let queueLimitRejected = false;
+  try {
+    await boundedRecordings.write({
+      sessionId: bounded.sessionId,
+      buffer: Buffer.alloc(800, 0x22)
+    }, { webContentsId: win.webContents.id + 500 });
+  } catch {
+    queueLimitRejected = true;
+  }
+  releaseBoundedWrite();
+  await queuedWrite;
+  await boundedRecordings.stop({ sessionId: bounded.sessionId }, {
+    webContentsId: win.webContents.id + 500
+  });
+  check('main recording queue enforces a total byte limit', queueLimitRejected);
+
   // Chromium may fall back to Matroska H.264 + Opus. MP4 keeps the video bitstream but
   // must convert Opus audio to AAC for broad player compatibility.
   const opusInput = path.join(SANDBOX, 'h264-opus.mkv');
@@ -668,6 +715,53 @@ async function run() {
     `start=${clipProbe.startSec}`);
   check('clip save stays fast', clipMs < 5000, `${clipMs} ms`);
 
+  const secondEpoch = await recordChunks(win, { seconds: 3, timeslice: 1000 });
+  const segmentedMeta = {
+    ...clipMeta,
+    durationMs: 8000,
+    trimRecentMs: 8000,
+    segmentedClip: true
+  };
+  const segmentedSession = await recordings.start(segmentedMeta, {
+    webContentsId: win.webContents.id
+  });
+  for (const buffer of recorded.buffers) {
+    await recordings.write({ sessionId: segmentedSession.sessionId, segmentIndex: 0, buffer }, {
+      webContentsId: win.webContents.id
+    });
+  }
+  for (const buffer of secondEpoch.buffers) {
+    await recordings.write({ sessionId: segmentedSession.sessionId, segmentIndex: 1, buffer }, {
+      webContentsId: win.webContents.id
+    });
+  }
+  const segmentedClip = await recordings.stop({
+    sessionId: segmentedSession.sessionId,
+    durationMs: 8000,
+    meta: segmentedMeta
+  }, { webContentsId: win.webContents.id });
+  const segmentedProbe = await ffprobe(segmentedClip.filePath);
+  check('rolling clip epochs concatenate into one decodable clip',
+    segmentedProbe.codec === 'h264' && (segmentedProbe.durationSec || 0) > 6,
+    `codec=${segmentedProbe.codec} duration=${segmentedProbe.durationSec}s`);
+
+  const genericMeta = { ...clipMeta, mimeType: 'video/mp4' };
+  const genericSession = await recordings.start(genericMeta, { webContentsId: win.webContents.id });
+  for (const buffer of recorded.buffers) {
+    await recordings.write({ sessionId: genericSession.sessionId, buffer }, {
+      webContentsId: win.webContents.id
+    });
+  }
+  const genericClip = await recordings.stop({
+    sessionId: genericSession.sessionId,
+    durationMs: 2000,
+    meta: genericMeta
+  }, { webContentsId: win.webContents.id });
+  const genericProbe = await ffprobe(genericClip.filePath);
+  check('generic video/mp4 H.264 clip remains lossless and decodable',
+    genericProbe.codec === 'h264' && (genericProbe.durationSec || 0) > 1,
+    `codec=${genericProbe.codec} duration=${genericProbe.durationSec}s`);
+
   // Recovery artifacts have strict app-generated names. User recordings that merely
   // contain ".backup-" must never be deleted or renamed.
   const userBackupName = path.join(RECORDINGS, 'normal.backup-user.mp4');
@@ -695,6 +789,20 @@ async function run() {
   check('recording index persists metadata across restart',
     Boolean(match) && match.durationMs > 0 && match.width === 1280,
     `duration=${match?.durationMs} ${match?.width}x${match?.height}`);
+  await revived.setMetadata(saved.filePath, {
+    ...revived.metadata.get(saved.filePath),
+    status: 'verifying'
+  });
+  const resumed = new RecordingManager({ settings, emit: () => {} });
+  await resumed.loadIndex();
+  const resumedCount = await resumed.resumePendingMediaJobs();
+  const resumeDeadline = Date.now() + 5000;
+  while (resumed.metadata.get(saved.filePath)?.status === 'verifying'
+    && Date.now() < resumeDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  check('verifying media resumes validation after restart',
+    resumedCount === 1 && resumed.metadata.get(saved.filePath)?.status === 'complete');
   const thumbnail = await revived.thumbnail(saved.filePath);
   check('recent recording thumbnail is generated',
     typeof thumbnail === 'string' && thumbnail.startsWith('data:image/jpeg;base64,'));

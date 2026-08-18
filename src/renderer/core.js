@@ -209,13 +209,14 @@ window.RP4 = window.RP4 || {};
     }
   }
 
-  async function writeBlobInSlices(sessionId, blob, { terminal = false } = {}) {
+  async function writeBlobInSlices(sessionId, blob, { terminal = false, segmentIndex } = {}) {
     for (let offset = 0; offset < blob.size; offset += IPC_SLICE_BYTES) {
       const part = blob.slice(offset, Math.min(blob.size, offset + IPC_SLICE_BYTES));
       const result = await window.rp4.writeRecordingChunk({
         sessionId,
         buffer: await part.arrayBuffer(),
-        terminal
+        terminal,
+        ...(Number.isInteger(segmentIndex) ? { segmentIndex } : {})
       });
       reportShutdownProgress({
         phase: 'writing',

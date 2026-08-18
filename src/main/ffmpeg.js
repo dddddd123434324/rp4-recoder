@@ -183,6 +183,41 @@ async function remux(inputPath, outputPath, { jobId, onProgress, totalDurationMs
   ], { jobId, onProgress, totalDurationMs });
 }
 
+/** Joins complete rolling MediaRecorder epochs without re-encoding. */
+async function concatSegments(inputPaths, outputPath, options = {}) {
+  if (!Array.isArray(inputPaths) || inputPaths.length === 0) {
+    throw new Error('결합할 클립 세그먼트가 없습니다.');
+  }
+  const listPath = `${outputPath}.concat-${crypto.randomUUID()}.txt`;
+  const escapePath = (value) => String(value).replace(/'/g, "'\\''");
+  const manifest = inputPaths.map((inputPath) => `file '${escapePath(inputPath)}'`).join('\n');
+  await fs.writeFile(listPath, manifest, 'utf8');
+  await fs.rm(outputPath, { force: true });
+  try {
+    const args = [
+      '-y',
+      '-f', 'concat',
+      '-safe', '0',
+      '-i', listPath,
+      '-map', '0:v:0',
+      '-map', '0:a?',
+      '-c', 'copy',
+      '-fflags', '+genpts'
+    ];
+    if (path.extname(outputPath).toLowerCase() === '.mp4') {
+      args.push('-movflags', '+faststart');
+    }
+    args.push(outputPath);
+    await run(args, {
+      jobId: options.jobId,
+      onProgress: options.onProgress,
+      totalDurationMs: options.totalDurationMs
+    });
+  } finally {
+    await fs.rm(listPath, { force: true }).catch(() => {});
+  }
+}
+
 /** Keeps H.264 lossless while converting Opus audio to MP4-compatible AAC. */
 async function remuxH264ToMp4(inputPath, outputPath, options = {}) {
   const audioBitrateKbps = Math.max(64, Math.min(320, Number(options.audioBitrateKbps) || 192));
@@ -317,6 +352,7 @@ module.exports = {
   validateMedia,
   createThumbnail,
   remux,
+  concatSegments,
   remuxH264ToMp4,
   trimRecent,
   trimRecentToMp4,

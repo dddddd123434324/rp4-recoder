@@ -216,6 +216,13 @@ class WindowCropService {
       this.child = child;
       child.stderr.resume();
 
+      // Pipe failures are emitted asynchronously when PowerShell exits between the
+      // writable check and write(). Without a listener, Node treats EPIPE as an
+      // uncaught error and can terminate the Electron main process.
+      child.stdin.on('error', () => {
+        this.terminateHost(child, generation);
+      });
+
       const rl = readline.createInterface({ input: child.stdout });
       let readySettled = false;
       let cleaned = false;
@@ -333,22 +340,33 @@ class WindowCropService {
 
     const child = await this.ensureHost();
     if (!child || !child.stdin.writable) return null;
+    const generation = this.generation;
 
     const id = `q${this.nextId++}`;
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         resolve(null);
-        this.terminateHost(child, this.generation);
+        this.terminateHost(child, generation);
       }, REQUEST_TIMEOUT_MS);
 
-      this.pending.set(id, { resolve, timer, child, generation: this.generation });
+      this.pending.set(id, { resolve, timer, child, generation });
       try {
-        child.stdin.write(`${id} ${numeric}\n`);
+        child.stdin.write(`${id} ${numeric}\n`, (error) => {
+          if (!error) return;
+          const entry = this.pending.get(id);
+          if (entry) {
+            this.pending.delete(id);
+            clearTimeout(entry.timer);
+            entry.resolve(null);
+          }
+          this.terminateHost(child, generation);
+        });
       } catch {
         this.pending.delete(id);
         clearTimeout(timer);
         resolve(null);
+        this.terminateHost(child, generation);
       }
     });
   }

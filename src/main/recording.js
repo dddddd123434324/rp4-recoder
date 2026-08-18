@@ -18,6 +18,7 @@ const MIN_FREE_BYTES_TO_START = 512 * 1024 * 1024;
 const MIN_FREE_BYTES_TO_CONTINUE = 128 * 1024 * 1024;
 const MIN_RECOVERABLE_RECORDING_BYTES = 512;
 const MAX_IPC_CHUNK_BYTES = 64 * 1024 * 1024;
+const MAX_SESSION_QUEUED_BYTES = 128 * 1024 * 1024;
 const MAX_SCREENSHOT_BYTES = 256 * 1024 * 1024;
 const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 const OPTIMIZING_FILE_PATTERN = new RegExp(
@@ -140,7 +141,14 @@ function normalizeRecordingMeta(value = {}) {
     const normalized = boundedNumber(source[key], min, max, { integer });
     if (normalized !== undefined) output[key] = normalized;
   }
-  for (const key of ['clip', 'requestedSystemAudio', 'hasSystemAudio', 'requestedMic', 'hasMic']) {
+  for (const key of [
+    'clip',
+    'segmentedClip',
+    'requestedSystemAudio',
+    'hasSystemAudio',
+    'requestedMic',
+    'hasMic'
+  ]) {
     if (typeof source[key] === 'boolean') output[key] = source[key];
   }
   return output;
@@ -301,7 +309,7 @@ class RecordingManager {
    * @param {import('./settings').SettingsStore} options.settings
    * @param {(channel: string, payload: unknown) => void} options.emit
    */
-  constructor({ settings, emit, move = moveFile }) {
+  constructor({ settings, emit, move = moveFile, maxSessionQueuedBytes = MAX_SESSION_QUEUED_BYTES }) {
     this.settings = settings;
     this.emit = emit || (() => {});
     this.sessions = new Map();
@@ -320,6 +328,7 @@ class RecordingManager {
     this.verificationJobs = new Map();
     this.startingWebContentsIds = new Set();
     this.moveFile = move;
+    this.maxSessionQueuedBytes = Math.max(1, Number(maxSessionQueuedBytes) || MAX_SESSION_QUEUED_BYTES);
   }
 
   get activeCount() {
@@ -587,8 +596,13 @@ class RecordingManager {
       recordedCodec,
       recordedAudioCodec,
       forceRemux: safeMeta.clip === true,
+      segmentedClip: safeMeta.clip === true && safeMeta.segmentedClip === true,
+      segmentPaths: [tempPath],
+      currentSegmentIndex: 0,
+      highestQueuedSegmentIndex: 0,
       handleClosed: false,
       bytes: 0,
+      queuedBytes: 0,
       writeChain: Promise.resolve(),
       acceptingWrites: true,
       startedAtMs: Date.now(),
@@ -636,10 +650,38 @@ class RecordingManager {
     }
 
     const terminal = payload.terminal === true;
+    let segmentIndex = 0;
+    if (session.segmentedClip) {
+      segmentIndex = Number(payload.segmentIndex);
+      if (!Number.isInteger(segmentIndex) || segmentIndex < 0 || segmentIndex > 1024) {
+        return Promise.reject(new Error('클립 세그먼트 번호가 올바르지 않습니다.'));
+      }
+      if (segmentIndex < session.highestQueuedSegmentIndex
+        || segmentIndex > session.highestQueuedSegmentIndex + 1) {
+        return Promise.reject(new Error('클립 세그먼트 순서가 올바르지 않습니다.'));
+      }
+      session.highestQueuedSegmentIndex = Math.max(session.highestQueuedSegmentIndex, segmentIndex);
+    }
+    if (session.queuedBytes + chunk.length > this.maxSessionQueuedBytes) {
+      session.failed = '녹화 쓰기 대기열이 허용 한도를 초과했습니다.';
+      return Promise.reject(new Error(session.failed));
+    }
+    session.queuedBytes += chunk.length;
     const writeTask = async () => {
       if (session.failed && !terminal) throw new Error(session.failed);
 
       try {
+        if (session.segmentedClip && segmentIndex !== session.currentSegmentIndex) {
+          await this.closeSessionHandle(session);
+          const segmentPath = path.join(
+            path.dirname(session.tempPath),
+            `rp4-${crypto.randomUUID()}.part.${session.recordedContainer}`
+          );
+          session.handle = await fs.open(segmentPath, 'wx');
+          session.handleClosed = false;
+          session.currentSegmentIndex = segmentIndex;
+          session.segmentPaths.push(segmentPath);
+        }
         let offset = 0;
         while (offset < chunk.length) {
           const { bytesWritten } = await session.handle.write(
@@ -678,7 +720,10 @@ class RecordingManager {
       return { bytes: session.bytes, warning: session.failed || null };
     };
 
-    const result = session.writeChain.then(writeTask);
+    const result = session.writeChain.then(writeTask)
+      .finally(() => {
+        session.queuedBytes = Math.max(0, session.queuedBytes - chunk.length);
+      });
     session.writeChain = result.catch(() => {});
     return result;
   }
@@ -716,6 +761,36 @@ class RecordingManager {
   async finishSession(session, payload = {}) {
     await session.writeChain.catch(() => {});
     await this.closeSessionHandle(session);
+
+    if (session.segmentedClip && session.segmentPaths.length > 1 && !session.failed) {
+      const combinedPath = path.join(
+        path.dirname(session.tempPath),
+        `rp4-${crypto.randomUUID()}.part.${session.recordedContainer}`
+      );
+      try {
+        const sourceSegments = [...session.segmentPaths];
+        await ffmpeg.concatSegments(session.segmentPaths, combinedPath, {
+          jobId: `clip-concat:${session.baseName}`,
+          totalDurationMs: Number(payload.durationMs) || Number(session.meta.durationMs) || 0
+        });
+        await ffmpeg.validateMedia(combinedPath);
+        session.tempPath = combinedPath;
+        session.segmentPaths = [combinedPath];
+        await Promise.allSettled(sourceSegments.map((filePath) => fs.rm(filePath, { force: true })));
+      } catch (error) {
+        await fs.rm(combinedPath, { force: true }).catch(() => {});
+        session.failed = `클립 세그먼트를 결합하지 못했습니다. ${error?.message || error}`.slice(0, 500);
+        // Preserve the largest complete segment as a visible partial recording. The
+        // remaining app-owned temp files stay recoverable on the next launch.
+        const candidates = await Promise.all(session.segmentPaths.map(async (filePath) => ({
+          filePath,
+          stats: await statFile(filePath)
+        })));
+        const largest = candidates.filter((entry) => entry.stats?.size > 0)
+          .sort((a, b) => b.stats.size - a.stats.size)[0];
+        if (largest) session.tempPath = largest.filePath;
+      }
+    }
 
     const tempStats = await statFile(session.tempPath);
     session.bytes = Math.max(session.bytes, tempStats?.size || 0);
@@ -806,7 +881,33 @@ class RecordingManager {
         this.emit('recording:convert-progress', { phase: 'clip', ratio: 0 });
         const progress = (ratio) => this.emit('recording:convert-progress', { phase: 'clip', ratio });
 
-        if (targetFormat === 'mp4' && recordedCodec !== 'h264') {
+        if (targetFormat === 'mp4' && recordedCodec === 'unknown'
+          && recordedContainer === 'mp4') {
+          // Some Chromium builds report only "video/mp4" even when the payload is
+          // H.264. Try the lossless path first and transcode only when the actual file
+          // proves incompatible.
+          try {
+            await ffmpeg.trimRecent(session.tempPath, target, {
+              durationMs: recentDurationMs,
+              endOffsetMs,
+              jobId: `clip:${session.baseName}`,
+              onProgress: progress
+            });
+            await ffmpeg.validateMedia(target);
+          } catch {
+            await fs.rm(target, { force: true }).catch(() => {});
+            await ffmpeg.transcodeToMp4(session.tempPath, target, {
+              fps: session.meta.fps,
+              bitrateMbps: session.meta.bitrateMbps,
+              audioBitrateKbps: session.meta.audioBitrateKbps,
+              encoderPreset: session.meta.encoderPreset,
+              recentDurationMs,
+              recentEndOffsetMs: endOffsetMs,
+              jobId: `clip:${session.baseName}`,
+              onProgress: progress
+            });
+          }
+        } else if (targetFormat === 'mp4' && recordedCodec !== 'h264') {
           await ffmpeg.transcodeToMp4(session.tempPath, target, {
             fps: session.meta.fps,
             bitrateMbps: session.meta.bitrateMbps,
@@ -1041,6 +1142,22 @@ class RecordingManager {
     }).finally(() => this.verificationJobs.delete(filePath));
     this.verificationJobs.set(filePath, job);
     return job;
+  }
+
+  /** Restarts direct-save validation that was interrupted by a previous app exit. */
+  async resumePendingMediaJobs() {
+    const recordingsDir = path.resolve(this.settings.recordingsDir).toLowerCase();
+    let resumed = 0;
+    for (const [filePath, meta] of this.metadata) {
+      if (meta?.status !== 'verifying') continue;
+      if (path.dirname(path.resolve(filePath)).toLowerCase() !== recordingsDir) continue;
+      if (!(await paths.pathExists(filePath))) continue;
+      resumed += 1;
+      const durationMs = Number(meta.durationMs) || 0;
+      const optimizable = String(meta.format || '').toLowerCase() === 'mp4';
+      this.enqueueVerification(filePath, durationMs, optimizable);
+    }
+    return resumed;
   }
 
   async drainOptimizeQueue() {
@@ -1351,6 +1468,7 @@ module.exports = {
   toBoundedBuffer,
   pruneThumbnailCache,
   MAX_IPC_CHUNK_BYTES,
+  MAX_SESSION_QUEUED_BYTES,
   MAX_SCREENSHOT_BYTES,
   MAX_INDEX_BYTES
 };

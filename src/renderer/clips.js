@@ -1,15 +1,17 @@
 'use strict';
 
 /*
- * Clip mode keeps one complete MediaRecorder epoch. Blob boundaries are not independent
- * files, so saving always snapshots a full epoch and lets FFmpeg trim from its end.
- * Rotation and snapshot capture share one operation queue; an epoch being rotated is held
- * until a save request that raced with the rotation has captured its immutable snapshot.
+ * Clip mode keeps a deque of short, complete MediaRecorder epochs. Individual periodic
+ * Blobs are not standalone files, but completed epochs are; this lets the main process
+ * concatenate only the recent rolling window without losing the scene immediately before
+ * a memory rotation. Rotation and snapshots share one operation queue.
  */
 (function initClips(RP4) {
   const { state, els, util } = RP4;
 
   const CHUNK_MS = 1000;
+  const MIN_SEGMENT_MS = 3000;
+  const MAX_SEGMENT_MS = 15000;
 
   function epochBytes(epoch) {
     if (!epoch) return 0;
@@ -22,7 +24,18 @@
   }
 
   function activeBufferBytes(session) {
-    return epochBytes(session?.currentEpoch) + epochBytes(session?.previousEpoch);
+    return epochBytes(session?.currentEpoch)
+      + (session?.completedEpochs || []).reduce((total, epoch) => total + epochBytes(epoch), 0);
+  }
+
+  function epochDuration(epoch, now = Date.now()) {
+    return Math.max(0, (epoch?.endedAt || now) - (epoch?.startedAt || now));
+  }
+
+  function activeBufferDuration(session) {
+    const epochs = [...(session?.completedEpochs || []), session?.currentEpoch].filter(Boolean);
+    if (!epochs.length) return 0;
+    return Math.max(0, Date.now() - epochs[0].startedAt);
   }
 
   function clipLimitBytes() {
@@ -85,14 +98,27 @@
 
   function pruneBuffer(session) {
     if (!session || state.clip !== session || session.stopping) return;
-    const reserve = Math.min(64 * 1024 * 1024, Math.max(8 * 1024 * 1024, clipLimitBytes() / 4));
-    const activeLimit = Math.max(reserve, clipLimitBytes() - (session.pendingSnapshotBytes || 0));
-    if (activeBufferBytes(session) <= activeLimit || session.rotationPromise) return;
+    const currentAge = epochDuration(session.currentEpoch);
+    const capacityExceeded = activeBufferBytes(session) > clipLimitBytes();
+    if ((currentAge < session.segmentMs && !capacityExceeded) || session.rotationPromise) return;
 
-    session.trimmedForSize = true;
+    if (capacityExceeded) session.trimmedForSize = true;
     session.rotationPromise = enqueueOperation(session, () => rotateBuffer(session))
       .catch((error) => failClipSession(session, error))
       .finally(() => { session.rotationPromise = null; });
+  }
+
+  function pruneCompletedEpochs(session) {
+    const targetMs = session.profile.clipDurationSeconds * 1000;
+    const durationLimit = targetMs + session.segmentMs;
+    while (session.completedEpochs.length > 1) {
+      const totalDuration = activeBufferDuration(session);
+      const overDuration = totalDuration > durationLimit;
+      const overCapacity = activeBufferBytes(session) > clipLimitBytes();
+      if (!overDuration && !overCapacity) break;
+      if (overCapacity) session.trimmedForSize = true;
+      session.completedEpochs.shift();
+    }
   }
 
   async function stopEpoch(epoch) {
@@ -107,37 +133,43 @@
 
   async function rotateBuffer(session) {
     if (state.clip !== session || session.stopping) return;
-    const previous = session.currentEpoch;
-    await stopEpoch(previous);
+    const completed = session.currentEpoch;
+    await stopEpoch(completed);
     if (state.clip !== session || session.stopping) return;
 
-    session.previousEpoch = previous;
+    session.completedEpochs.push(completed);
     startEpoch(session);
-    if (session.pendingSaveRequests === 0) session.previousEpoch = null;
+    pruneCompletedEpochs(session);
   }
 
   async function captureSnapshot(session, requestedAt) {
-    const previous = session.previousEpoch;
-    const usePrevious = previous
-      && requestedAt >= previous.startedAt
-      && requestedAt <= (previous.endedAt || requestedAt);
-    const epoch = usePrevious ? previous : session.currentEpoch;
-    if (!usePrevious) {
-      // Stopping establishes an unambiguous boundary: MediaRecorder emits its final
-      // dataavailable before stop, so a pending periodic event cannot complete the
-      // snapshot early and drop the last second.
-      await stopEpoch(epoch);
-      if (state.clip === session && !session.stopping) startEpoch(session);
+    // Stopping establishes an unambiguous boundary: MediaRecorder emits its final
+    // dataavailable before stop, so the snapshot includes the click instant.
+    const current = session.currentEpoch;
+    await stopEpoch(current);
+    const epochs = [...session.completedEpochs, current].filter((epoch) => epoch?.initChunk);
+    session.completedEpochs = [];
+    if (state.clip === session && !session.stopping) startEpoch(session);
+
+    const targetMs = session.profile.clipDurationSeconds * 1000;
+    while (epochs.length > 1
+      && requestedAt - (epochs[1]?.startedAt || requestedAt) >= targetMs) {
+      epochs.shift();
     }
 
     return {
       requestedAt,
-      startedAt: epoch?.startedAt || requestedAt,
-      endedAt: usePrevious ? epoch.endedAt : Date.now(),
-      initChunk: epoch?.initChunk || null,
-      chunks: epoch?.chunks.map((entry) => ({ ...entry })) || [],
+      startedAt: epochs[0]?.startedAt || requestedAt,
+      endedAt: current?.endedAt || Date.now(),
+      epochs: epochs.map((epoch) => ({
+        startedAt: epoch.startedAt,
+        endedAt: epoch.endedAt,
+        initChunk: epoch.initChunk,
+        chunks: epoch.chunks.map((entry) => ({ ...entry })),
+        mimeType: epoch.mimeType
+      })),
       trimmedForSize: session.trimmedForSize,
-      mimeType: epoch?.mimeType || session.codec.mimeType
+      mimeType: current?.mimeType || session.codec.mimeType
     };
   }
 
@@ -216,12 +248,15 @@
         profile,
         sourceSnapshot,
         currentEpoch: null,
-        previousEpoch: null,
+        completedEpochs: [],
+        segmentMs: Math.max(
+          MIN_SEGMENT_MS,
+          Math.min(MAX_SEGMENT_MS, Math.round(profile.clipDurationSeconds * 1000 / 3))
+        ),
         startedAt: Date.now(),
         trimmedForSize: false,
         rotationPromise: null,
         operationQueue: Promise.resolve(),
-        pendingSaveRequests: 0,
         pendingSnapshotBytes: 0,
         failure: null,
         stopping: false
@@ -294,12 +329,10 @@
 
   async function performSaveClip(session) {
     const requestedAt = Date.now();
-    session.pendingSaveRequests += 1;
     state.clipSaving = true;
     RP4.lifecycle.transition(session.operationId, 'saving-clip');
     RP4.app.updateClipUi();
     let clipSession = null;
-    let requestReleased = false;
     let snapshot = null;
     let snapshotRemainingBytes = 0;
     let wasTrimmedForSize;
@@ -307,8 +340,10 @@
 
     try {
       snapshot = await enqueueOperation(session, () => captureSnapshot(session, requestedAt));
-      snapshotRemainingBytes = (snapshot.initChunk?.size || 0)
-        + snapshot.chunks.reduce((total, entry) => total + (entry.blob?.size || 0), 0);
+      snapshotRemainingBytes = snapshot.epochs.reduce((total, epoch) => (
+        total + (epoch.initChunk?.size || 0)
+        + epoch.chunks.reduce((chunkTotal, entry) => chunkTotal + (entry.blob?.size || 0), 0)
+      ), 0);
       session.pendingSnapshotBytes += snapshotRemainingBytes;
       const reserve = Math.min(64 * 1024 * 1024, Math.max(8 * 1024 * 1024, clipLimitBytes() / 4));
       const activeRecorder = session.currentEpoch?.recorder;
@@ -318,13 +353,10 @@
         pausedForSnapshot = true;
       }
       wasTrimmedForSize = snapshot.trimmedForSize;
-      session.pendingSaveRequests -= 1;
-      requestReleased = true;
-      if (session.pendingSaveRequests === 0) session.previousEpoch = null;
 
       const profile = session.profile;
       const windowMs = profile.clipDurationSeconds * 1000;
-      if (!snapshot.initChunk) {
+      if (!snapshot.epochs.length) {
         RP4.ui.showToast('아직 저장할 클립 데이터가 없습니다.');
         return { ok: false, saved: null, partial: false, error: '아직 저장할 클립 데이터가 없습니다.' };
       }
@@ -354,27 +386,26 @@
         durationMs: estimatedMs,
         trimRecentMs: estimatedMs,
         trimEndOffsetMs: Math.max(0, snapshot.endedAt - snapshot.requestedAt),
-        clip: true
+        clip: true,
+        segmentedClip: snapshot.epochs.length > 1
       };
 
       clipSession = await window.rp4.startRecording(meta);
-      const initChunk = snapshot.initChunk;
-      const initResult = await util.writeBlobInSlices(clipSession.sessionId, initChunk);
-      snapshot.initChunk = null;
-      snapshotRemainingBytes -= initChunk.size;
-      session.pendingSnapshotBytes = Math.max(0, session.pendingSnapshotBytes - initChunk.size);
-      pruneBuffer(session);
-      if (initResult?.warning) throw new Error(initResult.warning);
-      for (const entry of snapshot.chunks) {
-        const blob = entry.blob;
-        const result = await util.writeBlobInSlices(clipSession.sessionId, blob);
-        entry.blob = null;
-        snapshotRemainingBytes -= blob.size;
-        session.pendingSnapshotBytes = Math.max(0, session.pendingSnapshotBytes - blob.size);
+      for (let segmentIndex = 0; segmentIndex < snapshot.epochs.length; segmentIndex += 1) {
+        const epoch = snapshot.epochs[segmentIndex];
+        const blobs = [epoch.initChunk, ...epoch.chunks.map((entry) => entry.blob)].filter(Boolean);
+        for (const blob of blobs) {
+          const result = await util.writeBlobInSlices(clipSession.sessionId, blob, { segmentIndex });
+          snapshotRemainingBytes -= blob.size;
+          session.pendingSnapshotBytes = Math.max(0, session.pendingSnapshotBytes - blob.size);
+          if (result?.warning) throw new Error(result.warning);
+        }
+        epoch.initChunk = null;
+        for (const entry of epoch.chunks) entry.blob = null;
+        epoch.chunks.length = 0;
         pruneBuffer(session);
-        if (result?.warning) throw new Error(result.warning);
       }
-      snapshot.chunks.length = 0;
+      snapshot.epochs.length = 0;
       const saved = await window.rp4.stopRecording({
         sessionId: clipSession.sessionId,
         durationMs: estimatedMs,
@@ -433,9 +464,12 @@
       };
     } finally {
       if (snapshot) {
-        snapshot.initChunk = null;
-        for (const entry of snapshot.chunks) entry.blob = null;
-        snapshot.chunks.length = 0;
+        for (const epoch of snapshot.epochs) {
+          epoch.initChunk = null;
+          for (const entry of epoch.chunks) entry.blob = null;
+          epoch.chunks.length = 0;
+        }
+        snapshot.epochs.length = 0;
       }
       session.pendingSnapshotBytes = Math.max(0, session.pendingSnapshotBytes - snapshotRemainingBytes);
       if (pausedForSnapshot && session.currentEpoch?.recorder?.state === 'paused') {
@@ -445,8 +479,6 @@
           // The clip may have been stopped while the snapshot was being written.
         }
       }
-      if (!requestReleased && session.pendingSaveRequests > 0) session.pendingSaveRequests -= 1;
-      if (session.pendingSaveRequests === 0) session.previousEpoch = null;
       state.clipSaving = false;
       if (state.clip === session) RP4.lifecycle.transition(session.operationId, 'clip');
       RP4.app.updateClipUi();
@@ -455,6 +487,7 @@
   }
 
   function saveClip() {
+    if (state.clipSavePromise) return state.clipSavePromise;
     const session = state.clip;
     if (!session || state.captureLifecycle !== 'clip') {
       return Promise.resolve({
@@ -464,8 +497,6 @@
         error: '활성 클립 버퍼가 없습니다.'
       });
     }
-    if (state.clipSavePromise) return state.clipSavePromise;
-
     const promise = performSaveClip(session);
     state.clipSavePromise = promise;
     void promise.finally(() => {
@@ -483,13 +514,13 @@
 
   function bufferStatus() {
     const session = state.clip;
-    const epoch = session?.currentEpoch;
-    if (!session || !epoch) return null;
+    if (!session || !session.currentEpoch) return null;
     return {
-      chunks: epoch.chunks.length,
+      chunks: session.completedEpochs.reduce((total, epoch) => total + epoch.chunks.length, 0)
+        + session.currentEpoch.chunks.length,
       bytes: retainedBytes(session),
       limitBytes: clipLimitBytes(),
-      availableMs: Math.max(0, Date.now() - epoch.startedAt),
+      availableMs: activeBufferDuration(session),
       targetMs: session.profile.clipDurationSeconds * 1000,
       limitedByCapacity: session.trimmedForSize
     };

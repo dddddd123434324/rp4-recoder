@@ -241,17 +241,22 @@ async function confirmCloseWhileRecording(win) {
   return response === 0;
 }
 
-async function confirmCloseWhileClip(win) {
+async function confirmCloseWhileClip(win, { saving = false } = {}) {
   const { response } = await dialog.showMessageBox(win, {
     type: 'warning',
-    buttons: ['최근 클립 저장 후 종료', '저장하지 않고 종료', '취소'],
+    buttons: saving
+      ? ['저장 완료 후 종료', '취소']
+      : ['최근 클립 저장 후 종료', '저장하지 않고 종료', '취소'],
     defaultId: 0,
-    cancelId: 2,
+    cancelId: saving ? 1 : 2,
     noLink: true,
     title: 'RP4 Recorder',
-    message: '클립 녹화 모드가 실행 중입니다.',
-    detail: '종료하기 전에 현재 버퍼의 최근 장면을 저장할 수 있습니다.'
+    message: saving ? '클립 저장이 진행 중입니다.' : '클립 녹화 모드가 실행 중입니다.',
+    detail: saving
+      ? '진행 중인 저장을 안전하게 마친 뒤 종료합니다.'
+      : '종료하기 전에 현재 버퍼의 최근 장면을 저장할 수 있습니다.'
   });
+  if (saving) return response === 0 ? 'save' : 'cancel';
   return response === 0 ? 'save' : response === 1 ? 'discard' : 'cancel';
 }
 

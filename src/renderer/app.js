@@ -855,13 +855,22 @@
           }
         }
         RP4.lifecycle.prepareShutdown();
-        await Promise.allSettled([
+        const finalized = await Promise.allSettled([
           RP4.recorder.finalizeForShutdown(),
           RP4.clips.finalizeForShutdown(),
           RP4.files.finalizeForShutdown(),
           RP4.profile.flushSave()
         ]);
+        const rejected = finalized.find((result) => result.status === 'rejected');
+        if (rejected) {
+          throw rejected.reason || new Error('종료 전 저장 작업을 완료하지 못했습니다.');
+        }
         window.rp4.reportFinalizeComplete(requestId, { ok: true });
+      } catch (error) {
+        window.rp4.reportFinalizeFailed(requestId, error?.message || error);
+        state.shuttingDown = false;
+        document.body.classList.remove('shutdown-pending');
+        RP4.app.updateClipUi();
       } finally {
         state.shutdownRequestId = null;
       }
