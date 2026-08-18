@@ -23,9 +23,6 @@ Windows용 화면·게임 녹화 프로그램입니다. H.264 영상을 MP4로 �
 
 [GitHub Releases](https://github.com/dddddd123434324/rp4-recoder/releases/latest)에서 설치판 또는 포터블 버전을 받을 수 있습니다.
 
-- `RP4-Recorder-Setup-<version>.exe`: 설치판
-- `RP4-Recorder-Portable-<version>.exe`: 포터블 버전
-
 Windows 코드 서명 인증서는 포함되어 있지 않습니다.
 
 ## English
@@ -48,9 +45,6 @@ RP4 Recorder is a Windows screen and game recorder. It writes H.264 video direct
 ### Download
 
 Download the installer or portable build from [GitHub Releases](https://github.com/dddddd123434324/rp4-recoder/releases/latest).
-
-- `RP4-Recorder-Setup-<version>.exe`: installer
-- `RP4-Recorder-Portable-<version>.exe`: portable build
 
 The Windows binaries are currently unsigned.
 
