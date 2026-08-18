@@ -8,6 +8,8 @@
 
   const VIDEO_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="13" rx="1.6"/><path d="M8 21h8M12 18v3"/></svg>';
   const thumbnailRecordings = new WeakMap();
+  let observedRecordingList = null;
+  const recordingListResizeObserver = new ResizeObserver(() => layoutRecentFiles());
   const thumbnailObserver = new IntersectionObserver((entries) => {
     for (const entry of entries) {
       if (!entry.isIntersecting) continue;
@@ -23,6 +25,37 @@
       }).catch(() => {});
     }
   }, { rootMargin: '96px 0px' });
+
+  /**
+   * CSS flows the horizontally scrolling grid by column. Reorder items so each visible
+   * page fills its top row left-to-right before moving down, avoiding a left-heavy stack
+   * on tall windows while keeping overflow on the horizontal axis.
+   */
+  function layoutRecentFiles() {
+    const list = els.recordingList;
+    if (!list || list.clientWidth <= 0 || list.clientHeight <= 0) return;
+    const items = [...list.querySelectorAll('.recording-item')];
+    if (!items.length) return;
+
+    const computed = getComputedStyle(list);
+    const columnGap = Number.parseFloat(computed.columnGap) || 0;
+    const rowGap = Number.parseFloat(computed.rowGap) || 0;
+    const first = items[0].getBoundingClientRect();
+    const columnsPerPage = Math.max(1, Math.floor((list.clientWidth + columnGap) / (first.width + columnGap)));
+    const rowsPerPage = Math.max(1, Math.floor((list.clientHeight + rowGap) / (first.height + rowGap)));
+    const pageSize = columnsPerPage * rowsPerPage;
+
+    for (const item of items) {
+      const index = Number(item.dataset.fileIndex) || 0;
+      const page = Math.floor(index / pageSize);
+      const withinPage = index % pageSize;
+      const row = Math.floor(withinPage / columnsPerPage);
+      const column = withinPage % columnsPerPage;
+      item.style.order = '';
+      item.style.gridRow = String(row + 1);
+      item.style.gridColumn = String(page * columnsPerPage + column + 1);
+    }
+  }
 
   function actionButton({ text, title, className = '', onClick }) {
     const button = document.createElement('button');
@@ -148,9 +181,17 @@
         return;
       }
 
-      for (const recording of recordings) {
-        els.recordingList.append(createItem(recording));
+      for (const [index, recording] of recordings.entries()) {
+        const item = createItem(recording);
+        item.dataset.fileIndex = String(index);
+        els.recordingList.append(item);
       }
+      if (observedRecordingList !== els.recordingList) {
+        if (observedRecordingList) recordingListResizeObserver.unobserve(observedRecordingList);
+        observedRecordingList = els.recordingList;
+        recordingListResizeObserver.observe(observedRecordingList);
+      }
+      window.requestAnimationFrame(layoutRecentFiles);
     } catch (error) {
       console.error(error);
       RP4.ui.showToast('녹화 파일 목록을 불러오지 못했습니다.');
