@@ -255,12 +255,19 @@ class SettingsStore {
       { ...staged, recordingsDir: resolved.recordingsDir },
       { recordingsDirFallback: resolved.recordingsDir }
     );
+    if (resolved.fellBack) {
+      // Permanent fallback policy: once the configured path is unusable, persist the
+      // writable replacement immediately instead of changing it accidentally on a later,
+      // unrelated settings update.
+      await this.writeSnapshot(this.current);
+    }
 
     return {
       settings: this.current,
       recordingsDirFellBack: resolved.fellBack,
       recordingsDirFallbackReason: resolved.fallbackReason,
       requestedRecordingsDir: resolved.requestedDir,
+      recordingsDirFallbackPersisted: resolved.fellBack,
       settingsRecovered: Boolean(loaded.recovery),
       settingsBackupPath: loaded.recovery?.backupPath || null,
       settingsRecoveryError: loaded.recovery?.error || null

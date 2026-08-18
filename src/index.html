@@ -158,22 +158,11 @@
                 </div>
               </div>
 
+            </section>
+
+            <section class="settings-block">
               <button class="section-toggle popup-trigger" type="button" data-settings-popup="record" aria-haspopup="dialog" aria-controls="settingsModal" aria-expanded="false">
-                <span>녹화 설정</span>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
-              </button>
-            </section>
-
-            <section class="settings-block">
-              <button class="section-toggle popup-trigger" type="button" data-settings-popup="screenshot" aria-haspopup="dialog" aria-controls="settingsModal" aria-expanded="false">
-                <span>스크린샷 설정</span>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
-              </button>
-            </section>
-
-            <section class="settings-block">
-              <button class="section-toggle popup-trigger" type="button" data-settings-popup="hotkeys" aria-haspopup="dialog" aria-controls="settingsModal" aria-expanded="false">
-                <span>단축키</span>
+                <span>설정</span>
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
               </button>
             </section>
@@ -198,8 +187,13 @@
   <div id="settingsModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settingsModalTitle">
     <div class="modal-card settings-modal-card">
       <div class="panel-header">
-        <h2 id="settingsModalTitle">녹화 설정</h2>
+        <h2 id="settingsModalTitle">설정</h2>
         <button id="closeSettingsModal" class="icon-button" type="button" aria-label="닫기">×</button>
+      </div>
+      <div class="settings-tabs" role="tablist" aria-label="설정 종류">
+        <button class="active" type="button" role="tab" data-settings-tab="record" aria-selected="true">녹화</button>
+        <button type="button" role="tab" data-settings-tab="screenshot" aria-selected="false">스크린샷</button>
+        <button type="button" role="tab" data-settings-tab="hotkeys" aria-selected="false">단축키</button>
       </div>
       <div class="settings-popup-scroll">
         <div id="recordSettingsBody" class="section-body settings-popup-body">

@@ -326,12 +326,12 @@ async function run() {
   const fakeContents = new EventEmitter();
   fakeContents.send = (channel, payload) => {
     if (channel === 'app:finalize-recordings') {
-      const emitAck = (eventName) => require('electron').ipcMain.emit(
-        eventName, { sender: fakeContents }, { requestId: payload.requestId }
+      const emitAck = (eventName, progress = undefined) => require('electron').ipcMain.emit(
+        eventName, { sender: fakeContents }, { requestId: payload.requestId, progress }
       );
       setImmediate(() => emitAck('app:shutdown-accepted'));
-      setTimeout(() => emitAck('app:shutdown-progress'), 30);
-      setTimeout(() => emitAck('app:shutdown-progress'), 65);
+      setTimeout(() => emitAck('app:shutdown-progress', { phase: 'write', completedBytes: 1 }), 30);
+      setTimeout(() => emitAck('app:shutdown-progress', { phase: 'write', completedBytes: 2 }), 65);
       setTimeout(() => emitAck('app:shutdown-ready'), 100);
     }
   };
@@ -357,6 +357,57 @@ async function run() {
       && drained.timedOut === false
       && shutdownOptions.failureReason === null
       && Date.now() - shutdownStartedAt >= 90);
+
+  const hardLimitContents = new EventEmitter();
+  let hardLimitHeartbeat = null;
+  hardLimitContents.send = (channel, payload) => {
+    if (channel !== 'app:finalize-recordings') return;
+    require('electron').ipcMain.emit(
+      'app:shutdown-accepted', { sender: hardLimitContents }, { requestId: payload.requestId }
+    );
+    let completedBytes = 0;
+    hardLimitHeartbeat = setInterval(() => {
+      completedBytes += 1;
+      require('electron').ipcMain.emit(
+        'app:shutdown-progress',
+        { sender: hardLimitContents },
+        { requestId: payload.requestId, progress: { phase: 'stuck', completedBytes } }
+      );
+    }, 15);
+  };
+  const hardLimitStartedAt = Date.now();
+  const hardLimited = await require('../src/main/windows').drainRecordings(
+    { isDestroyed: () => false, webContents: hardLimitContents },
+    fakeRecordings,
+    { timeoutMs: 40, maxTotalMs: 80 }
+  );
+  clearInterval(hardLimitHeartbeat);
+  check('shutdown hard deadline cannot be extended by heartbeat',
+    hardLimited.timedOut === true && Date.now() - hardLimitStartedAt < 180);
+
+  const failedContents = new EventEmitter();
+  failedContents.send = (channel, payload) => {
+    if (channel !== 'app:finalize-recordings') return;
+    setImmediate(() => require('electron').ipcMain.emit(
+      'app:shutdown-failed',
+      { sender: failedContents },
+      { requestId: payload.requestId, error: 'simulated clip save failure' }
+    ));
+  };
+  let failedFinalizeCalls = 0;
+  const failedDrain = await require('../src/main/windows').drainRecordings(
+    { isDestroyed: () => false, webContents: failedContents },
+    {
+      hasActiveSessions: () => false,
+      hasPendingRecordings: () => false,
+      finalizeAllSessions: async () => { failedFinalizeCalls += 1; return []; }
+    },
+    { timeoutMs: 100 }
+  );
+  check('clip save failure aborts shutdown before forced finalization',
+    failedDrain.shutdownFailed === true
+      && /simulated/.test(failedDrain.error)
+      && failedFinalizeCalls === 0);
 
   let closeAttempts = 0;
   const closeFailureSession = {
@@ -451,6 +502,27 @@ async function run() {
     `${probe.durationSec}s`);
   check('reported duration excludes nothing unexpected',
     Math.abs((probe.durationSec || 0) - 5) < 1.5, `${probe.durationSec}s vs 5s`);
+
+  const invalidSession = await recordings.start(meta, { webContentsId: win.webContents.id });
+  await recordings.write({
+    sessionId: invalidSession.sessionId,
+    buffer: Buffer.alloc(4096, 0xaa)
+  }, { webContentsId: win.webContents.id });
+  const invalidSaved = await recordings.stop({
+    sessionId: invalidSession.sessionId,
+    durationMs: 1000
+  }, { webContentsId: win.webContents.id });
+  const invalidDeadline = Date.now() + 5000;
+  while (recordings.metadata.get(invalidSaved.filePath)?.status === 'verifying'
+    && Date.now() < invalidDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  check('invalid direct recording is not classified complete',
+    recordings.metadata.get(invalidSaved.filePath)?.status === 'invalid');
+
+  recordings.optimizeQueue.push({ filePath: 'pending-test.mp4', durationMs: 1 });
+  check('pending optimization blocks recording-folder mutation', recordings.hasPendingFileMutations());
+  recordings.optimizeQueue.pop();
 
   const concurrentStarts = await Promise.allSettled([
     recordings.start(meta, { webContentsId: win.webContents.id }),

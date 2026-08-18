@@ -336,7 +336,7 @@
     if (!state.appSettings.customPresets.length) {
       const empty = document.createElement('div');
       empty.className = 'empty-state compact';
-      empty.textContent = '생성한 프리셋이 없습니다.';
+      empty.textContent = '생성한 프리셋이 없습니다.\n설정에서 프리셋을 만들어 주세요.';
       els.customPresetList.append(empty);
       return;
     }
@@ -564,18 +564,26 @@
     state.sourceSelectionPending = false;
   }
 
-  function openSettingsModal(type) {
-    const titles = { record: '녹화 설정', screenshot: '스크린샷 설정', hotkeys: '단축키' };
-    els.settingsModalTitle.textContent = titles[type] || titles.record;
+  function setSettingsTab(type = 'record') {
     RP4.$('#recordSettingsBody').classList.toggle('hidden', type !== 'record');
     RP4.$('#screenshotSettingsBody').classList.toggle('hidden', type !== 'screenshot');
     RP4.$('#hotkeySettingsBody').classList.toggle('hidden', type !== 'hotkeys');
+    for (const button of RP4.$$('[data-settings-tab]')) {
+      const active = button.dataset.settingsTab === type;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-selected', String(active));
+    }
+    if (type === 'hotkeys') RP4.hotkeys.render();
+  }
+
+  function openSettingsModal(type = 'record') {
+    els.settingsModalTitle.textContent = '설정';
+    setSettingsTab(type);
     els.settingsModal.classList.remove('hidden');
 
     for (const button of RP4.$$('[data-settings-popup]')) {
       button.setAttribute('aria-expanded', String(button.dataset.settingsPopup === type));
     }
-    if (type === 'hotkeys') RP4.hotkeys.render();
   }
 
   function updateScreenshotQualityUi() {
@@ -704,6 +712,10 @@
     els.settingsModal.addEventListener('click', (event) => {
       if (event.target === els.settingsModal) closeSettingsModal();
     });
+    els.settingsModal.addEventListener('click', (event) => {
+      const tab = event.target.closest('[data-settings-tab]');
+      if (tab) setSettingsTab(tab.dataset.settingsTab);
+    });
 
     els.sourceGrid.addEventListener('click', async (event) => {
       const card = event.target.closest('.source-card');
@@ -795,7 +807,7 @@
     });
 
     window.rp4.onConvertProgress(({ phase, ratio }) => {
-      util.reportShutdownProgress();
+      util.reportShutdownProgress({ phase, ratio: Number(ratio) || 0 });
       const label = phase === 'transcode' ? '변환 중' : '컨테이너 정리 중';
       setProgress(ratio, `${label} ${Math.round(ratio * 100)}%`);
       if (ratio >= 1) window.setTimeout(() => setProgress(null), 800);
@@ -805,7 +817,20 @@
       // Optimization runs after the file is already saved and listed, so it only ever
       // reports; it never blocks.
       if (phase === 'start') setProgress(0.05, 'MP4 최적화 중 (백그라운드)');
-      else setProgress(null);
+      else {
+        setProgress(null);
+        if (phase === 'failed') RP4.ui.showToast('MP4 최적화에 실패해 원본 파일을 유지했습니다.');
+        if (phase === 'skipped-low-space') RP4.ui.showToast('저장 공간이 부족해 MP4 최적화를 건너뛰었습니다.');
+      }
+    });
+
+    window.rp4.onVerifyState(({ state: phase }) => {
+      if (phase === 'start') setProgress(0.1, '저장 파일 검증 중');
+      else {
+        setProgress(null);
+        void RP4.files.render();
+        if (phase === 'failed') RP4.ui.showToast('저장 파일 검증에 실패했습니다. 파일을 부분 저장으로 표시합니다.');
+      }
     });
 
     window.rp4.onDiskFull(() => {
@@ -816,13 +841,19 @@
     window.rp4.onFinalizeRecordings(async ({ requestId, saveActiveClip = false } = {}) => {
       state.shutdownRequestId = requestId;
       state.shuttingDown = true;
-      for (const control of document.querySelectorAll('button, input, select')) {
-        control.disabled = true;
-      }
+      document.body.classList.add('shutdown-pending');
       window.rp4.reportFinalizeAccepted(requestId);
-      const heartbeat = window.setInterval(() => util.reportShutdownProgress(), 2000);
       try {
-        if (saveActiveClip) await RP4.clips.saveClip().catch(() => {});
+        if (saveActiveClip) {
+          const clipResult = await RP4.clips.saveClip();
+          if (!clipResult?.ok) {
+            window.rp4.reportFinalizeFailed(requestId, clipResult?.error);
+            state.shuttingDown = false;
+            document.body.classList.remove('shutdown-pending');
+            RP4.app.updateClipUi();
+            return;
+          }
+        }
         RP4.lifecycle.prepareShutdown();
         await Promise.allSettled([
           RP4.recorder.finalizeForShutdown(),
@@ -830,9 +861,8 @@
           RP4.files.finalizeForShutdown(),
           RP4.profile.flushSave()
         ]);
-        window.rp4.reportFinalizeComplete(requestId);
+        window.rp4.reportFinalizeComplete(requestId, { ok: true });
       } finally {
-        window.clearInterval(heartbeat);
         state.shutdownRequestId = null;
       }
     });

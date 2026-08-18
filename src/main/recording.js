@@ -317,6 +317,7 @@ class RecordingManager {
     this.thumbnailQueue = Promise.resolve();
     this.thumbnailInflight = new Map();
     this.screenshotJobs = new Set();
+    this.verificationJobs = new Map();
     this.startingWebContentsIds = new Set();
     this.moveFile = move;
   }
@@ -332,6 +333,13 @@ class RecordingManager {
   hasPendingRecordings() {
     return this.startingWebContentsIds.size > 0 || this.sessions.size > 0
       || this.finalizing.size > 0 || this.screenshotJobs.size > 0;
+  }
+
+  hasPendingFileMutations() {
+    return this.hasPendingRecordings()
+      || this.optimizing
+      || this.optimizeQueue.length > 0
+      || this.verificationJobs.size > 0;
   }
 
   indexFile() {
@@ -732,13 +740,14 @@ class RecordingManager {
     const outcome = finalized.partial
       ? 'partial'
       : finalized.conversionError ? 'original-preserved' : 'exact';
+    const verificationPending = Boolean(finalized.verificationPending);
     const meta = {
       ...session.meta,
       ...normalizeRecordingMeta(payload.meta),
       format: finalized.format,
       converted: finalized.converted,
       conversionError: finalized.conversionError || null,
-      status: finalized.partial ? 'partial' : 'complete',
+      status: finalized.partial ? 'partial' : verificationPending ? 'verifying' : 'complete',
       partial: Boolean(finalized.partial),
       failureReason: finalized.failureReason || null,
       outcome,
@@ -749,7 +758,9 @@ class RecordingManager {
 
     await this.setMetadata(finalized.filePath, meta);
 
-    if (finalized.optimizable && this.settings.value.optimizeMp4) {
+    if (verificationPending) {
+      this.enqueueVerification(finalized.filePath, durationMs, finalized.optimizable);
+    } else if (finalized.optimizable && this.settings.value.optimizeMp4) {
       this.enqueueOptimize(finalized.filePath, durationMs);
     }
 
@@ -839,7 +850,8 @@ class RecordingManager {
         converted: false,
         // A stream-copy pass moves the moov atom to the front. It is optional, runs in
         // the background, and never delays the save.
-        optimizable: targetFormat === 'mp4'
+        optimizable: targetFormat === 'mp4',
+        verificationPending: true
       };
     }
 
@@ -985,6 +997,50 @@ class RecordingManager {
       this.optimizeDrainPromise = this.drainOptimizeQueue()
         .finally(() => { this.optimizeDrainPromise = null; });
     }
+  }
+
+  enqueueVerification(filePath, durationMs, optimizable = false) {
+    if (this.verificationJobs.has(filePath)) return this.verificationJobs.get(filePath);
+    const job = Promise.resolve().then(async () => {
+      this.emit('recording:verify', { filePath, state: 'start' });
+      try {
+        await ffmpeg.validateMedia(filePath);
+        const meta = this.metadata.get(filePath);
+        if (meta) {
+          await this.setMetadata(filePath, {
+            ...meta,
+            status: 'complete',
+            partial: false,
+            outcome: meta.outcome === 'exact' ? 'exact' : meta.outcome,
+            failureReason: null
+          });
+        }
+        this.emit('recording:verify', { filePath, state: 'done' });
+        if (optimizable && this.settings.value.optimizeMp4) {
+          this.enqueueOptimize(filePath, durationMs);
+        }
+        return true;
+      } catch (error) {
+        const meta = this.metadata.get(filePath);
+        if (meta) {
+          await this.setMetadata(filePath, {
+            ...meta,
+            status: 'invalid',
+            partial: true,
+            outcome: 'invalid',
+            failureReason: `저장된 미디어를 검증하지 못했습니다. ${error?.message || error}`.slice(0, 500)
+          });
+        }
+        this.emit('recording:verify', {
+          filePath,
+          state: 'failed',
+          error: error?.message || String(error)
+        });
+        return false;
+      }
+    }).finally(() => this.verificationJobs.delete(filePath));
+    this.verificationJobs.set(filePath, job);
+    return job;
   }
 
   async drainOptimizeQueue() {
@@ -1242,6 +1298,7 @@ class RecordingManager {
 
     await Promise.allSettled([...this.finalizing.values()].map((entry) => entry.promise));
     await Promise.allSettled([...this.screenshotJobs]);
+    await Promise.allSettled([...this.verificationJobs.values()]);
     await this.flushIndex().catch((error) => {
       this.emit('app:notice', {
         level: 'warn',

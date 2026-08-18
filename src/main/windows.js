@@ -5,11 +5,13 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 
 const displays = require('./displays');
+const ffmpeg = require('./ffmpeg');
 
 const SRC_DIR = path.resolve(__dirname, '..');
 const APP_ROOT = path.resolve(SRC_DIR, '..');
 const ICON_PATH = path.join(APP_ROOT, 'icon.ico');
 const UNRESPONSIVE_GRACE_MS = 10000;
+const MAX_TOTAL_SHUTDOWN_MS = 10 * 60 * 1000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -116,6 +118,7 @@ function createMainWindow({ isSmoke, onQuitRequested, onRendererGone, onRenderer
  */
 async function drainRecordings(win, recordingManager, {
   timeoutMs = 20000,
+  maxTotalMs = MAX_TOTAL_SHUTDOWN_MS,
   saveActiveClip = false,
   timeoutFailureReason = null
 } = {}) {
@@ -127,20 +130,24 @@ async function drainRecordings(win, recordingManager, {
     const result = await new Promise((resolve) => {
       let settled = false;
       let timer = null;
+      let hardTimer = null;
       let accepted = false;
+      let lastProgress = null;
       const armInactivityTimer = () => {
         clearTimeout(timer);
         timer = setTimeout(() => finish(false), timeoutMs);
       };
-      const finish = (completed) => {
+      const finish = (completed, { failed = false, error = null } = {}) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        clearTimeout(hardTimer);
         ipcMain.removeListener('app:shutdown-accepted', onAccepted);
         ipcMain.removeListener('app:shutdown-progress', onProgress);
+        ipcMain.removeListener('app:shutdown-failed', onFailed);
         ipcMain.removeListener('app:shutdown-ready', onReady);
         win.webContents.removeListener('destroyed', onDestroyed);
-        resolve({ completed, accepted });
+        resolve({ completed, accepted, failed, error });
       };
       const matches = (event, payload) => (
         event.sender === win.webContents && payload?.requestId === requestId
@@ -152,7 +159,14 @@ async function drainRecordings(win, recordingManager, {
       };
       const onProgress = (event, payload = {}) => {
         if (!matches(event, payload)) return;
+        const signature = JSON.stringify(payload.progress || {});
+        if (signature === lastProgress) return;
+        lastProgress = signature;
         armInactivityTimer();
+      };
+      const onFailed = (event, payload = {}) => {
+        if (!matches(event, payload)) return;
+        finish(false, { failed: true, error: payload.error || '클립을 저장하지 못했습니다.' });
       };
       const onReady = (event, payload = {}) => {
         if (!matches(event, payload)) return;
@@ -162,9 +176,11 @@ async function drainRecordings(win, recordingManager, {
 
       ipcMain.on('app:shutdown-accepted', onAccepted);
       ipcMain.on('app:shutdown-progress', onProgress);
+      ipcMain.on('app:shutdown-failed', onFailed);
       ipcMain.on('app:shutdown-ready', onReady);
       win.webContents.once('destroyed', onDestroyed);
       armInactivityTimer();
+      hardTimer = setTimeout(() => finish(false), maxTotalMs);
       try {
         win.webContents.send('app:finalize-recordings', { requestId, saveActiveClip });
       } catch {
@@ -173,6 +189,17 @@ async function drainRecordings(win, recordingManager, {
     });
     rendererReady = result.completed;
     rendererAccepted = result.accepted;
+    if (result.failed) {
+      return {
+        drained: false,
+        rendererReady: false,
+        rendererAccepted,
+        timedOut: false,
+        shutdownFailed: true,
+        error: result.error,
+        saved: []
+      };
+    }
   }
 
   const deadline = Date.now() + timeoutMs;
@@ -184,6 +211,7 @@ async function drainRecordings(win, recordingManager, {
   // starts it is intentionally not timed out: cancelling ffmpeg here could corrupt the
   // only copy of the recording.
   const timedOut = !rendererReady || recordingManager.hasActiveSessions();
+  if (timedOut) await ffmpeg.cancelAll().catch(() => {});
   const saved = await recordingManager.finalizeAllSessions({
     failureReason: timedOut
       ? timeoutFailureReason || '앱 종료 대기 시간이 지나 부분 저장했습니다.'
@@ -194,6 +222,7 @@ async function drainRecordings(win, recordingManager, {
     rendererReady,
     rendererAccepted,
     timedOut,
+    shutdownFailed: false,
     saved
   };
 }
@@ -224,6 +253,20 @@ async function confirmCloseWhileClip(win) {
     detail: '종료하기 전에 현재 버퍼의 최근 장면을 저장할 수 있습니다.'
   });
   return response === 0 ? 'save' : response === 1 ? 'discard' : 'cancel';
+}
+
+async function confirmClipSaveFailure(win, error) {
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'error',
+    buttons: ['앱으로 돌아가기', '저장하지 않고 종료'],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+    title: 'RP4 Recorder',
+    message: '최근 클립을 저장하지 못했습니다.',
+    detail: String(error || '저장 장치와 여유 공간을 확인해 주세요.').slice(0, 500)
+  });
+  return response === 1 ? 'discard' : 'return';
 }
 
 /**
@@ -326,8 +369,10 @@ module.exports = {
   drainRecordings,
   confirmCloseWhileRecording,
   confirmCloseWhileClip,
+  confirmClipSaveFailure,
   selectDesktopArea,
   closeAreaSelector,
   sleep,
-  UNRESPONSIVE_GRACE_MS
+  UNRESPONSIVE_GRACE_MS,
+  MAX_TOTAL_SHUTDOWN_MS
 };

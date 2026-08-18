@@ -332,7 +332,7 @@ function registerIpcHandlers(context) {
   });
 
   handleMain('folder:choose-recordings', async (event) => {
-    if (folderDialogActive || recordings.hasPendingRecordings()) {
+    if (folderDialogActive || recordings.hasPendingFileMutations()) {
       return {
         canceled: false,
         failed: true,
@@ -378,7 +378,7 @@ function registerIpcHandlers(context) {
           recordingsDir: settings.recordingsDir
         };
       }
-      if (recordings.hasPendingRecordings()) {
+      if (recordings.hasPendingFileMutations()) {
         return {
           canceled: false,
           failed: true,

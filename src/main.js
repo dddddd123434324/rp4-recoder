@@ -85,17 +85,37 @@ async function shutdown({
 
   await cleanup('hotkeys', () => hotkeys?.unregisterAll());
   await cleanup('area selector', () => windows.closeAreaSelector());
+  let drainResult = null;
   if (recordings) {
     if (rendererUnavailable) {
       await cleanup('recordings', () => recordings.finalizeAllSessions({ failureReason }));
     } else {
-      await cleanup('recordings', () => (
-        windows.drainRecordings(mainWindow, recordings, {
+      try {
+        drainResult = await windows.drainRecordings(mainWindow, recordings, {
           timeoutMs: 20000,
           saveActiveClip,
           timeoutFailureReason: failureReason
-        })
-      ));
+        });
+      } catch (error) {
+        process.stderr.write(`shutdown recordings error: ${error?.message || error}\n`);
+      }
+      if (drainResult?.shutdownFailed && saveActiveClip) {
+        const decision = await windows.confirmClipSaveFailure(mainWindow, drainResult.error);
+        if (decision === 'return') {
+          isQuitting = false;
+          try {
+            hotkeys?.register(settings.value.hotkeys);
+          } catch {
+            // The app remains usable even if a global shortcut cannot be restored.
+          }
+          return false;
+        }
+        await windows.drainRecordings(mainWindow, recordings, {
+          timeoutMs: 20000,
+          saveActiveClip: false,
+          timeoutFailureReason: failureReason
+        });
+      }
     }
     await cleanup('session handles', () => recordings.closeAllSessions());
     await cleanup('optimizations', () => recordings.cancelAndDrainOptimizations());
@@ -110,6 +130,7 @@ async function shutdown({
   }
 
   app.exit(exitCode);
+  return true;
 }
 
 /**
@@ -248,7 +269,7 @@ async function bootstrap() {
           : '폴더를 만들거나 쓸 수 없습니다.';
         send('app:notice', {
           level: 'warn',
-          message: `설정된 저장 폴더(${loaded.requestedRecordingsDir})를 사용할 수 없습니다: ${reason} ${settings.recordingsDir} 로 변경했습니다.`
+          message: `설정된 저장 폴더(${loaded.requestedRecordingsDir})를 사용할 수 없습니다: ${reason} 저장 경로를 ${settings.recordingsDir}(으)로 영구 변경했습니다.`
         });
       }
       if (sweep.recovered.length > 0) {

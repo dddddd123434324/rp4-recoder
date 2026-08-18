@@ -68,6 +68,8 @@
 
     const badges = [];
     if (recording.partial || recording.status === 'partial') badges.push(['부분 저장', 'warn']);
+    if (recording.status === 'verifying') badges.push(['검증 중', 'info']);
+    if (recording.status === 'invalid') badges.push(['검증 실패', 'warn']);
     if (recording.outcome === 'original-preserved') badges.push(['원본 보존', 'warn']);
     if (recording.recovered || recording.outcome === 'recovered') badges.push(['복구됨', 'info']);
     if (badges.length > 0) {

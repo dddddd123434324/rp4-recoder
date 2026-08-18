@@ -203,9 +203,9 @@ window.RP4 = window.RP4 || {};
 
   const IPC_SLICE_BYTES = 8 * 1024 * 1024;
 
-  function reportShutdownProgress() {
+  function reportShutdownProgress(progress = {}) {
     if (state.shutdownRequestId) {
-      window.rp4.reportFinalizeProgress(state.shutdownRequestId);
+      window.rp4.reportFinalizeProgress(state.shutdownRequestId, progress);
     }
   }
 
@@ -217,7 +217,11 @@ window.RP4 = window.RP4 || {};
         buffer: await part.arrayBuffer(),
         terminal
       });
-      reportShutdownProgress();
+      reportShutdownProgress({
+        phase: 'writing',
+        completedBytes: Math.min(blob.size, offset + part.size),
+        totalBytes: blob.size
+      });
       if (result?.warning) return result;
     }
     return null;

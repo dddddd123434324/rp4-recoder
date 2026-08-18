@@ -62,13 +62,21 @@ contextBridge.exposeInMainWorld('rp4', {
   onNotice: (callback) => subscribe('app:notice', callback),
   onConvertProgress: (callback) => subscribe('recording:convert-progress', callback),
   onOptimizeState: (callback) => subscribe('recording:optimize', callback),
+  onVerifyState: (callback) => subscribe('recording:verify', callback),
   onDiskFull: (callback) => subscribe('recording:disk-full', callback),
   // Fired when the app is closing so the renderer can flush and finalize a recording
   // before the window goes away.
   onFinalizeRecordings: (callback) => subscribe('app:finalize-recordings', callback),
   reportFinalizeAccepted: (requestId) => ipcRenderer.send('app:shutdown-accepted', { requestId }),
-  reportFinalizeProgress: (requestId) => ipcRenderer.send('app:shutdown-progress', { requestId }),
-  reportFinalizeComplete: (requestId) => ipcRenderer.send('app:shutdown-ready', { requestId }),
+  reportFinalizeProgress: (requestId, progress = {}) => (
+    ipcRenderer.send('app:shutdown-progress', { requestId, progress })
+  ),
+  reportFinalizeFailed: (requestId, error) => (
+    ipcRenderer.send('app:shutdown-failed', { requestId, error: String(error || '').slice(0, 500) })
+  ),
+  reportFinalizeComplete: (requestId, result = {}) => (
+    ipcRenderer.send('app:shutdown-ready', { requestId, ok: result.ok !== false })
+  ),
 
   window: {
     minimize: () => ipcRenderer.invoke('window:minimize'),

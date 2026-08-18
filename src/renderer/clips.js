@@ -18,9 +18,11 @@
   }
 
   function retainedBytes(session) {
-    return epochBytes(session?.currentEpoch)
-      + epochBytes(session?.previousEpoch)
-      + (session?.pendingSnapshotBytes || 0);
+    return activeBufferBytes(session) + (session?.pendingSnapshotBytes || 0);
+  }
+
+  function activeBufferBytes(session) {
+    return epochBytes(session?.currentEpoch) + epochBytes(session?.previousEpoch);
   }
 
   function clipLimitBytes() {
@@ -83,7 +85,9 @@
 
   function pruneBuffer(session) {
     if (!session || state.clip !== session || session.stopping) return;
-    if (retainedBytes(session) <= clipLimitBytes() || session.rotationPromise) return;
+    const reserve = Math.min(64 * 1024 * 1024, Math.max(8 * 1024 * 1024, clipLimitBytes() / 4));
+    const activeLimit = Math.max(reserve, clipLimitBytes() - (session.pendingSnapshotBytes || 0));
+    if (activeBufferBytes(session) <= activeLimit || session.rotationPromise) return;
 
     session.trimmedForSize = true;
     session.rotationPromise = enqueueOperation(session, () => rotateBuffer(session))
@@ -299,12 +303,20 @@
     let snapshot = null;
     let snapshotRemainingBytes = 0;
     let wasTrimmedForSize;
+    let pausedForSnapshot = false;
 
     try {
       snapshot = await enqueueOperation(session, () => captureSnapshot(session, requestedAt));
       snapshotRemainingBytes = (snapshot.initChunk?.size || 0)
         + snapshot.chunks.reduce((total, entry) => total + (entry.blob?.size || 0), 0);
       session.pendingSnapshotBytes += snapshotRemainingBytes;
+      const reserve = Math.min(64 * 1024 * 1024, Math.max(8 * 1024 * 1024, clipLimitBytes() / 4));
+      const activeRecorder = session.currentEpoch?.recorder;
+      if (snapshotRemainingBytes > clipLimitBytes() - reserve
+        && activeRecorder?.state === 'recording') {
+        activeRecorder.pause();
+        pausedForSnapshot = true;
+      }
       wasTrimmedForSize = snapshot.trimmedForSize;
       session.pendingSaveRequests -= 1;
       requestReleased = true;
@@ -312,9 +324,9 @@
 
       const profile = session.profile;
       const windowMs = profile.clipDurationSeconds * 1000;
-      if (!snapshot.initChunk || snapshot.chunks.length === 0) {
+      if (!snapshot.initChunk) {
         RP4.ui.showToast('아직 저장할 클립 데이터가 없습니다.');
-        return;
+        return { ok: false, saved: null, partial: false, error: '아직 저장할 클립 데이터가 없습니다.' };
       }
 
       const estimatedMs = Math.min(
@@ -389,6 +401,12 @@
           `메모리 한도(${state.appSettings.clipBufferLimitMb}MB) 때문에 목표 길이보다 짧을 수 있습니다.`
         );
       }
+      return {
+        ok: true,
+        saved,
+        partial: saved.outcome === 'partial' || saved.status === 'partial',
+        error: null
+      };
     } catch (error) {
       console.error(error);
       let partial = null;
@@ -407,6 +425,12 @@
         RP4.ui.setStatus('클립 저장 실패', '클립 파일 저장을 완료하지 못했습니다.', 'warn');
         RP4.ui.showToast('클립 파일 저장을 완료하지 못했습니다.');
       }
+      return {
+        ok: Boolean(partial),
+        saved: partial,
+        partial: Boolean(partial),
+        error: partial ? null : error?.message || '클립 파일 저장을 완료하지 못했습니다.'
+      };
     } finally {
       if (snapshot) {
         snapshot.initChunk = null;
@@ -414,6 +438,13 @@
         snapshot.chunks.length = 0;
       }
       session.pendingSnapshotBytes = Math.max(0, session.pendingSnapshotBytes - snapshotRemainingBytes);
+      if (pausedForSnapshot && session.currentEpoch?.recorder?.state === 'paused') {
+        try {
+          session.currentEpoch.recorder.resume();
+        } catch {
+          // The clip may have been stopped while the snapshot was being written.
+        }
+      }
       if (!requestReleased && session.pendingSaveRequests > 0) session.pendingSaveRequests -= 1;
       if (session.pendingSaveRequests === 0) session.previousEpoch = null;
       state.clipSaving = false;
@@ -425,7 +456,14 @@
 
   function saveClip() {
     const session = state.clip;
-    if (!session || state.captureLifecycle !== 'clip') return Promise.resolve();
+    if (!session || state.captureLifecycle !== 'clip') {
+      return Promise.resolve({
+        ok: false,
+        saved: null,
+        partial: false,
+        error: '활성 클립 버퍼가 없습니다.'
+      });
+    }
     if (state.clipSavePromise) return state.clipSavePromise;
 
     const promise = performSaveClip(session);
