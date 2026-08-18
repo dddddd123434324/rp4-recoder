@@ -10,38 +10,9 @@
 </head>
 <body>
   <div class="app-shell">
-    <aside class="sidebar">
-      <div class="brand" aria-label="RP4">RP<strong>4</strong></div>
-
-      <nav class="nav-list" aria-label="주 메뉴">
-        <button class="nav-item active" type="button">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10.5V20h13v-9.5"/><path d="M9.5 20v-6h5v6"/></svg>
-          <span>대시보드</span>
-        </button>
-        <button class="nav-item" type="button" data-action="open-folder">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9a2 2 0 0 1-2 2h-15z"/><path d="M3.5 6.5v12a2 2 0 0 0 2 2"/></svg>
-          <span>녹화 파일</span>
-        </button>
-        <button id="chooseFolderButton" class="nav-sub-action" type="button">경로 지정</button>
-      </nav>
-
-      <section class="file-panel" aria-label="최근 녹화 파일">
-        <div class="file-panel-header">
-          <h2>최근 파일</h2>
-          <div class="file-panel-actions">
-            <button id="refreshFilesButton" class="icon-button" type="button" aria-label="목록 새로고침">↻</button>
-            <button id="openFolderButton" class="icon-button" type="button" aria-label="폴더 열기">⁝</button>
-          </div>
-        </div>
-        <div id="recordingList" class="recording-list"></div>
-      </section>
-
-      <span id="versionLabel" class="version"></span>
-    </aside>
-
     <main class="main">
       <div class="titlebar">
-        <span></span>
+        <div class="titlebar-brand" aria-label="RP4">RP<strong>4</strong></div>
         <div class="window-actions">
           <button id="minimizeButton" type="button" aria-label="최소화">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/></svg>
@@ -117,6 +88,18 @@
             </div>
             <strong>초</strong>
           </div>
+
+          <section class="recent-files-panel" aria-label="최근 녹화 파일">
+            <div class="recent-files-header">
+              <h2>최근 파일</h2>
+              <div class="recent-files-actions">
+                <button id="openFolderButton" class="text-button" type="button">녹화 파일</button>
+                <button id="chooseFolderButton" class="text-button" type="button">경로 지정</button>
+                <button id="refreshFilesButton" class="icon-button" type="button" aria-label="목록 새로고침">↻</button>
+              </div>
+            </div>
+            <div id="recordingList" class="recording-list" tabindex="0" aria-label="최근 파일 가로 목록"></div>
+          </section>
         </section>
 
         <aside class="panel settings-panel">
@@ -195,6 +178,7 @@
               </button>
             </section>
           </div>
+          <span id="versionLabel" class="version settings-version"></span>
         </aside>
 
       </section>

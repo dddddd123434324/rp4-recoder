@@ -668,6 +668,13 @@
     els.refreshFilesButton.addEventListener('click', () => void RP4.files.render());
     els.openFolderButton.addEventListener('click', () => void window.rp4.openRecordingsFolder());
     els.chooseFolderButton.addEventListener('click', () => void chooseRecordingsFolder());
+    els.recordingList.addEventListener('wheel', (event) => {
+      if (els.recordingList.scrollWidth <= els.recordingList.clientWidth) return;
+      const delta = Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
+      if (!delta) return;
+      event.preventDefault();
+      els.recordingList.scrollLeft += delta;
+    }, { passive: false });
     els.createPresetButton.addEventListener('click', () => void RP4.profile.createCustomPreset());
 
     els.resetHotkeysButton.addEventListener('click', () => void RP4.hotkeys.reset());
@@ -774,12 +781,6 @@
         if (!target) return;
         const collapsed = target.classList.toggle('collapsed');
         button.setAttribute('aria-expanded', String(!collapsed));
-      });
-    }
-
-    for (const button of RP4.$$('.nav-item')) {
-      button.addEventListener('click', () => {
-        if (button.dataset.action === 'open-folder') void window.rp4.openRecordingsFolder();
       });
     }
 
