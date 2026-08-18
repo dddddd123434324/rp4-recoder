@@ -34,11 +34,23 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 $code = @'
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Runtime.InteropServices;
+using System.Text;
 
 public static class Rp4WindowCrop
 {
+    public sealed class WindowInfo
+    {
+        public string hwnd;
+        public string title;
+        public uint processId;
+        public bool minimized;
+    }
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 
@@ -47,6 +59,13 @@ public static class Rp4WindowCrop
 
     [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hWnd);
     [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+    [DllImport("user32.dll")] private static extern int GetWindowTextLength(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr hWnd, int command);
+    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
     [DllImport("user32.dll")] private static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
@@ -54,6 +73,7 @@ public static class Rp4WindowCrop
     [DllImport("user32.dll")] private static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
 
     private const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+    private const int SW_RESTORE = 9;
 
     public static void Init()
     {
@@ -64,6 +84,46 @@ public static class Rp4WindowCrop
     private static string Escape(int value)
     {
         return value.ToString(CultureInfo.InvariantCulture);
+    }
+
+    public static WindowInfo[] ListWindows()
+    {
+        List<WindowInfo> result = new List<WindowInfo>();
+        EnumWindows(delegate(IntPtr hWnd, IntPtr unused)
+        {
+            try
+            {
+                if (!IsWindowVisible(hWnd)) return true;
+                int length = GetWindowTextLength(hWnd);
+                if (length <= 0 || length > 32768) return true;
+                StringBuilder title = new StringBuilder(length + 1);
+                if (GetWindowText(hWnd, title, title.Capacity) <= 0) return true;
+                uint processId;
+                GetWindowThreadProcessId(hWnd, out processId);
+                result.Add(new WindowInfo {
+                    hwnd = hWnd.ToInt64().ToString(CultureInfo.InvariantCulture),
+                    title = title.ToString(),
+                    processId = processId,
+                    minimized = IsIconic(hWnd)
+                });
+            }
+            catch { }
+            return true;
+        }, IntPtr.Zero);
+        return result.ToArray();
+    }
+
+    public static bool Restore(long hwndValue)
+    {
+        try
+        {
+            IntPtr hWnd = new IntPtr(hwndValue);
+            if (!IsWindow(hWnd)) return false;
+            if (IsIconic(hWnd)) ShowWindowAsync(hWnd, SW_RESTORE);
+            SetForegroundWindow(hWnd);
+            return true;
+        }
+        catch { return false; }
     }
 
     public static string Query(string id, long hwndValue)
@@ -127,7 +187,15 @@ while ($true) {
     $parts = $line.Split(' ')
     if ($parts.Length -lt 2) { continue }
     try {
-        [Console]::Out.WriteLine([Rp4WindowCrop]::Query($parts[0], [int64]$parts[1]))
+        if ($parts[1] -eq 'list') {
+            $json = ConvertTo-Json -InputObject @([Rp4WindowCrop]::ListWindows()) -Compress
+            [Console]::Out.WriteLine('RP4:' + $parts[0] + ':' + $json)
+        } elseif ($parts[1] -eq 'restore' -and $parts.Length -ge 3) {
+            $restored = [Rp4WindowCrop]::Restore([int64]$parts[2])
+            [Console]::Out.WriteLine('RP4:' + $parts[0] + ':' + $(if ($restored) { 'true' } else { 'false' }))
+        } else {
+            [Console]::Out.WriteLine([Rp4WindowCrop]::Query($parts[0], [int64]$parts[1]))
+        }
     } catch {
         [Console]::Out.WriteLine('RP4:' + $parts[0] + ':null')
     }
@@ -338,6 +406,26 @@ class WindowCropService {
     const numeric = String(hwnd || '').trim();
     if (!/^\d+$/.test(numeric)) return null;
 
+    return this.request(numeric);
+  }
+
+  async listWindows() {
+    const result = await this.request('list');
+    if (!Array.isArray(result)) return [];
+    return result.filter((entry) => (
+      entry && /^\d+$/.test(String(entry.hwnd || ''))
+        && typeof entry.title === 'string' && entry.title.trim()
+    )).slice(0, 512);
+  }
+
+  async restore(hwnd) {
+    const numeric = String(hwnd || '').trim();
+    if (!/^\d+$/.test(numeric)) return false;
+    return (await this.request(`restore ${numeric}`)) === true;
+  }
+
+  async request(command) {
+    if (this.unsupported || this.disposed) return null;
     const child = await this.ensureHost();
     if (!child || !child.stdin.writable) return null;
     const generation = this.generation;
@@ -352,7 +440,7 @@ class WindowCropService {
 
       this.pending.set(id, { resolve, timer, child, generation });
       try {
-        child.stdin.write(`${id} ${numeric}\n`, (error) => {
+        child.stdin.write(`${id} ${command}\n`, (error) => {
           if (!error) return;
           const entry = this.pending.get(id);
           if (entry) {

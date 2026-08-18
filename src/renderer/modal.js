@@ -23,7 +23,7 @@
     const header = document.createElement('div');
     header.className = 'panel-header';
     const heading = document.createElement('h2');
-    heading.textContent = title;
+    heading.textContent = RP4.i18n.translate(title);
     header.append(heading);
 
     const body = document.createElement('div');
@@ -31,7 +31,7 @@
 
     if (message) {
       const text = document.createElement('p');
-      text.textContent = message;
+      text.textContent = RP4.i18n.translate(message);
       body.append(text);
     }
 
@@ -41,7 +41,7 @@
       input.type = 'text';
       input.className = 'dialog-input';
       input.value = defaultValue || '';
-      input.placeholder = placeholder || '';
+      input.placeholder = RP4.i18n.translate(placeholder || '');
       input.maxLength = 40;
       input.setAttribute('aria-label', title);
       body.append(input);
@@ -52,11 +52,11 @@
     const cancel = document.createElement('button');
     cancel.type = 'button';
     cancel.className = 'dialog-button';
-    cancel.textContent = cancelLabel || '취소';
+    cancel.textContent = RP4.i18n.translate(cancelLabel || '취소');
     const confirm = document.createElement('button');
     confirm.type = 'button';
     confirm.className = 'dialog-button primary';
-    confirm.textContent = confirmLabel || '확인';
+    confirm.textContent = RP4.i18n.translate(confirmLabel || '확인');
     actions.append(cancel, confirm);
 
     card.append(header, body, actions);

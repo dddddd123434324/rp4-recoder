@@ -1,6 +1,6 @@
 {
   "name": "rp4-recorder",
-  "version": "0.2.18",
+  "version": "0.2.19",
   "productName": "RP4 Recorder",
   "description": "RP4 desktop game recorder",
   "author": "RP4",
@@ -54,8 +54,15 @@
       ]
     },
     "nsis": {
+      "artifactName": "RP4-Recorder-Setup-${version}.${ext}",
       "oneClick": false,
       "perMachine": false,
+      "multiLanguageInstaller": true,
+      "displayLanguageSelector": true,
+      "installerLanguages": [
+        "en_US",
+        "ko_KR"
+      ],
       "allowElevation": true,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,

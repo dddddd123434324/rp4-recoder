@@ -224,7 +224,7 @@
   }
 
   function defaultPresetName() {
-    return `사용자 프리셋 ${state.appSettings.customPresets.length + 1}`;
+    return `${RP4.i18n.translate('사용자 프리셋')} ${state.appSettings.customPresets.length + 1}`;
   }
 
   async function createCustomPreset() {

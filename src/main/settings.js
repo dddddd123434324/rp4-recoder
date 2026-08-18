@@ -25,6 +25,7 @@ const SCREENSHOT_FORMATS = ['png', 'jpeg', 'webp'];
 const DEFAULT_SCREENSHOT_FORMAT = 'png';
 const DEFAULT_SCREENSHOT_QUALITY = 100;
 const SCREENSHOT_QUALITIES = [70, 80, 90, 95, 100];
+const LANGUAGES = new Set(['ko', 'en']);
 
 // Clip mode keeps recent footage buffered. Without a byte ceiling a 7200s buffer at
 // 35 Mbps would try to hold ~31 GB, so the buffer is bounded in megabytes as well as
@@ -159,6 +160,7 @@ function normalize(value = {}, { recordingsDirFallback } = {}) {
   const clipLimit = Number(source.clipBufferLimitMb);
 
   return {
+    language: LANGUAGES.has(source.language) ? source.language : 'ko',
     hotkeys: normalizeHotkeys(source.hotkeys),
     selectedPreset: normalizeSelectedPreset(source.selectedPreset, customPresets),
     customPresets,
@@ -334,6 +336,7 @@ module.exports = {
   DEFAULT_SCREENSHOT_QUALITY,
   SCREENSHOT_FORMATS,
   SCREENSHOT_QUALITIES,
+  LANGUAGES,
   MIN_CLIP_BUFFER_LIMIT_MB,
   MAX_CLIP_BUFFER_LIMIT_MB,
   MAX_SETTINGS_BYTES,

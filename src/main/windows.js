@@ -227,49 +227,60 @@ async function drainRecordings(win, recordingManager, {
   };
 }
 
-async function confirmCloseWhileRecording(win) {
+async function confirmCloseWhileRecording(win, language = 'ko') {
+  const english = language === 'en';
   const { response } = await dialog.showMessageBox(win, {
     type: 'warning',
-    buttons: ['저장하고 종료', '계속 녹화'],
+    buttons: english ? ['Save and Exit', 'Keep Recording'] : ['저장하고 종료', '계속 녹화'],
     defaultId: 0,
     cancelId: 1,
     noLink: true,
     title: 'RP4 Recorder',
-    message: '녹화가 진행 중입니다.',
-    detail: '지금 종료하면 녹화를 마무리한 뒤 파일을 저장합니다.'
+    message: english ? 'Recording is in progress.' : '녹화가 진행 중입니다.',
+    detail: english
+      ? 'The recording will be finalized and saved before the app exits.'
+      : '지금 종료하면 녹화를 마무리한 뒤 파일을 저장합니다.'
   });
   return response === 0;
 }
 
-async function confirmCloseWhileClip(win, { saving = false } = {}) {
+async function confirmCloseWhileClip(win, { saving = false, language = 'ko' } = {}) {
+  const english = language === 'en';
   const { response } = await dialog.showMessageBox(win, {
     type: 'warning',
     buttons: saving
-      ? ['저장 완료 후 종료', '취소']
-      : ['최근 클립 저장 후 종료', '저장하지 않고 종료', '취소'],
+      ? english ? ['Exit After Saving', 'Cancel'] : ['저장 완료 후 종료', '취소']
+      : english
+        ? ['Save Recent Clip and Exit', 'Exit Without Saving', 'Cancel']
+        : ['최근 클립 저장 후 종료', '저장하지 않고 종료', '취소'],
     defaultId: 0,
     cancelId: saving ? 1 : 2,
     noLink: true,
     title: 'RP4 Recorder',
-    message: saving ? '클립 저장이 진행 중입니다.' : '클립 녹화 모드가 실행 중입니다.',
+    message: saving
+      ? english ? 'A clip is being saved.' : '클립 저장이 진행 중입니다.'
+      : english ? 'Clip Mode is active.' : '클립 녹화 모드가 실행 중입니다.',
     detail: saving
-      ? '진행 중인 저장을 안전하게 마친 뒤 종료합니다.'
-      : '종료하기 전에 현재 버퍼의 최근 장면을 저장할 수 있습니다.'
+      ? english ? 'The app will exit after the current save finishes safely.' : '진행 중인 저장을 안전하게 마친 뒤 종료합니다.'
+      : english ? 'You can save the recent buffered footage before exiting.' : '종료하기 전에 현재 버퍼의 최근 장면을 저장할 수 있습니다.'
   });
   if (saving) return response === 0 ? 'wait-current-save' : 'cancel';
   return response === 0 ? 'save-current-buffer' : response === 1 ? 'discard' : 'cancel';
 }
 
-async function confirmClipSaveFailure(win, error) {
+async function confirmClipSaveFailure(win, error, language = 'ko') {
+  const english = language === 'en';
   const { response } = await dialog.showMessageBox(win, {
     type: 'error',
-    buttons: ['앱으로 돌아가기', '저장하지 않고 종료'],
+    buttons: english ? ['Return to App', 'Exit Without Saving'] : ['앱으로 돌아가기', '저장하지 않고 종료'],
     defaultId: 0,
     cancelId: 0,
     noLink: true,
     title: 'RP4 Recorder',
-    message: '최근 클립을 저장하지 못했습니다.',
-    detail: String(error || '저장 장치와 여유 공간을 확인해 주세요.').slice(0, 500)
+    message: english ? 'The recent clip could not be saved.' : '최근 클립을 저장하지 못했습니다.',
+    detail: String(error || (english
+      ? 'Check the storage device and available space.'
+      : '저장 장치와 여유 공간을 확인해 주세요.')).slice(0, 500)
   });
   return response === 1 ? 'discard' : 'return';
 }

@@ -11,6 +11,7 @@ const cancelButton = document.getElementById('cancelButton');
 const fillDisplayButton = document.getElementById('fillDisplayButton');
 const hint = document.getElementById('hint');
 const actions = document.getElementById('actions');
+const hintText = document.getElementById('hintText');
 
 let virtualBounds = { x: 0, y: 0, width: 0, height: 0 };
 let displayList = [];
@@ -250,6 +251,14 @@ async function init() {
   virtualBounds = data.virtualBounds;
   displayList = data.displays || [];
   minSizePx = data.minSelectionPx || 16;
+  if (data.language === 'en') {
+    document.documentElement.lang = 'en';
+    document.title = 'Select Area';
+    hintText.textContent = 'Drag to create, move or resize the box, Enter to apply, ESC to cancel';
+    fillDisplayButton.textContent = 'Full Display';
+    cancelButton.textContent = 'Cancel';
+    applyButton.textContent = 'Apply';
+  }
 
   positionChrome(window.innerWidth / 2, window.innerHeight / 2);
 

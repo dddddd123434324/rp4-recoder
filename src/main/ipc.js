@@ -95,6 +95,7 @@ function registerIpcHandlers(context) {
   function settingsDto() {
     const value = settings.value;
     return {
+      language: value.language,
       selectedPreset: value.selectedPreset,
       customPresets: value.customPresets.map((preset) => ({
         id: preset.id,
@@ -224,13 +225,16 @@ function registerIpcHandlers(context) {
       }
     ]));
 
-    const sources = await desktopCapturer.getSources({
-      types: ['screen', 'window'],
-      thumbnailSize: { width: 320, height: 180 },
-      fetchWindowIcons: true
-    });
+    const [sources, nativeWindows] = await Promise.all([
+      desktopCapturer.getSources({
+        types: ['screen', 'window'],
+        thumbnailSize: { width: 320, height: 180 },
+        fetchWindowIcons: true
+      }),
+      windowCrop.listWindows()
+    ]);
 
-    return sources.map((source) => {
+    const toDto = (source, extra = {}) => {
       const displayId = source.display_id ? String(source.display_id) : null;
       return {
         id: source.id,
@@ -242,12 +246,80 @@ function registerIpcHandlers(context) {
         thumbnail: source.thumbnail && !source.thumbnail.isEmpty()
           ? source.thumbnail.toDataURL()
           : null,
-        appIcon: source.appIcon && !source.appIcon.isEmpty() ? source.appIcon.toDataURL() : null
+        appIcon: source.appIcon && !source.appIcon.isEmpty() ? source.appIcon.toDataURL() : null,
+        ...extra
       };
-    });
+    };
+
+    const screens = sources.filter((source) => source.id.startsWith('screen:')).map(toDto);
+    const capturedWindows = new Map(sources
+      .filter((source) => source.id.startsWith('window:'))
+      .map((source) => [parseWindowHandle(source.id), source]));
+    const mergedWindows = [];
+    const includedHandles = new Set();
+    for (const nativeWindow of nativeWindows) {
+      const hwnd = String(nativeWindow.hwnd);
+      if (Number(nativeWindow.processId) === process.pid || includedHandles.has(hwnd)) continue;
+      includedHandles.add(hwnd);
+      const captured = capturedWindows.get(hwnd);
+      if (captured) {
+        mergedWindows.push(toDto(captured, { minimized: Boolean(nativeWindow.minimized) }));
+      } else {
+        mergedWindows.push({
+          id: `window:${hwnd}:0`,
+          name: nativeWindow.title.trim().slice(0, 500),
+          type: 'window',
+          hwnd,
+          displayId: null,
+          display: null,
+          thumbnail: null,
+          appIcon: null,
+          minimized: Boolean(nativeWindow.minimized),
+          requiresRestore: true
+        });
+      }
+    }
+    for (const [hwnd, source] of capturedWindows) {
+      if (!includedHandles.has(hwnd)) mergedWindows.push(toDto(source));
+    }
+    return [...screens, ...mergedWindows];
   });
 
-  handleArea('area-selector:data', async () => displays.getDisplayPayload());
+  handleMain('window:prepare-source', async (_event, sourceId) => {
+    const hwnd = parseWindowHandle(sourceId);
+    if (!hwnd || !(await windowCrop.restore(hwnd))) return null;
+
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 120));
+      const sources = await desktopCapturer.getSources({
+        types: ['window'],
+        thumbnailSize: { width: 320, height: 180 },
+        fetchWindowIcons: true
+      });
+      const source = sources.find((item) => parseWindowHandle(item.id) === hwnd);
+      if (!source) continue;
+      return {
+        id: source.id,
+        name: source.name,
+        type: 'window',
+        hwnd,
+        displayId: null,
+        display: null,
+        thumbnail: source.thumbnail && !source.thumbnail.isEmpty()
+          ? source.thumbnail.toDataURL()
+          : null,
+        appIcon: source.appIcon && !source.appIcon.isEmpty() ? source.appIcon.toDataURL() : null,
+        minimized: false,
+        requiresRestore: false
+      };
+    }
+    return null;
+  });
+
+  handleArea('area-selector:data', async () => ({
+    ...displays.getDisplayPayload(),
+    language: settings.value.language
+  }));
 
   handleMain('area:select', async () => windows.selectDesktopArea({ isSmoke }));
 
@@ -450,6 +522,7 @@ function registerIpcHandlers(context) {
 
   handleMain('settings:options', async (_event, options = {}) => {
     const patch = {};
+    if (options.language === 'ko' || options.language === 'en') patch.language = options.language;
     if (typeof options.optimizeMp4 === 'boolean') patch.optimizeMp4 = options.optimizeMp4;
     if (typeof options.screenshotFormat === 'string') {
       patch.screenshotFormat = options.screenshotFormat;

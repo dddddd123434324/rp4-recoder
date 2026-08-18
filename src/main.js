@@ -100,7 +100,11 @@ async function shutdown({
         process.stderr.write(`shutdown recordings error: ${error?.message || error}\n`);
       }
       if (drainResult?.shutdownFailed && clipShutdownMode !== 'discard') {
-        const decision = await windows.confirmClipSaveFailure(mainWindow, drainResult.error);
+        const decision = await windows.confirmClipSaveFailure(
+          mainWindow,
+          drainResult.error,
+          settings.value.language
+        );
         if (decision === 'return') {
           isQuitting = false;
           try {
@@ -143,12 +147,13 @@ async function handleQuitRequest(win) {
   let clipShutdownMode = 'discard';
   if (rendererCaptureState.clipActive || rendererCaptureState.clipSaving) {
     const decision = await windows.confirmCloseWhileClip(win, {
-      saving: rendererCaptureState.clipSaving
+      saving: rendererCaptureState.clipSaving,
+      language: settings.value.language
     });
     if (decision === 'cancel') return;
     clipShutdownMode = decision;
   } else if (recordings?.hasPendingRecordings()) {
-    const shouldSave = await windows.confirmCloseWhileRecording(win);
+    const shouldSave = await windows.confirmCloseWhileRecording(win, settings.value.language);
     if (!shouldSave) return;
   }
 

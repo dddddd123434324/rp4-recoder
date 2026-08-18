@@ -1339,6 +1339,7 @@ svg {
 }
 
 .source-card {
+  position: relative;
   display: grid;
   grid-template-rows: 124px auto;
   gap: 10px;
@@ -1487,6 +1488,24 @@ svg {
   padding-right: 0;
   align-content: start;
   grid-auto-rows: max-content;
+}
+
+.source-state-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 3px 6px;
+  border: 1px solid #676e79;
+  background: rgba(20, 23, 27, 0.9);
+  color: #d8dde5;
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.language-settings {
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid #474c55;
 }
 
 .file-panel .recording-item {

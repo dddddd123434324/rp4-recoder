@@ -52,6 +52,7 @@ window.RP4 = window.RP4 || {};
     toastTimer: null,
 
     appSettings: {
+      language: 'ko',
       selectedPreset: 'normal',
       customPresets: [],
       profile: null,
@@ -118,7 +119,7 @@ window.RP4 = window.RP4 || {};
   }
 
   function formatDate(value) {
-    return new Intl.DateTimeFormat('ko-KR', {
+    return new Intl.DateTimeFormat(RP4.i18n?.language === 'en' ? 'en-US' : 'ko-KR', {
       month: '2-digit',
       day: '2-digit',
       hour: '2-digit',
@@ -127,6 +128,12 @@ window.RP4 = window.RP4 || {};
   }
 
   function formatSeconds(seconds) {
+    if (RP4.i18n?.language === 'en') {
+      if (seconds < 60) return `${seconds} sec`;
+      const minutes = Math.floor(seconds / 60);
+      const rest = seconds % 60;
+      return rest ? `${minutes} min ${rest} sec` : `${minutes} min`;
+    }
     if (seconds < 60) return `${seconds}초`;
     const minutes = Math.floor(seconds / 60);
     const rest = seconds % 60;
@@ -135,7 +142,7 @@ window.RP4 = window.RP4 || {};
 
   function showToast(message, { durationMs = 3600 } = {}) {
     if (!els.toast) return;
-    els.toast.textContent = message;
+    els.toast.textContent = RP4.i18n?.translate(message) || message;
     els.toast.classList.remove('hidden');
     window.clearTimeout(state.toastTimer);
     state.toastTimer = window.setTimeout(() => {
@@ -145,8 +152,8 @@ window.RP4 = window.RP4 || {};
 
   function setStatus(title, text, tone = 'ready') {
     if (!els.statusTitle) return;
-    els.statusTitle.textContent = title;
-    els.statusText.textContent = text;
+    els.statusTitle.textContent = RP4.i18n?.translate(title) || title;
+    els.statusText.textContent = RP4.i18n?.translate(text) || text;
     els.statusDot.classList.toggle('recording', tone === 'recording');
     els.statusDot.classList.toggle('warn', tone === 'warn');
   }

@@ -40,6 +40,7 @@
       screenshotFormatSelect: RP4.$('#screenshotFormatSelect'),
       screenshotQualitySelect: RP4.$('#screenshotQualitySelect'),
       screenshotQualityNote: RP4.$('#screenshotQualityNote'),
+      languageSelect: RP4.$('#languageSelect'),
 
       clipDurationInput: RP4.$('#clipDurationInput'),
       clipDurationUp: RP4.$('#clipDurationUp'),
@@ -88,20 +89,22 @@
   }
 
   function getSourceTitle(source) {
-    if (!source) return '소스 없음';
+    if (!source) return RP4.i18n.translate('소스 없음');
     if (source.type === 'screen') {
       const index = source.display?.index
         || getScreenSources().findIndex((item) => item.id === source.id) + 1;
-      return source.display?.primary ? `모니터 ${index} (주 화면)` : `모니터 ${index}`;
+      return RP4.i18n.translate(
+        source.display?.primary ? `모니터 ${index} (주 화면)` : `모니터 ${index}`
+      );
     }
-    return source.name || '창';
+    return source.name || RP4.i18n.translate('창');
   }
 
   function getModeLabel(mode) {
-    if (mode === 'window') return '창 지정';
-    if (mode === 'monitor') return '특정 모니터';
-    if (mode === 'area') return '영역 녹화';
-    return '전체 화면';
+    if (mode === 'window') return RP4.i18n.translate('창 지정');
+    if (mode === 'monitor') return RP4.i18n.translate('특정 모니터');
+    if (mode === 'area') return RP4.i18n.translate('영역 녹화');
+    return RP4.i18n.translate('전체 화면');
   }
 
   function getScreenSources() {
@@ -268,6 +271,7 @@
 
   function applyAppSettings(settings = {}) {
     state.appSettings = {
+      language: settings.language === 'en' ? 'en' : 'ko',
       selectedPreset: Object.hasOwn(settings, 'selectedPreset') ? settings.selectedPreset : 'normal',
       customPresets: Array.isArray(settings.customPresets) ? settings.customPresets : [],
       profile: settings.profile || null,
@@ -282,6 +286,8 @@
     };
     state.selectedPreset = state.appSettings.selectedPreset;
 
+    els.languageSelect.value = state.appSettings.language;
+    RP4.i18n.setLanguage(state.appSettings.language);
     els.optimizeMp4Toggle.checked = state.appSettings.optimizeMp4;
     els.clipBufferInput.value = String(state.appSettings.clipBufferLimitMb);
     els.screenshotFormatSelect.value = state.appSettings.screenshotFormat;
@@ -529,6 +535,13 @@
         card.append(fallback);
       }
 
+      if (source.requiresRestore) {
+        const stateBadge = document.createElement('span');
+        stateBadge.className = 'source-state-badge';
+        stateBadge.textContent = '최소화됨';
+        card.append(stateBadge);
+      }
+
       const title = document.createElement('strong');
       title.textContent = getSourceTitle(source);
       card.append(title);
@@ -720,10 +733,22 @@
     els.sourceGrid.addEventListener('click', async (event) => {
       const card = event.target.closest('.source-card');
       if (!card) return;
-      const source = state.sources.find((item) => item.id === card.dataset.sourceId);
+      let source = state.sources.find((item) => item.id === card.dataset.sourceId);
       if (!source) return;
       const generation = state.modalGeneration;
       if (generation !== state.sourceSelectionGeneration || RP4.lifecycle.isBusy()) return;
+      if (source.requiresRestore) {
+        card.disabled = true;
+        RP4.ui.showToast('최소화되었거나 숨겨진 창을 복원하고 있습니다.');
+        const prepared = await window.rp4.prepareWindowSource(source.id).catch(() => null);
+        card.disabled = false;
+        if (!prepared) {
+          RP4.ui.showToast('이 창을 복원하거나 캡처할 수 없습니다.');
+          return;
+        }
+        state.sources = state.sources.map((item) => item.id === source.id ? prepared : item);
+        source = prepared;
+      }
       closeSourceModal();
       await chooseSource(source, state.modalMode, { generation });
     });
@@ -821,6 +846,23 @@
         setProgress(null);
         if (phase === 'failed') RP4.ui.showToast('MP4 최적화에 실패해 원본 파일을 유지했습니다.');
         if (phase === 'skipped-low-space') RP4.ui.showToast('저장 공간이 부족해 MP4 최적화를 건너뛰었습니다.');
+      }
+    });
+
+    els.languageSelect.addEventListener('change', async () => {
+      const language = els.languageSelect.value === 'en' ? 'en' : 'ko';
+      state.appSettings.language = language;
+      RP4.i18n.setLanguage(language);
+      updatePipelineNote();
+      updateRecordingUi();
+      updateClipUi();
+      renderCustomPresets();
+      RP4.hotkeys.render();
+      void RP4.files.render();
+      try {
+        await window.rp4.setOptions({ language });
+      } catch {
+        RP4.ui.showToast('설정을 저장하지 못했습니다.');
       }
     });
 

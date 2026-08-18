@@ -172,10 +172,15 @@ async function run() {
     hotkeys: { recordToggle: 'Alt+F9' }
   });
   check('legacy settings keep their selected preset', legacyShaped.selectedPreset === 'game');
+  check('legacy settings default to Korean', legacyShaped.language === 'ko');
   check('legacy settings have no substituted profile', legacyShaped.profile === null);
   check('legacy hotkeys survive normalization', legacyShaped.hotkeys.recordToggle === 'Alt+F9');
   check('missing hotkeys fall back to defaults',
     legacyShaped.hotkeys.clipSave === 'CommandOrControl+Shift+V');
+
+  await settings.update({ language: 'en' });
+  check('English language preference persists', settings.value.language === 'en');
+  await settings.update({ language: 'ko' });
 
   await settings.update({ profile: { resolution: '1280x720', fps: '30' } });
   check('saved profile round-trips', settings.value.profile?.resolution === '1280x720',
@@ -449,6 +454,27 @@ async function run() {
   const page = path.join(SANDBOX, 'page.html');
   fs.writeFileSync(page, '<!doctype html><html><body>itest</body></html>', 'utf8');
   await win.loadFile(page);
+
+  const i18nSource = await fsp.readFile(path.join(__dirname, '..', 'src', 'renderer', 'i18n.js'), 'utf8');
+  const i18nResult = JSON.parse(await win.webContents.executeJavaScript(`
+    (async () => {
+      document.body.innerHTML = '<button id="translated" aria-label="닫기">스크린샷</button>';
+      window.RP4 = {};
+      eval(${JSON.stringify(i18nSource)});
+      window.RP4.i18n.setLanguage('en');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const button = document.getElementById('translated');
+      const english = { text: button.textContent, label: button.getAttribute('aria-label') };
+      window.RP4.i18n.setLanguage('ko');
+      const korean = { text: button.textContent, label: button.getAttribute('aria-label') };
+      return JSON.stringify({ english, korean });
+    })()
+  `));
+  check('UI language switches to English and back to Korean',
+    i18nResult.english.text === 'Screenshot'
+      && i18nResult.english.label === 'Close'
+      && i18nResult.korean.text === '스크린샷'
+      && i18nResult.korean.label === '닫기');
 
   const clipsSource = await fsp.readFile(path.join(__dirname, '..', 'src', 'renderer', 'clips.js'), 'utf8');
   const clipPolicyResult = JSON.parse(await win.webContents.executeJavaScript(`
