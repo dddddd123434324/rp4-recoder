@@ -3,11 +3,12 @@
 const { contextBridge, ipcRenderer } = require('electron/renderer');
 
 const MAX_IPC_BINARY_BYTES = 64 * 1024 * 1024;
+const MAX_SCREENSHOT_BYTES = 256 * 1024 * 1024;
 
-function invokeWithBoundedBuffer(channel, payload = {}) {
+function invokeWithBoundedBuffer(channel, payload = {}, maxBytes = MAX_IPC_BINARY_BYTES) {
   const bytes = Number(payload.buffer?.byteLength ?? payload.buffer?.length ?? 0);
-  if (bytes > MAX_IPC_BINARY_BYTES) {
-    return Promise.reject(new Error('한 번에 전송할 수 있는 데이터 크기(64MB)를 초과했습니다.'));
+  if (bytes > maxBytes) {
+    return Promise.reject(new Error('한 번에 전송할 수 있는 데이터 크기를 초과했습니다.'));
   }
   return ipcRenderer.invoke(channel, payload);
 }
@@ -28,10 +29,11 @@ contextBridge.exposeInMainWorld('rp4', {
   captureScreenshotSource: (sourceId) => ipcRenderer.invoke('screenshot:capture-source', sourceId),
 
   listRecordings: () => ipcRenderer.invoke('recordings:list'),
+  getRecordingThumbnail: (filePath) => ipcRenderer.invoke('recording:thumbnail', filePath),
   startRecording: (meta) => ipcRenderer.invoke('recording:start', meta),
   writeRecordingChunk: (payload) => invokeWithBoundedBuffer('recording:write', payload),
   stopRecording: (payload) => ipcRenderer.invoke('recording:stop', payload),
-  saveScreenshot: (payload) => invokeWithBoundedBuffer('screenshot:save', payload),
+  saveScreenshot: (payload) => invokeWithBoundedBuffer('screenshot:save', payload, MAX_SCREENSHOT_BYTES),
   cancelConversion: (jobId) => ipcRenderer.invoke('convert:cancel', jobId),
 
   openRecordingsFolder: () => ipcRenderer.invoke('folder:open-recordings'),

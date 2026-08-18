@@ -87,11 +87,14 @@
       && typeof window.VideoFrame === 'function';
   }
 
-  async function getDesktopStream(source, { audio }) {
-    const profile = RP4.profile.get();
+  async function getDesktopStream(source, {
+    audio,
+    mode = state.selectedMode,
+    profile = RP4.profile.get()
+  }) {
     // Crop modes discard part of the frame, so the source is requested at full detail and
     // the requested resolution is applied to the cropped output instead.
-    const highDetail = source?.type === 'window' || state.selectedMode === 'area';
+    const highDetail = source?.type === 'window' || mode === 'area';
     const video = {
       mandatory: {
         chromeMediaSource: 'desktop',
@@ -136,8 +139,7 @@
     return { x, y, width: Math.max(2, width), height: Math.max(2, height) };
   }
 
-  function areaCropFor(frameWidth, frameHeight) {
-    const selection = state.areaSelection;
+  function areaCropFor(frameWidth, frameHeight, selection = state.areaSelection) {
     return alignRect({
       x: selection.x * frameWidth,
       y: selection.y * frameHeight,
@@ -391,12 +393,18 @@
    *
    * @returns {Promise<object>} handle with `stream`, `cleanup`, `gains` and `output`
    */
-  async function createCaptureStream({ audio, cropArea, includeMic }) {
-    const source = state.selectedSource;
+  async function createCaptureStream({
+    audio,
+    cropArea,
+    includeMic,
+    source = state.selectedSource,
+    mode = state.selectedMode,
+    areaSelection = state.areaSelection,
+    profile = RP4.profile.get()
+  }) {
     if (!source) throw new Error('캡처 소스가 없습니다.');
 
-    const profile = RP4.profile.get();
-    const desktop = await getDesktopStream(source, { audio });
+    const desktop = await getDesktopStream(source, { audio, mode, profile });
     const inputs = [desktop.stream];
     const disposers = [];
 
@@ -405,7 +413,7 @@
       if (!videoTrack) throw new Error('영상 트랙을 찾을 수 없습니다.');
       videoTrack.contentHint = 'motion';
 
-      const wantsAreaCrop = Boolean(cropArea && state.selectedMode === 'area' && state.hasAreaSelection);
+      const wantsAreaCrop = Boolean(cropArea && mode === 'area');
       const wantsWindowCrop = source.type === 'window' && !wantsAreaCrop;
 
       const settings = await waitForTrackDimensions(videoTrack);
@@ -420,7 +428,7 @@
         let getCrop;
 
         if (wantsAreaCrop) {
-          getCrop = (width, height) => areaCropFor(width, height);
+          getCrop = (width, height) => areaCropFor(width, height, areaSelection);
         } else {
           const initialCrop = await window.rp4.getWindowClientCrop(source.id);
           if (!initialCrop) {
@@ -535,15 +543,17 @@
    * at preview resolution and could be stale or black when the window was minimized -
    * precisely when the screenshot hotkey is most useful.
    */
-  async function captureStill() {
-    const source = state.selectedSource;
+  async function captureStill(snapshot = {}) {
+    const source = snapshot.source || state.selectedSource;
+    const mode = snapshot.mode || state.selectedMode;
+    const areaSelection = snapshot.areaSelection || state.areaSelection;
     if (!source) throw new Error('캡처 소스가 없습니다.');
     const frame = await window.rp4.captureScreenshotSource(source.id);
     const bitmap = await createImageBitmap(new Blob([frame.buffer], { type: 'image/png' }));
     try {
       let crop = { x: 0, y: 0, width: bitmap.width, height: bitmap.height };
-      if (state.selectedMode === 'area' && state.hasAreaSelection) {
-        crop = areaCropFor(bitmap.width, bitmap.height);
+      if (mode === 'area' && snapshot.hasAreaSelection !== false) {
+        crop = areaCropFor(bitmap.width, bitmap.height, areaSelection);
       } else if (source.type === 'window') {
         if (frame.clientCrop) crop = windowCropFor(frame.clientCrop, bitmap.width, bitmap.height);
       }

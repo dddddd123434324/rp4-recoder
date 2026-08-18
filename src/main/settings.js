@@ -179,10 +179,17 @@ function normalize(value = {}, { recordingsDirFallback } = {}) {
 }
 
 async function readJson(filePath) {
+  let text;
   try {
-    return { value: JSON.parse(await fs.readFile(filePath, 'utf8')), recovery: null };
+    text = await fs.readFile(filePath, 'utf8');
   } catch (error) {
     if (error?.code === 'ENOENT') return { value: null, recovery: null };
+    throw error;
+  }
+
+  try {
+    return { value: JSON.parse(text), recovery: null };
+  } catch (error) {
 
     const extension = path.extname(filePath);
     const stem = path.basename(filePath, extension);

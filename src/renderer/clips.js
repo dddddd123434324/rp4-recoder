@@ -58,6 +58,7 @@
       videoKeyFrameIntervalDuration: CHUNK_MS
     });
     epoch.recorder = recorder;
+    epoch.mimeType = recorder.mimeType || session.codec.mimeType;
 
     recorder.addEventListener('dataavailable', (event) => {
       if (event.data && event.data.size > 0) {
@@ -146,7 +147,8 @@
       endedAt: usePrevious ? epoch.endedAt : Date.now(),
       initChunk: epoch?.initChunk || null,
       chunks: epoch?.chunks.slice() || [],
-      trimmedForSize: session.trimmedForSize
+      trimmedForSize: session.trimmedForSize,
+      mimeType: epoch?.mimeType || session.codec.mimeType
     };
   }
 
@@ -176,6 +178,13 @@
     }
 
     const profile = RP4.profile.get();
+    const sourceSnapshot = {
+      source: state.selectedSource,
+      mode: state.selectedMode,
+      modeLabel: RP4.app.getModeLabel(state.selectedMode),
+      sourceName: RP4.app.getSourceTitle(state.selectedSource),
+      areaSelection: { ...state.areaSelection }
+    };
     const codec = RP4.capture.pickRecorderMime(profile.format);
     if (!codec) {
       RP4.lifecycle.finish(operationId);
@@ -191,8 +200,12 @@
       RP4.recorder.cleanupPreview();
       capture = await RP4.capture.createCaptureStream({
         audio: profile.systemAudioEnabled,
-        cropArea: state.selectedMode === 'area',
-        includeMic: profile.micEnabled
+        cropArea: sourceSnapshot.mode === 'area',
+        includeMic: profile.micEnabled,
+        profile,
+        source: sourceSnapshot.source,
+        mode: sourceSnapshot.mode,
+        areaSelection: sourceSnapshot.areaSelection
       });
 
       if (!RP4.lifecycle.isCurrent(operationId, 'starting-clip')) {
@@ -210,6 +223,7 @@
         operationId,
         codec,
         profile,
+        sourceSnapshot,
         currentEpoch: null,
         previousEpoch: null,
         startedAt: Date.now(),
@@ -315,11 +329,11 @@
       RP4.ui.setStatus('클립 저장 중', '클릭 시점까지의 최근 장면을 저장하고 있습니다.', 'warn');
 
       const meta = {
-        mode: state.selectedMode,
-        modeLabel: `${RP4.app.getModeLabel(state.selectedMode)} 클립`,
-        sourceName: RP4.app.getSourceTitle(state.selectedSource),
+        mode: session.sourceSnapshot.mode,
+        modeLabel: `${session.sourceSnapshot.modeLabel} 클립`,
+        sourceName: session.sourceSnapshot.sourceName,
         format: profile.format,
-        mimeType: session.codec.mimeType,
+        mimeType: snapshot.mimeType,
         width: session.output.width,
         height: session.output.height,
         fps: profile.fps,
@@ -367,15 +381,22 @@
       }
     } catch (error) {
       console.error(error);
+      let partial = null;
       if (clipSession) {
-        await window.rp4.stopRecording({
+        partial = await window.rp4.stopRecording({
           sessionId: clipSession.sessionId,
           durationMs: 0,
           failureReason: error?.message || '클립 저장 중 오류가 발생했습니다.'
-        }).catch(() => {});
+        }).catch(() => null);
       }
-      RP4.ui.setStatus('클립 저장 실패', '클립 파일 저장을 완료하지 못했습니다.', 'warn');
-      RP4.ui.showToast('클립 파일 저장을 완료하지 못했습니다.');
+      if (partial) {
+        await RP4.files.render();
+        RP4.ui.setStatus('클립 부분 저장됨', partial.name, 'warn');
+        RP4.ui.showToast(`클립 일부만 저장했습니다: ${partial.name}`);
+      } else {
+        RP4.ui.setStatus('클립 저장 실패', '클립 파일 저장을 완료하지 못했습니다.', 'warn');
+        RP4.ui.showToast('클립 파일 저장을 완료하지 못했습니다.');
+      }
     } finally {
       if (!requestReleased && session.pendingSaveRequests > 0) session.pendingSaveRequests -= 1;
       if (session.pendingSaveRequests === 0) session.previousEpoch = null;

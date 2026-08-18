@@ -126,7 +126,7 @@ async function recordChunks(win, { seconds = 5, timeslice = 1000 }) {
         for (let o = 0; o < u8.length; o += CH) s += String.fromCharCode.apply(null, u8.subarray(o, o + CH));
         return btoa(s);
       };
-      return JSON.stringify({ mime: MIME, count: chunks.length, sizes: chunks.map((c) => c.size) });
+      return JSON.stringify({ mime: rec.mimeType || MIME, count: chunks.length, sizes: chunks.map((c) => c.size) });
     })()
   `);
 
@@ -497,6 +497,9 @@ async function run() {
   check('recording index persists metadata across restart',
     Boolean(match) && match.durationMs > 0 && match.width === 1280,
     `duration=${match?.durationMs} ${match?.width}x${match?.height}`);
+  const thumbnail = await revived.thumbnail(saved.filePath);
+  check('recent recording thumbnail is generated',
+    typeof thumbnail === 'string' && thumbnail.startsWith('data:image/jpeg;base64,'));
   const oldFolderMetadata = path.join(`${RECORDINGS}-old`, 'old.mp4');
   recordings.metadata.set(oldFolderMetadata, { durationMs: 1234 });
   await recordings.list();
@@ -518,18 +521,24 @@ async function run() {
     await resolveRecordingMediaFile(RECORDINGS, nestedMedia) === null);
 
   // ---- orphaned temp files are recovered, not lost ------------------------------
-  const orphan = path.join(settings.tempDir, 'crashed_take.mp4');
+  const orphan = path.join(settings.tempDir, `rp4-${crypto.randomUUID()}.part.mp4`);
   await fsp.writeFile(orphan, Buffer.concat([recorded.buffers[0], recorded.buffers[1]]));
   const sweep = await recordings.sweepTempDir();
   check('orphaned temp recording is recovered', sweep.recovered.length === 1,
     sweep.recovered[0] ? path.basename(sweep.recovered[0]) : 'none');
   check('recovered file left the temp folder', !fs.existsSync(orphan));
 
-  const tiny = path.join(settings.tempDir, 'empty_take.mp4');
+  const tiny = path.join(settings.tempDir, `rp4-${crypto.randomUUID()}.part.mp4`);
   await fsp.writeFile(tiny, Buffer.alloc(128));
+  const unrelated = path.join(settings.tempDir, 'another-program.tmp');
+  const unrelatedDir = path.join(settings.tempDir, 'another-program-cache');
+  await fsp.writeFile(unrelated, Buffer.alloc(16));
+  await fsp.mkdir(unrelatedDir);
   const sweep2 = await recordings.sweepTempDir();
   check('worthless temp scraps are cleaned up',
     sweep2.removed === 1 && !fs.existsSync(tiny));
+  check('unrelated temp file is preserved', fs.existsSync(unrelated));
+  check('unrelated temp directory is preserved', fs.existsSync(unrelatedDir));
 
   // ---- screenshots get unique names --------------------------------------------
   const png = Buffer.from(

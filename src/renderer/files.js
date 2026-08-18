@@ -7,6 +7,22 @@
   const { state, els, util } = RP4;
 
   const VIDEO_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="13" rx="1.6"/><path d="M8 21h8M12 18v3"/></svg>';
+  const thumbnailRecordings = new WeakMap();
+  const thumbnailObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      thumbnailObserver.unobserve(entry.target);
+      const recording = thumbnailRecordings.get(entry.target);
+      if (!recording) continue;
+      void window.rp4.getRecordingThumbnail(recording.filePath).then((dataUrl) => {
+        if (!dataUrl || !entry.target.isConnected) return;
+        const image = document.createElement('img');
+        image.src = dataUrl;
+        image.alt = '';
+        image.addEventListener('load', () => entry.target.replaceChildren(image), { once: true });
+      }).catch(() => {});
+    }
+  }, { rootMargin: '96px 0px' });
 
   function actionButton({ text, title, className = '', onClick }) {
     const button = document.createElement('button');
@@ -31,6 +47,8 @@
     const thumb = document.createElement('div');
     thumb.className = 'recording-thumb';
     thumb.innerHTML = VIDEO_ICON;
+    thumbnailRecordings.set(thumb, recording);
+    thumbnailObserver.observe(thumb);
 
     const info = document.createElement('div');
     info.className = 'recording-info';
@@ -47,6 +65,22 @@
       util.formatBytes(recording.size)
     ].filter(Boolean).join(' · ');
     info.append(name, detail);
+
+    const badges = [];
+    if (recording.partial || recording.status === 'partial') badges.push(['부분 저장', 'warn']);
+    if (recording.outcome === 'original-preserved') badges.push(['원본 보존', 'warn']);
+    if (recording.recovered || recording.outcome === 'recovered') badges.push(['복구됨', 'info']);
+    if (badges.length > 0) {
+      const badgeRow = document.createElement('div');
+      badgeRow.className = 'recording-badges';
+      for (const [label, tone] of badges) {
+        const badge = document.createElement('span');
+        badge.className = `recording-badge ${tone}`;
+        badge.textContent = label;
+        badgeRow.append(badge);
+      }
+      info.append(badgeRow);
+    }
 
     const actions = document.createElement('div');
     actions.className = 'recording-actions';
@@ -99,6 +133,9 @@
 
     try {
       const recordings = await window.rp4.listRecordings();
+      for (const thumb of els.recordingList.querySelectorAll('.recording-thumb')) {
+        thumbnailObserver.unobserve(thumb);
+      }
       els.recordingList.replaceChildren();
 
       if (!recordings.length) {
@@ -122,14 +159,20 @@
    * Captures a still from a fresh full-resolution grab of the source, so it works at native
    * resolution and while the app is minimized.
    */
-  async function takeScreenshot() {
+  async function performTakeScreenshot() {
     if (!state.selectedSource) {
       RP4.ui.showToast('먼저 캡처 소스를 선택해 주세요.');
       return;
     }
 
+    const snapshot = {
+      source: state.selectedSource,
+      mode: state.selectedMode,
+      areaSelection: { ...state.areaSelection },
+      hasAreaSelection: state.hasAreaSelection
+    };
     try {
-      const canvas = await RP4.capture.captureStill();
+      const canvas = await RP4.capture.captureStill(snapshot);
       const configuredFormat = state.appSettings.screenshotFormat || 'png';
       const requestedMime = configuredFormat === 'jpeg'
         ? 'image/jpeg'
@@ -157,6 +200,16 @@
       console.error(error);
       RP4.ui.showToast('스크린샷 저장에 실패했습니다.');
     }
+  }
+
+  function takeScreenshot() {
+    if (state.screenshotPromise) return state.screenshotPromise;
+    const promise = performTakeScreenshot();
+    state.screenshotPromise = promise;
+    void promise.finally(() => {
+      if (state.screenshotPromise === promise) state.screenshotPromise = null;
+    });
+    return promise;
   }
 
   RP4.files = { render, takeScreenshot, VIDEO_ICON };

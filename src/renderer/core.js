@@ -16,6 +16,8 @@ window.RP4 = window.RP4 || {};
     selectedSource: null,
     selectedMode: 'screen',
     modalMode: 'screen',
+    modalGeneration: 0,
+    sourceSelectionGeneration: 0,
 
     // Preview
     preview: null,
@@ -41,6 +43,7 @@ window.RP4 = window.RP4 || {};
     clip: null,
     clipSaving: false,
     clipSavePromise: null,
+    screenshotPromise: null,
 
     timerId: null,
     toastTimer: null,

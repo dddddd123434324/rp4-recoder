@@ -119,6 +119,13 @@
     }
 
     const profile = RP4.profile.get();
+    const sourceSnapshot = {
+      source: state.selectedSource,
+      mode: state.selectedMode,
+      modeLabel: RP4.app.getModeLabel(state.selectedMode),
+      sourceName: RP4.app.getSourceTitle(state.selectedSource),
+      areaSelection: { ...state.areaSelection }
+    };
     const codec = RP4.capture.pickRecorderMime(profile.format);
     if (!codec) {
       RP4.lifecycle.finish(operationId);
@@ -137,8 +144,12 @@
 
       capture = await RP4.capture.createCaptureStream({
         audio: profile.systemAudioEnabled,
-        cropArea: state.selectedMode === 'area',
-        includeMic: profile.micEnabled
+        cropArea: sourceSnapshot.mode === 'area',
+        includeMic: profile.micEnabled,
+        profile,
+        source: sourceSnapshot.source,
+        mode: sourceSnapshot.mode,
+        areaSelection: sourceSnapshot.areaSelection
       });
 
       if (!RP4.lifecycle.isCurrent(operationId, 'starting-recording')) {
@@ -155,12 +166,14 @@
         RP4.ui.showToast('이 소스에서는 시스템 오디오를 사용할 수 없어 영상만 녹화합니다.');
       }
 
+      const recorder = new MediaRecorder(capture.stream, recorderOptions(profile, codec.mimeType));
+      const actualMimeType = recorder.mimeType || codec.mimeType;
       session = await window.rp4.startRecording({
-        mode: state.selectedMode,
-        modeLabel: RP4.app.getModeLabel(state.selectedMode),
-        sourceName: RP4.app.getSourceTitle(state.selectedSource),
+        mode: sourceSnapshot.mode,
+        modeLabel: sourceSnapshot.modeLabel,
+        sourceName: sourceSnapshot.sourceName,
         format: profile.format,
-        mimeType: codec.mimeType,
+        mimeType: actualMimeType,
         width: capture.output.width,
         height: capture.output.height,
         fps: profile.fps,
@@ -175,8 +188,6 @@
         return;
       }
 
-      const recorder = new MediaRecorder(capture.stream, recorderOptions(profile, codec.mimeType));
-
       const context = {
         ...capture,
         operationId,
@@ -184,6 +195,8 @@
         sessionId: session.sessionId,
         codec,
         profile,
+        sourceSnapshot,
+        actualMimeType,
         writeQueue: Promise.resolve(),
         queuedBytes: 0,
         failure: null,
@@ -233,7 +246,7 @@
       const label = session.directToTarget
         ? `${profile.format.toUpperCase()}로 직접 저장합니다.`
         : '저장 시 빠른 변환이 필요합니다.';
-      RP4.ui.setStatus('녹화 중', `${RP4.app.getSourceTitle(state.selectedSource)} · ${label}`, 'recording');
+      RP4.ui.setStatus('녹화 중', `${sourceSnapshot.sourceName} · ${label}`, 'recording');
     } catch (error) {
       console.error(error);
       if (session?.sessionId) {

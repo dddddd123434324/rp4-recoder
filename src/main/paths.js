@@ -3,6 +3,7 @@
 const { app } = require('electron/main');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 // Historically every path was hardcoded under D:\RP4, which meant the app could not
 // start at all on a machine without a writable D: drive. We now resolve real OS paths
@@ -12,7 +13,9 @@ const LEGACY_CONFIG_FILE = path.join(LEGACY_ROOT, 'config', 'rp4-recorder-settin
 const LEGACY_RECORDINGS_DIR = path.join(LEGACY_ROOT, 'recordings');
 
 const SETTINGS_FILE_NAME = 'rp4-recorder-settings.json';
-const TEMP_DIR_NAME = '.temp';
+const TEMP_DIR_NAME = '.rp4-recorder-temp';
+const TEMP_OWNER_FILE = '.rp4-owner';
+const TEMP_OWNER_VALUE = 'RP4 Recorder temporary files v1\n';
 const SCREENSHOTS_DIR_NAME = 'screenshots';
 
 function configDir() {
@@ -58,15 +61,61 @@ async function pathExists(target) {
  * the first recording.
  */
 async function isDirectoryWritable(target) {
+  let probe = null;
+  let handle = null;
   try {
     await fs.mkdir(target, { recursive: true });
-    const probe = path.join(target, `.rp4-write-probe-${process.pid}`);
-    await fs.writeFile(probe, 'ok', 'utf8');
+    probe = path.join(target, `.rp4-write-probe-${crypto.randomUUID()}`);
+    handle = await fs.open(probe, 'wx');
+    await handle.writeFile('ok', 'utf8');
+    await handle.close();
+    handle = null;
     await fs.rm(probe, { force: true });
     return true;
   } catch {
+    await handle?.close().catch(() => {});
+    if (probe) await fs.rm(probe, { force: true }).catch(() => {});
     return false;
   }
+}
+
+async function ensureOwnedTempDir(recordingsDir) {
+  const root = path.resolve(recordingsDir);
+  const tempDir = tempDirFor(root);
+  await fs.mkdir(root, { recursive: true });
+
+  let created = false;
+  try {
+    await fs.mkdir(tempDir);
+    created = true;
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+  }
+
+  const stats = await fs.lstat(tempDir);
+  if (!stats.isDirectory() || stats.isSymbolicLink()) {
+    throw new Error('임시 녹화 경로가 안전한 폴더가 아닙니다.');
+  }
+  const [realRoot, realTemp] = await Promise.all([fs.realpath(root), fs.realpath(tempDir)]);
+  if (path.dirname(realTemp).toLowerCase() !== realRoot.toLowerCase()
+    || path.basename(realTemp).toLowerCase() !== TEMP_DIR_NAME.toLowerCase()) {
+    throw new Error('임시 녹화 경로가 저장 폴더를 벗어났습니다.');
+  }
+
+  const ownerPath = path.join(realTemp, TEMP_OWNER_FILE);
+  if (created) {
+    await fs.writeFile(ownerPath, TEMP_OWNER_VALUE, { encoding: 'utf8', flag: 'wx' });
+  } else {
+    const ownerStats = await fs.lstat(ownerPath).catch(() => null);
+    if (!ownerStats?.isFile() || ownerStats.isSymbolicLink()) {
+      throw new Error('앱 소유 표시가 없는 임시 폴더는 사용하지 않습니다.');
+    }
+    const owner = await fs.readFile(ownerPath, 'utf8');
+    if (owner !== TEMP_OWNER_VALUE) {
+      throw new Error('임시 폴더의 앱 소유 표시가 올바르지 않습니다.');
+    }
+  }
+  return realTemp;
 }
 
 /**
@@ -176,7 +225,7 @@ async function resolveRecordingsDir(configuredDir) {
 async function ensureRecordingDirs(recordingsDir) {
   await fs.mkdir(configDir(), { recursive: true });
   await fs.mkdir(recordingsDir, { recursive: true });
-  await fs.mkdir(tempDirFor(recordingsDir), { recursive: true });
+  await ensureOwnedTempDir(recordingsDir);
   await fs.mkdir(screenshotsDirFor(recordingsDir), { recursive: true });
 }
 
@@ -184,6 +233,7 @@ module.exports = {
   LEGACY_ROOT,
   LEGACY_RECORDINGS_DIR,
   TEMP_DIR_NAME,
+  TEMP_OWNER_FILE,
   SCREENSHOTS_DIR_NAME,
   configDir,
   settingsFile,
@@ -193,6 +243,7 @@ module.exports = {
   screenshotsDirFor,
   pathExists,
   isDirectoryWritable,
+  ensureOwnedTempDir,
   isPlausibleRecordingsDir,
   normalizeRecordingsDir,
   isInside,

@@ -130,10 +130,23 @@ async function validateMedia(inputPath) {
   await run([
     '-v', 'error',
     '-i', inputPath,
-    '-map', '0:v:0',
+    '-map', '0',
     '-c', 'copy',
     '-f', 'null',
     '-'
+  ]);
+}
+
+async function createThumbnail(inputPath, outputPath) {
+  await fs.rm(outputPath, { force: true });
+  await run([
+    '-y',
+    '-ss', '0.2',
+    '-i', inputPath,
+    '-frames:v', '1',
+    '-vf', 'scale=112:64:force_original_aspect_ratio=decrease,pad=112:64:(ow-iw)/2:(oh-ih)/2',
+    '-q:v', '4',
+    outputPath
   ]);
 }
 
@@ -287,6 +300,7 @@ module.exports = {
   cancelAll,
   hasActiveJobs,
   validateMedia,
+  createThumbnail,
   remux,
   remuxH264ToMp4,
   trimRecent,

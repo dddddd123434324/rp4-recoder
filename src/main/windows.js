@@ -72,13 +72,26 @@ function createMainWindow({ isSmoke, onQuitRequested }) {
     void onQuitRequested(win);
   });
 
-  void win.loadFile(path.join(SRC_DIR, 'index.html'));
+  void win.loadFile(path.join(SRC_DIR, 'index.html')).catch(async (error) => {
+    if (!isSmoke && !win.isDestroyed()) {
+      await dialog.showMessageBox(win, {
+        type: 'error',
+        title: 'RP4 Recorder',
+        message: '프로그램 화면을 불러오지 못했습니다.',
+        detail: error?.message || String(error)
+      }).catch(() => {});
+    }
+    if (!win.isDestroyed()) {
+      win.rp4AllowClose = true;
+      win.destroy();
+    }
+  });
   return win;
 }
 
 /**
  * Asks the renderer to flush and finalize any in-flight recording, then waits for the
- * sessions to drain. Closing the window used to abandon the take in `.temp`, where it was
+ * sessions to drain. Closing the window used to abandon the take in the temporary folder, where it was
  * invisible to the user.
  */
 async function drainRecordings(win, recordingManager, { timeoutMs = 20000 } = {}) {
@@ -216,7 +229,7 @@ function selectDesktopArea({ isSmoke } = {}) {
     ipcMain.on('area-selector:cancel', onCancel);
     win.on('closed', () => finish(null));
 
-    void win.loadFile(path.join(SRC_DIR, 'area-selector.html'));
+    void win.loadFile(path.join(SRC_DIR, 'area-selector.html')).catch(() => finish(null));
     win.once('ready-to-show', () => {
       win.setBounds(bounds, false);
       win.show();

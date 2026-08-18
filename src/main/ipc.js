@@ -21,6 +21,7 @@ const windows = require('./windows');
 const { parseWindowHandle } = require('./window-crop');
 
 const MEDIA_FILE_PATTERN = /\.(mp4|webm|mkv)$/i;
+const MAX_SCREENSHOT_BYTES = 256 * 1024 * 1024;
 
 function isTopLevelWindowSender(event) {
   if (!event?.sender || event.sender.isDestroyed()) return false;
@@ -186,8 +187,12 @@ function registerIpcHandlers(context) {
       throw new Error('스크린샷 원본 프레임을 가져올 수 없습니다.');
     }
     const size = source.thumbnail.getSize();
+    const buffer = source.thumbnail.toPNG();
+    if (buffer.length > MAX_SCREENSHOT_BYTES) {
+      throw new Error('원본 스크린샷이 안전한 전송 한도(256MB)를 초과했습니다.');
+    }
     return {
-      buffer: source.thumbnail.toPNG(),
+      buffer,
       width: size.width,
       height: size.height,
       clientCrop
@@ -195,6 +200,13 @@ function registerIpcHandlers(context) {
   });
 
   ipcMain.handle('recordings:list', async () => recordings.list());
+
+  ipcMain.handle('recording:thumbnail', async (event, filePath) => {
+    if (!isTopLevelWindowSender(event)) return null;
+    const target = await resolveRecordingMediaFile(settings.recordingsDir, filePath);
+    if (!target) return null;
+    return recordings.thumbnail(target).catch(() => null);
+  });
 
   ipcMain.handle('recording:start', async (event, meta = {}) => {
     if (folderDialogActive) {

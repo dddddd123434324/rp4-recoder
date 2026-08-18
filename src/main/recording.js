@@ -17,10 +17,15 @@ const MIN_FREE_BYTES_TO_START = 512 * 1024 * 1024;
 const MIN_FREE_BYTES_TO_CONTINUE = 128 * 1024 * 1024;
 const MIN_RECOVERABLE_RECORDING_BYTES = 512;
 const MAX_IPC_CHUNK_BYTES = 64 * 1024 * 1024;
+const MAX_SCREENSHOT_BYTES = 256 * 1024 * 1024;
 const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 const OPTIMIZING_FILE_PATTERN = /^(.*\.mp4)\.optimizing\.mp4$/i;
 const BACKUP_FILE_PATTERN = new RegExp(
   `^(.*\\.(?:mp4|webm|mkv))\\.backup-${UUID_PATTERN}$`,
+  'i'
+);
+const TEMP_RECORDING_PATTERN = new RegExp(
+  `^rp4-(${UUID_PATTERN})\\.part\\.(mp4|webm|mkv)$`,
   'i'
 );
 
@@ -209,6 +214,8 @@ class RecordingManager {
     this.optimizationCancelled = false;
     this.indexChain = Promise.resolve();
     this.indexDirty = false;
+    this.thumbnailQueue = Promise.resolve();
+    this.thumbnailInflight = new Map();
     this.moveFile = move;
   }
 
@@ -234,8 +241,16 @@ class RecordingManager {
    * single index file rather than a sidecar per recording.
    */
   async loadIndex() {
+    let text;
     try {
-      const raw = JSON.parse(await fs.readFile(this.indexFile(), 'utf8'));
+      text = await fs.readFile(this.indexFile(), 'utf8');
+    } catch (error) {
+      if (error?.code === 'ENOENT') return { recovered: false, backupPath: null };
+      throw error;
+    }
+
+    try {
+      const raw = JSON.parse(text);
       if (!raw || typeof raw !== 'object' || !Array.isArray(raw.entries)) {
         throw new SyntaxError('녹화 인덱스 형식이 올바르지 않습니다.');
       }
@@ -245,8 +260,7 @@ class RecordingManager {
         }
       }
       return { recovered: false, backupPath: null };
-    } catch (error) {
-      if (error?.code === 'ENOENT') return { recovered: false, backupPath: null };
+    } catch {
       const source = this.indexFile();
       const backup = path.join(
         path.dirname(source),
@@ -298,11 +312,16 @@ class RecordingManager {
   }
 
   /**
-   * Removes leftovers from `.temp`. A crash or a force-quit during recording used to
+   * Recovers app-owned leftovers from the marked temporary directory. A crash or a force-quit used to
    * strand partial files there forever, invisible to the user.
    */
   async sweepTempDir({ maxAgeMs = 0 } = {}) {
-    const tempDir = this.settings.tempDir;
+    let tempDir;
+    try {
+      tempDir = await paths.ensureOwnedTempDir(this.settings.recordingsDir);
+    } catch (error) {
+      return { removed: 0, recovered: [], failed: [{ filePath: this.settings.tempDir, error: error.message }] };
+    }
     let entries;
     try {
       entries = await fs.readdir(tempDir, { withFileTypes: true });
@@ -316,14 +335,13 @@ class RecordingManager {
     let removed = 0;
 
     for (const entry of entries) {
+      const match = TEMP_RECORDING_PATTERN.exec(entry.name);
+      if (!match || !entry.isFile()) continue;
       const fullPath = path.join(tempDir, entry.name);
       if (activeTempPaths.has(fullPath)) continue;
 
-      if (entry.isDirectory()) {
-        await fs.rm(fullPath, { recursive: true, force: true });
-        removed += 1;
-        continue;
-      }
+      const itemStats = await fs.lstat(fullPath).catch(() => null);
+      if (!itemStats?.isFile() || itemStats.isSymbolicLink()) continue;
 
       const stats = await statFile(fullPath);
       if (!stats) continue;
@@ -331,12 +349,19 @@ class RecordingManager {
 
       // Anything with real content is salvaged into the recordings folder instead of
       // being deleted, so an interrupted take is never silently thrown away.
-      if (stats.size > MIN_RECOVERABLE_RECORDING_BYTES && RECORDING_EXTENSIONS.test(entry.name)) {
-        const extension = path.extname(entry.name).slice(1).toLowerCase();
-        const baseName = `${path.basename(entry.name, path.extname(entry.name))}_recovered`;
+      if (stats.size > MIN_RECOVERABLE_RECORDING_BYTES) {
+        const extension = match[2].toLowerCase();
+        const baseName = `${timestamp()}_recovered_${match[1].slice(0, 8)}`;
         const target = await uniquePath(this.settings.recordingsDir, baseName, extension);
         try {
           await this.moveFile(fullPath, target);
+          await this.setMetadata(target, {
+            status: 'complete',
+            outcome: 'recovered',
+            recovered: true,
+            recoveredAt: new Date().toISOString(),
+            bytes: stats.size
+          });
           recovered.push(target);
           continue;
         } catch (error) {
@@ -378,8 +403,9 @@ class RecordingManager {
       sessionId.slice(0, 8)
     ].join('_');
 
-    const tempPath = path.join(this.settings.tempDir, `${baseName}_${sessionId.slice(0, 8)}.${recordedContainer}`);
-    const handle = await fs.open(tempPath, 'w');
+    const tempDir = await paths.ensureOwnedTempDir(recordingsDir);
+    const tempPath = path.join(tempDir, `rp4-${sessionId}.part.${recordedContainer}`);
+    const handle = await fs.open(tempPath, 'wx');
 
     this.sessions.set(sessionId, {
       handle,
@@ -748,20 +774,28 @@ class RecordingManager {
       const original = path.join(recordingsDir, originalName);
 
       try {
-        if (await paths.pathExists(original)) {
+        const artifactStats = await statFile(fullPath);
+        let artifactValid = false;
+        if (artifactStats && artifactStats.size > MIN_RECOVERABLE_RECORDING_BYTES) {
+          artifactValid = await ffmpeg.validateMedia(fullPath).then(() => true, () => false);
+        }
+        const originalExists = await paths.pathExists(original);
+        const originalValid = originalExists
+          ? await ffmpeg.validateMedia(original).then(() => true, () => false)
+          : false;
+
+        if (originalValid) {
           await fs.rm(fullPath, { force: true });
           result.removed += 1;
-          continue;
-        }
-
-        const stats = await statFile(fullPath);
-        if (stats && stats.size > MIN_RECOVERABLE_RECORDING_BYTES) {
-          await ffmpeg.validateMedia(fullPath);
+        } else if (artifactValid) {
+          if (originalExists) {
+            const corrupt = `${original}.corrupt-${crypto.randomUUID()}`;
+            await this.moveFile(original, corrupt);
+          }
           await this.moveFile(fullPath, original);
           result.restored += 1;
         } else {
-          await fs.rm(fullPath, { force: true });
-          result.removed += 1;
+          result.failed.push({ filePath: fullPath, error: '원본과 복구 파일을 모두 검증하지 못해 보존했습니다.' });
         }
       } catch (error) {
         result.failed.push({ filePath: fullPath, error: error?.message || String(error) });
@@ -849,7 +883,13 @@ class RecordingManager {
       bitrateMbps: meta.bitrateMbps || null,
       sourceName: meta.sourceName || null,
       modeLabel: meta.modeLabel || null,
-      format: meta.format || path.extname(filePath).slice(1).toLowerCase()
+      format: meta.format || path.extname(filePath).slice(1).toLowerCase(),
+      status: meta.status || 'complete',
+      partial: Boolean(meta.partial),
+      failureReason: meta.failureReason || null,
+      outcome: meta.outcome || 'exact',
+      conversionError: meta.conversionError || null,
+      recovered: Boolean(meta.recovered)
     };
   }
 
@@ -892,6 +932,34 @@ class RecordingManager {
     return recordings.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   }
 
+  async thumbnail(filePath) {
+    const stats = await statFile(filePath);
+    if (!stats?.isFile()) return null;
+    const cacheDir = path.join(paths.configDir(), 'recording-thumbnails');
+    const key = crypto.createHash('sha256')
+      .update(`${filePath}\0${stats.size}\0${stats.mtimeMs}`)
+      .digest('hex');
+    const output = path.join(cacheDir, `rp4-thumb-${key}.jpg`);
+    await fs.mkdir(cacheDir, { recursive: true });
+    if (this.thumbnailInflight.has(key)) return this.thumbnailInflight.get(key);
+
+    const task = this.thumbnailQueue.then(async () => {
+      if (!(await paths.pathExists(output))) {
+        await ffmpeg.createThumbnail(filePath, output);
+      }
+      const buffer = await fs.readFile(output);
+      if (buffer.length === 0 || buffer.length > 2 * 1024 * 1024) return null;
+      return `data:image/jpeg;base64,${buffer.toString('base64')}`;
+    });
+    this.thumbnailInflight.set(key, task);
+    this.thumbnailQueue = task.catch(() => {});
+    try {
+      return await task;
+    } finally {
+      this.thumbnailInflight.delete(key);
+    }
+  }
+
   /** Moves a completed top-level recording to the OS recycle bin and prunes its metadata. */
   async trashRecording(filePath, { trash } = {}) {
     if (typeof filePath !== 'string' || typeof trash !== 'function') return false;
@@ -932,8 +1000,8 @@ class RecordingManager {
     if (buffer.length === 0) {
       throw new Error('저장할 스크린샷 데이터가 없습니다.');
     }
-    if (buffer.length > MAX_IPC_CHUNK_BYTES) {
-      throw new Error('스크린샷 데이터는 64MB를 초과할 수 없습니다.');
+    if (buffer.length > MAX_SCREENSHOT_BYTES) {
+      throw new Error('스크린샷 데이터는 256MB를 초과할 수 없습니다.');
     }
 
     let format = null;
@@ -1020,5 +1088,6 @@ module.exports = {
   moveFile,
   replaceFileSafely,
   writeUniqueFile,
-  MAX_IPC_CHUNK_BYTES
+  MAX_IPC_CHUNK_BYTES,
+  MAX_SCREENSHOT_BYTES
 };

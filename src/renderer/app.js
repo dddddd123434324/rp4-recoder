@@ -8,10 +8,6 @@
 
   function cacheElements() {
     Object.assign(els, {
-      statusTitle: RP4.$('#statusTitle'),
-      statusText: RP4.$('#statusText'),
-      statusDot: RP4.$('.status-dot'),
-
       previewStage: RP4.$('#previewStage'),
       previewVideo: RP4.$('#previewVideo'),
       previewPlaceholder: RP4.$('#previewPlaceholder'),
@@ -392,10 +388,12 @@
       RP4.ui.setStatus('소스 없음', '캡처 가능한 화면을 찾지 못했습니다.', 'warn');
       return;
     }
-    await chooseSource(primary, 'screen');
+    await chooseSource(primary, 'screen', { allowBusy: true });
   }
 
-  async function chooseSource(source, mode = state.selectedMode) {
+  async function chooseSource(source, mode = state.selectedMode, { generation = null, allowBusy = false } = {}) {
+    if ((generation != null && generation !== state.sourceSelectionGeneration)
+      || (!allowBusy && RP4.lifecycle.isBusy())) return false;
     state.selectedSource = source;
     state.selectedMode = mode;
     if (mode !== 'area') state.hasAreaSelection = false;
@@ -404,6 +402,7 @@
     if (!RP4.lifecycle.isBusy()) {
       await RP4.recorder.startPreview();
     }
+    return true;
   }
 
   async function setMode(mode) {
@@ -412,23 +411,26 @@
       return;
     }
 
+    const generation = ++state.sourceSelectionGeneration;
+
     if (mode === 'area') {
-      await chooseDesktopArea();
+      await chooseDesktopArea(generation);
       return;
     }
 
     if (mode === 'screen') {
       await refreshSources();
+      if (generation !== state.sourceSelectionGeneration || RP4.lifecycle.isBusy()) return;
       const screens = getScreenSources();
       const source = screens.find((item) => item.display?.primary) || screens[0];
-      if (source) await chooseSource(source, mode);
+      if (source) await chooseSource(source, mode, { generation });
       return;
     }
 
-    await openSourceModal(mode);
+    await openSourceModal(mode, generation);
   }
 
-  async function chooseDesktopArea() {
+  async function chooseDesktopArea(generation) {
     const previousMode = state.selectedMode;
     setActiveMode('area');
     RP4.ui.setStatus('영역 선택', '실제 화면에서 녹화할 영역을 드래그하세요.', 'warn');
@@ -441,6 +443,8 @@
       RP4.ui.showToast('영역 선택 화면을 열지 못했습니다.');
     }
 
+    if (generation !== state.sourceSelectionGeneration || RP4.lifecycle.isBusy()) return;
+
     if (!result?.selection) {
       setActiveMode(previousMode);
       RP4.ui.setStatus('준비 완료', '녹화 준비가\n완료되었습니다.', 'ready');
@@ -448,6 +452,7 @@
     }
 
     await refreshSources();
+    if (generation !== state.sourceSelectionGeneration || RP4.lifecycle.isBusy()) return;
     const screens = getScreenSources();
     const source = screens.find((item) => String(item.displayId) === String(result.displayId))
       || screens.find((item) => item.display?.primary)
@@ -462,7 +467,7 @@
 
     state.areaSelection = result.selection;
     state.hasAreaSelection = true;
-    await chooseSource(source, 'area');
+    await chooseSource(source, 'area', { generation });
 
     const size = result.absolute;
     RP4.ui.showToast(`영역을 지정했습니다: ${size.width} x ${size.height}`);
@@ -506,14 +511,16 @@
     }
   }
 
-  async function openSourceModal(mode) {
+  async function openSourceModal(mode, generation = ++state.sourceSelectionGeneration) {
     if (RP4.lifecycle.isBusy()) {
       RP4.ui.showToast('녹화 중에는 소스를 바꿀 수 없습니다.');
       return;
     }
 
     state.modalMode = mode;
+    state.modalGeneration = generation;
     await refreshSources();
+    if (generation !== state.sourceSelectionGeneration || RP4.lifecycle.isBusy()) return;
 
     els.sourceModalTitle.textContent = mode === 'window'
       ? '창 선택'
@@ -666,8 +673,10 @@
       if (!card) return;
       const source = state.sources.find((item) => item.id === card.dataset.sourceId);
       if (!source) return;
+      const generation = state.modalGeneration;
+      if (generation !== state.sourceSelectionGeneration || RP4.lifecycle.isBusy()) return;
       closeSourceModal();
-      await chooseSource(source, state.modalMode);
+      await chooseSource(source, state.modalMode, { generation });
     });
 
     // Only resolution and frame rate change the capture itself. Bitrate, container and

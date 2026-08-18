@@ -1441,9 +1441,12 @@ svg {
 }
 
 .file-panel .recording-item {
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 5px;
-  min-height: 42px;
+  grid-template-columns: 56px minmax(0, 1fr);
+  grid-template-areas:
+    "thumb info"
+    "thumb actions";
+  gap: 3px 7px;
+  min-height: 52px;
   padding: 5px 2px;
   border: 0;
   border-bottom: 1px solid #20242a;
@@ -1456,7 +1459,26 @@ svg {
 }
 
 .file-panel .recording-thumb {
-  display: none;
+  grid-area: thumb;
+  display: grid;
+  width: 56px;
+  height: 32px;
+  align-self: center;
+}
+
+.file-panel .recording-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.file-panel .recording-thumb svg {
+  width: 17px;
+  height: 17px;
+}
+
+.file-panel .recording-info {
+  grid-area: info;
 }
 
 .file-panel .recording-info strong {
@@ -1469,9 +1491,35 @@ svg {
 }
 
 .file-panel .recording-actions {
+  grid-area: actions;
   flex-direction: row;
   align-items: center;
   gap: 2px;
+  justify-content: flex-end;
+}
+
+.recording-badges {
+  display: flex;
+  gap: 3px;
+  margin-top: 3px;
+}
+
+.recording-badge {
+  padding: 1px 4px;
+  border: 1px solid #59606b;
+  color: #cbd1da;
+  font-size: 8px;
+  line-height: 1.2;
+}
+
+.recording-badge.warn {
+  border-color: #a77131;
+  color: #ffd28a;
+}
+
+.recording-badge.info {
+  border-color: #4b7a9b;
+  color: #a9ddff;
 }
 
 .file-panel .recording-actions button {
@@ -1487,10 +1535,6 @@ svg {
   border-color: rgba(255, 74, 55, 0.9);
   background: rgba(255, 45, 10, 0.16);
   color: #ff8f7c;
-}
-
-.ready-card {
-  flex: 0 0 auto;
 }
 
 /* ------------------------------------------------------------------------- */
