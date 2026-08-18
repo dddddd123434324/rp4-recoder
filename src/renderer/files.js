@@ -212,5 +212,9 @@
     return promise;
   }
 
-  RP4.files = { render, takeScreenshot, VIDEO_ICON };
+  async function finalizeForShutdown() {
+    await state.screenshotPromise?.catch(() => {});
+  }
+
+  RP4.files = { render, takeScreenshot, finalizeForShutdown, VIDEO_ICON };
 }(window.RP4));

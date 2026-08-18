@@ -1438,6 +1438,8 @@ svg {
   overscroll-behavior: contain;
   scrollbar-gutter: auto;
   padding-right: 0;
+  align-content: start;
+  grid-auto-rows: max-content;
 }
 
 .file-panel .recording-item {
@@ -1447,6 +1449,8 @@ svg {
     "thumb actions";
   gap: 3px 7px;
   min-height: 52px;
+  height: max-content;
+  align-self: start;
   padding: 5px 2px;
   border: 0;
   border-bottom: 1px solid #20242a;

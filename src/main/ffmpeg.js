@@ -52,11 +52,14 @@ function run(args, { onProgress, totalDurationMs = 0, jobId } = {}) {
     });
 
     let cancelled = false;
+    let resolveClosed;
+    const closed = new Promise((done) => { resolveClosed = done; });
     activeJobs.set(id, {
       cancel: () => {
         cancelled = true;
         child.kill('SIGKILL');
-      }
+      },
+      closed
     });
 
     let stderr = '';
@@ -87,11 +90,13 @@ function run(args, { onProgress, totalDurationMs = 0, jobId } = {}) {
 
     child.on('error', (error) => {
       activeJobs.delete(id);
+      resolveClosed();
       reject(error);
     });
 
     child.on('close', (code) => {
       activeJobs.delete(id);
+      resolveClosed();
       if (cancelled) {
         const error = new Error('작업이 취소되었습니다.');
         error.code = 'CANCELLED';
@@ -110,15 +115,17 @@ function run(args, { onProgress, totalDurationMs = 0, jobId } = {}) {
 
 function cancel(jobId) {
   const job = activeJobs.get(jobId);
-  if (!job) return false;
+  if (!job) return Promise.resolve(false);
   job.cancel();
-  return true;
+  return job.closed.then(() => true);
 }
 
-function cancelAll() {
-  for (const job of activeJobs.values()) {
+async function cancelAll() {
+  const jobs = [...activeJobs.values()];
+  for (const job of jobs) {
     job.cancel();
   }
+  await Promise.allSettled(jobs.map((job) => job.closed));
 }
 
 function hasActiveJobs() {
@@ -138,16 +145,24 @@ async function validateMedia(inputPath) {
 }
 
 async function createThumbnail(inputPath, outputPath) {
-  await fs.rm(outputPath, { force: true });
-  await run([
-    '-y',
-    '-ss', '0.2',
-    '-i', inputPath,
-    '-frames:v', '1',
+  const extract = (seek) => run([
+    '-y', '-ss', seek, '-i', inputPath, '-frames:v', '1',
     '-vf', 'scale=112:64:force_original_aspect_ratio=decrease,pad=112:64:(ow-iw)/2:(oh-ih)/2',
-    '-q:v', '4',
-    outputPath
+    '-q:v', '4', outputPath
   ]);
+  await fs.rm(outputPath, { force: true });
+  try {
+    await extract('0.2');
+  } catch (firstError) {
+    await fs.rm(outputPath, { force: true });
+    if (firstError?.code === 'CANCELLED') throw firstError;
+    try {
+      await extract('0');
+    } catch (error) {
+      await fs.rm(outputPath, { force: true });
+      throw error;
+    }
+  }
 }
 
 /**

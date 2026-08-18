@@ -786,6 +786,7 @@
       await Promise.allSettled([
         RP4.recorder.finalizeForShutdown(),
         RP4.clips.finalizeForShutdown(),
+        RP4.files.finalizeForShutdown(),
         RP4.profile.flushSave()
       ]);
       window.rp4.reportFinalizeComplete(requestId);

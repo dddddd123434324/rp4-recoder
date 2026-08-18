@@ -28,10 +28,6 @@
     return result;
   }
 
-  function resolveFlush(epoch) {
-    epoch?.pendingFlush?.resolve();
-  }
-
   function failClipSession(session, error) {
     if (!session || session.failure || session.stopping) return;
     session.failure = error?.message || String(error || 'MediaRecorder가 중단되었습니다.');
@@ -47,8 +43,7 @@
       initChunk: null,
       chunks: [],
       startedAt: Date.now(),
-      endedAt: null,
-      pendingFlush: null
+      endedAt: null
     };
     const profile = session.profile;
     const recorder = new MediaRecorder(session.stream, {
@@ -66,7 +61,6 @@
         else epoch.chunks.push({ blob: event.data, at: Date.now() });
         if (session.currentEpoch === epoch) pruneBuffer(session);
       }
-      resolveFlush(epoch);
     });
     recorder.addEventListener('error', (event) => {
       failClipSession(session, event.error || new Error('MediaRecorder가 클립 녹화 중 실패했습니다.'));
@@ -112,34 +106,19 @@
     if (session.pendingSaveRequests === 0) session.previousEpoch = null;
   }
 
-  async function flushEpoch(epoch) {
-    if (!epoch || epoch.recorder.state !== 'recording') return;
-    await new Promise((resolve) => {
-      let settled = false;
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        epoch.pendingFlush = null;
-        resolve();
-      };
-      epoch.pendingFlush = { resolve: finish };
-      try {
-        epoch.recorder.requestData();
-      } catch {
-        finish();
-        return;
-      }
-      window.setTimeout(finish, 1500);
-    });
-  }
-
   async function captureSnapshot(session, requestedAt) {
     const previous = session.previousEpoch;
     const usePrevious = previous
       && requestedAt >= previous.startedAt
       && requestedAt <= (previous.endedAt || requestedAt);
     const epoch = usePrevious ? previous : session.currentEpoch;
-    if (!usePrevious) await flushEpoch(epoch);
+    if (!usePrevious) {
+      // Stopping establishes an unambiguous boundary: MediaRecorder emits its final
+      // dataavailable before stop, so a pending periodic event cannot complete the
+      // snapshot early and drop the last second.
+      await stopEpoch(epoch);
+      if (state.clip === session && !session.stopping) startEpoch(session);
+    }
 
     return {
       requestedAt,

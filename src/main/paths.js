@@ -104,7 +104,14 @@ async function ensureOwnedTempDir(recordingsDir) {
 
   const ownerPath = path.join(realTemp, TEMP_OWNER_FILE);
   if (created) {
-    await fs.writeFile(ownerPath, TEMP_OWNER_VALUE, { encoding: 'utf8', flag: 'wx' });
+    try {
+      await fs.writeFile(ownerPath, TEMP_OWNER_VALUE, { encoding: 'utf8', flag: 'wx' });
+    } catch (error) {
+      // Remove only the directory this call just created, and only when it is still empty.
+      // Never recurse here: another process may have placed a file in it meanwhile.
+      await fs.rmdir(realTemp).catch(() => {});
+      throw error;
+    }
   } else {
     const ownerStats = await fs.lstat(ownerPath).catch(() => null);
     if (!ownerStats?.isFile() || ownerStats.isSymbolicLink()) {
@@ -116,6 +123,21 @@ async function ensureOwnedTempDir(recordingsDir) {
     }
   }
   return realTemp;
+}
+
+async function ensureSafeChildDirectory(recordingsDir, childName) {
+  const root = path.resolve(recordingsDir);
+  const child = path.join(root, childName);
+  await fs.mkdir(child, { recursive: true });
+  const stats = await fs.lstat(child);
+  if (!stats.isDirectory() || stats.isSymbolicLink()) {
+    throw new Error(`${childName} 경로가 안전한 폴더가 아닙니다.`);
+  }
+  const [realRoot, realChild] = await Promise.all([fs.realpath(root), fs.realpath(child)]);
+  if (path.dirname(realChild).toLowerCase() !== realRoot.toLowerCase()) {
+    throw new Error(`${childName} 경로가 저장 폴더를 벗어났습니다.`);
+  }
+  return realChild;
 }
 
 /**
@@ -198,6 +220,11 @@ async function resolveRecordingsDir(configuredDir) {
 
   for (const candidate of [...new Set(candidates)]) {
     if (await isDirectoryWritable(candidate)) {
+      try {
+        await ensureRecordingDirs(candidate);
+      } catch {
+        continue;
+      }
       const fallbackReason = requestedDir == null
         ? null
         : !requestedValid
@@ -226,7 +253,7 @@ async function ensureRecordingDirs(recordingsDir) {
   await fs.mkdir(configDir(), { recursive: true });
   await fs.mkdir(recordingsDir, { recursive: true });
   await ensureOwnedTempDir(recordingsDir);
-  await fs.mkdir(screenshotsDirFor(recordingsDir), { recursive: true });
+  await ensureSafeChildDirectory(recordingsDir, SCREENSHOTS_DIR_NAME);
 }
 
 module.exports = {
@@ -244,6 +271,7 @@ module.exports = {
   pathExists,
   isDirectoryWritable,
   ensureOwnedTempDir,
+  ensureSafeChildDirectory,
   isPlausibleRecordingsDir,
   normalizeRecordingsDir,
   isInside,

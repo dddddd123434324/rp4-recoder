@@ -144,7 +144,7 @@ async function recordChunks(win, { seconds = 5, timeslice = 1000 }) {
 async function run() {
   const paths = require('../src/main/paths');
   const { SettingsStore } = require('../src/main/settings');
-  const { RecordingManager } = require('../src/main/recording');
+  const { RecordingManager, toBoundedBuffer } = require('../src/main/recording');
 
   // ---- settings + path handling -------------------------------------------------
   const settings = new SettingsStore();
@@ -191,6 +191,36 @@ async function run() {
     paths.isInside(RECORDINGS, path.join(RECORDINGS, 'a', 'b.mp4')) === true);
   check('path containment blocks traversal',
     paths.isInside(RECORDINGS, path.join(RECORDINGS, '..', 'secret.mp4')) === false);
+  check('bounded binary validation accepts typed arrays',
+    toBoundedBuffer(new Uint8Array([1, 2]), 2).length === 2);
+  let oversizedBinaryRejected = false;
+  try {
+    toBoundedBuffer(new Uint8Array([1, 2, 3]), 2);
+  } catch {
+    oversizedBinaryRejected = true;
+  }
+  check('bounded binary validation rejects before copying', oversizedBinaryRejected);
+
+  for (const conflict of ['foreign-temp', 'temp-file', 'screenshots-file']) {
+    const root = path.join(SANDBOX, conflict);
+    await fsp.mkdir(root, { recursive: true });
+    if (conflict === 'foreign-temp') {
+      await fsp.mkdir(path.join(root, paths.TEMP_DIR_NAME));
+    } else if (conflict === 'temp-file') {
+      await fsp.writeFile(path.join(root, paths.TEMP_DIR_NAME), 'not a directory');
+    } else {
+      await fsp.writeFile(path.join(root, paths.SCREENSHOTS_DIR_NAME), 'not a directory');
+    }
+    let rejected = false;
+    try {
+      await paths.ensureRecordingDirs(root);
+    } catch {
+      rejected = true;
+    }
+    check(`${conflict} recording folder conflict is rejected`, rejected);
+    check(`${conflict} failure does not change saved recording path`,
+      settings.recordingsDir === RECORDINGS);
+  }
 
   const displayPayload = require('../src/main/displays').getDisplayPayload();
   const horizontalPair = displayPayload.displays
@@ -323,6 +353,13 @@ async function run() {
     ownershipEnforced = true;
   }
   check('session rejects writes from another renderer', ownershipEnforced);
+  let duplicateSessionRejected = false;
+  try {
+    await recordings.start(meta, { webContentsId: win.webContents.id });
+  } catch {
+    duplicateSessionRejected = true;
+  }
+  check('renderer cannot exhaust handles with duplicate sessions', duplicateSessionRejected);
 
   const stopStarted = Date.now();
   const saved = await recordings.stop({ sessionId: session.sessionId, durationMs: 5000 });
@@ -488,6 +525,12 @@ async function run() {
   check('ordinary backup-like recording name is preserved', fs.existsSync(userBackupName));
   check('only UUID-suffixed optimization backup is restored',
     reconciliation.restored === 1 && fs.existsSync(restoredTarget) && !fs.existsSync(trueBackup));
+  const ordinaryOptimizingName = path.join(RECORDINGS, 'user-video.mp4.optimizing.mp4');
+  await fsp.copyFile(saved.filePath, ordinaryOptimizingName);
+  const reconciliation2 = await recordings.reconcileRecordingsDir();
+  check('ordinary optimizing-like recording name is preserved',
+    reconciliation2.removed === 0 && reconciliation2.restored === 0
+      && fs.existsSync(ordinaryOptimizingName));
 
   // ---- metadata survives a restart ---------------------------------------------
   const revived = new RecordingManager({ settings, emit: () => {} });
@@ -551,6 +594,18 @@ async function run() {
   check('screenshots in the same second do not overwrite',
     shotA.filePath !== shotB.filePath && fs.existsSync(shotA.filePath) && fs.existsSync(shotB.filePath),
     `${shotA.fileName} / ${shotB.fileName}`);
+  check('screenshot writes leave no partial files',
+    fs.readdirSync(settings.screenshotsDir).every((name) => !name.endsWith('.part')));
+
+  const originalScreenshotWriter = recordings.performSaveScreenshot.bind(recordings);
+  let releaseScreenshot;
+  recordings.performSaveScreenshot = () => new Promise((resolve) => { releaseScreenshot = resolve; });
+  const pendingScreenshot = recordings.saveScreenshot({ buffer: png });
+  check('pending screenshot participates in shutdown state', recordings.hasPendingRecordings());
+  releaseScreenshot({ filePath: shotA.filePath, fileName: shotA.fileName });
+  await pendingScreenshot;
+  recordings.performSaveScreenshot = originalScreenshotWriter;
+  check('completed screenshot releases shutdown state', !recordings.hasPendingRecordings());
 
   // ---- background optimization never destroys the file -------------------------
   recordings.enqueueOptimize(saved.filePath, 5000);
@@ -563,7 +618,9 @@ async function run() {
     afterOptimize.codec === 'h264' && (afterOptimize.durationSec || 0) > 3,
     `codec=${afterOptimize.codec} duration=${afterOptimize.durationSec}s`);
   check('no .optimizing leftovers',
-    fs.readdirSync(RECORDINGS).every((f) => !f.includes('.optimizing.')));
+    fs.readdirSync(RECORDINGS).every((f) => (
+      !/\.optimizing-[0-9a-f-]{36}\.mp4$/i.test(f)
+    )));
 
   win.destroy();
 }

@@ -80,6 +80,14 @@ function normalizeScreenshotQuality(quality) {
   ), DEFAULT_SCREENSHOT_QUALITY);
 }
 
+function normalizeResolution(resolution) {
+  const match = /^(\d{2,5})x(\d{2,5})$/.exec(String(resolution || ''));
+  if (!match) return DEFAULT_PROFILE.resolution;
+  const width = Math.floor(clampNumber(Number(match[1]), 320, 7680) / 2) * 2;
+  const height = Math.floor(clampNumber(Number(match[2]), 240, 4320) / 2) * 2;
+  return `${width}x${height}`;
+}
+
 function normalizeProfile(value = {}) {
   const profile = value && typeof value === 'object' ? value : {};
   const micVolume = Number(profile.micVolume);
@@ -87,9 +95,7 @@ function normalizeProfile(value = {}) {
 
   return {
     format: normalizeFormat(profile.format),
-    resolution: /^\d{3,5}x\d{3,5}$/.test(String(profile.resolution || ''))
-      ? String(profile.resolution)
-      : DEFAULT_PROFILE.resolution,
+    resolution: normalizeResolution(profile.resolution),
     fps: String(clampNumber(Number(profile.fps) || 60, 1, 240)),
     bitrate: String(clampNumber(Number(profile.bitrate) || 10, 1, 300)),
     encoderPreset: normalizeEncoderPreset(profile.encoderPreset),
@@ -278,8 +284,7 @@ class SettingsStore {
   }
 
   save() {
-    const snapshot = this.current;
-    const run = () => this.writeSnapshot(snapshot);
+    const run = () => this.writeSnapshot(this.current);
 
     this.writeChain = this.writeChain.then(run, run);
     return this.writeChain;
@@ -319,6 +324,7 @@ module.exports = {
   normalizeFormat,
   normalizeScreenshotFormat,
   normalizeScreenshotQuality,
+  normalizeResolution,
   normalizeEncoderPreset,
   normalizeCustomPresets,
   normalizeSelectedPreset,

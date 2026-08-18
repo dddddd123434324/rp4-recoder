@@ -269,8 +269,13 @@
     if (!accelerator) return;
 
     const target = signature(accelerator);
-    const entry = Object.entries(state.hotkeys)
-      .find(([, value]) => value && signature(value) === target);
+    const entry = Object.entries(state.hotkeys).find(([action, value]) => {
+      if (!value || signature(value) !== target) return false;
+      const registration = state.hotkeyRegistrations[action];
+      return registration?.registered === false
+        && registration.reason !== 'disabled'
+        && registration.reason !== 'duplicate';
+    });
     if (!entry) return;
 
     event.preventDefault();

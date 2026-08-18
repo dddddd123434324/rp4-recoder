@@ -12,6 +12,7 @@ const {
 const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { fileURLToPath } = require('node:url');
 
 const displays = require('./displays');
 const ffmpeg = require('./ffmpeg');
@@ -23,10 +24,20 @@ const { parseWindowHandle } = require('./window-crop');
 const MEDIA_FILE_PATTERN = /\.(mp4|webm|mkv)$/i;
 const MAX_SCREENSHOT_BYTES = 256 * 1024 * 1024;
 
-function isTopLevelWindowSender(event) {
+function isTrustedFileSender(event, fileName) {
   if (!event?.sender || event.sender.isDestroyed()) return false;
   const owner = BrowserWindow.fromWebContents(event.sender);
-  return Boolean(owner && event.senderFrame && event.senderFrame === event.sender.mainFrame);
+  if (!owner || !event.senderFrame || event.senderFrame !== event.sender.mainFrame) return false;
+  try {
+    const senderPath = path.resolve(fileURLToPath(event.senderFrame.url || event.sender.getURL()));
+    return senderPath.toLowerCase() === path.join(windows.SRC_DIR, fileName).toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+function isTopLevelWindowSender(event) {
+  return isTrustedFileSender(event, 'index.html');
 }
 
 async function resolveRecordingMediaFile(recordingsDir, filePath) {
@@ -60,6 +71,16 @@ async function resolveRecordingMediaFile(recordingsDir, filePath) {
 function registerIpcHandlers(context) {
   const { settings, recordings, windowCrop, hotkeys, isSmoke } = context;
   let folderDialogActive = false;
+  const handleMain = (channel, handler) => ipcMain.handle(channel, (event, ...args) => {
+    if (!isTopLevelWindowSender(event)) throw new Error('허용되지 않은 IPC 송신자입니다.');
+    return handler(event, ...args);
+  });
+  const handleArea = (channel, handler) => ipcMain.handle(channel, (event, ...args) => {
+    if (!isTrustedFileSender(event, 'area-selector.html')) {
+      throw new Error('허용되지 않은 영역 선택 IPC 송신자입니다.');
+    }
+    return handler(event, ...args);
+  });
 
   function settingsDto() {
     const value = settings.value;
@@ -84,7 +105,7 @@ function registerIpcHandlers(context) {
     };
   }
 
-  ipcMain.handle('app:info', async () => ({
+  handleMain('app:info', async () => ({
     appRoot: windows.APP_ROOT,
     configDir: paths.configDir(),
     settingsFile: paths.settingsFile(),
@@ -96,7 +117,7 @@ function registerIpcHandlers(context) {
     isSmoke
   }));
 
-  ipcMain.handle('sources:list', async () => {
+  handleMain('sources:list', async () => {
     const allDisplays = screen.getAllDisplays();
     const primaryId = screen.getPrimaryDisplay().id;
     const displayMap = new Map(allDisplays.map((display, index) => [
@@ -133,17 +154,17 @@ function registerIpcHandlers(context) {
     });
   });
 
-  ipcMain.handle('area-selector:data', async () => displays.getDisplayPayload());
+  handleArea('area-selector:data', async () => displays.getDisplayPayload());
 
-  ipcMain.handle('area:select', async () => windows.selectDesktopArea({ isSmoke }));
+  handleMain('area:select', async () => windows.selectDesktopArea({ isSmoke }));
 
-  ipcMain.handle('window:client-crop', async (_event, sourceId) => {
+  handleMain('window:client-crop', async (_event, sourceId) => {
     const hwnd = parseWindowHandle(sourceId);
     if (!hwnd) return null;
     return windowCrop.query(hwnd);
   });
 
-  ipcMain.handle('screenshot:capture-source', async (_event, sourceId) => {
+  handleMain('screenshot:capture-source', async (_event, sourceId) => {
     const id = String(sourceId || '');
     const type = id.startsWith('screen:') ? 'screen' : id.startsWith('window:') ? 'window' : null;
     if (!type) throw new Error('스크린샷 소스가 올바르지 않습니다.');
@@ -199,41 +220,46 @@ function registerIpcHandlers(context) {
     };
   });
 
-  ipcMain.handle('recordings:list', async () => recordings.list());
+  handleMain('recordings:list', async () => recordings.list());
 
-  ipcMain.handle('recording:thumbnail', async (event, filePath) => {
+  handleMain('recording:thumbnail', async (event, filePath) => {
     if (!isTopLevelWindowSender(event)) return null;
     const target = await resolveRecordingMediaFile(settings.recordingsDir, filePath);
     if (!target) return null;
     return recordings.thumbnail(target).catch(() => null);
   });
 
-  ipcMain.handle('recording:start', async (event, meta = {}) => {
+  handleMain('recording:start', async (event, meta = {}) => {
     if (folderDialogActive) {
       throw new Error('저장 폴더를 선택하는 동안에는 녹화를 시작할 수 없습니다.');
     }
     return recordings.start(meta, { webContentsId: event.sender.id });
   });
 
-  ipcMain.handle('recording:write', async (event, payload = {}) => recordings.write(payload, {
+  handleMain('recording:write', async (event, payload = {}) => recordings.write(payload, {
     webContentsId: event.sender.id
   }));
 
-  ipcMain.handle('recording:stop', async (event, payload = {}) => recordings.stop(payload, {
+  handleMain('recording:stop', async (event, payload = {}) => recordings.stop(payload, {
     webContentsId: event.sender.id
   }));
 
-  ipcMain.handle('screenshot:save', async (_event, payload = {}) => recordings.saveScreenshot(payload));
+  handleMain('screenshot:save', async (_event, payload = {}) => {
+    if (folderDialogActive) {
+      throw new Error('저장 폴더를 선택하는 동안에는 스크린샷을 저장할 수 없습니다.');
+    }
+    return recordings.saveScreenshot(payload);
+  });
 
-  ipcMain.handle('convert:cancel', async (_event, jobId) => ffmpeg.cancel(String(jobId || '')));
+  handleMain('convert:cancel', async (_event, jobId) => ffmpeg.cancel(String(jobId || '')));
 
-  ipcMain.handle('folder:open-recordings', async () => {
+  handleMain('folder:open-recordings', async () => {
     await paths.ensureRecordingDirs(settings.recordingsDir);
     await shell.openPath(settings.recordingsDir);
     return settings.recordingsDir;
   });
 
-  ipcMain.handle('folder:choose-recordings', async (event) => {
+  handleMain('folder:choose-recordings', async (event) => {
     if (folderDialogActive || recordings.hasPendingRecordings()) {
       return {
         canceled: false,
@@ -259,7 +285,7 @@ function registerIpcHandlers(context) {
         return { canceled: true, recordingsDir: settings.recordingsDir };
       }
 
-      const chosen = result.filePaths[0];
+      const chosen = path.resolve(result.filePaths[0]);
       if (!paths.isPlausibleRecordingsDir(chosen)) {
         return {
           canceled: false,
@@ -268,12 +294,15 @@ function registerIpcHandlers(context) {
           recordingsDir: settings.recordingsDir
         };
       }
-      // Confirm we can actually write there before committing the setting.
-      if (!(await paths.isDirectoryWritable(chosen))) {
+      // Prepare and validate the complete app-owned structure before persisting the path.
+      // A conflicting temp/screenshots entry must never poison the next startup.
+      try {
+        await paths.ensureRecordingDirs(chosen);
+      } catch (error) {
         return {
           canceled: false,
           failed: true,
-          error: '선택한 폴더에 쓸 수 없습니다. 다른 폴더를 선택해 주세요.',
+          error: error?.message || '선택한 폴더를 사용할 수 없습니다.',
           recordingsDir: settings.recordingsDir
         };
       }
@@ -287,7 +316,6 @@ function registerIpcHandlers(context) {
       }
 
       await settings.update({ recordingsDir: chosen });
-      await paths.ensureRecordingDirs(settings.recordingsDir);
       return { canceled: false, failed: false, recordingsDir: settings.recordingsDir };
     } finally {
       try {
@@ -299,7 +327,7 @@ function registerIpcHandlers(context) {
     }
   });
 
-  ipcMain.handle('file:show', async (event, filePath) => {
+  handleMain('file:show', async (event, filePath) => {
     if (!isTopLevelWindowSender(event)) return false;
     const target = await resolveRecordingMediaFile(settings.recordingsDir, filePath);
     if (!target) return false;
@@ -307,7 +335,7 @@ function registerIpcHandlers(context) {
     return true;
   });
 
-  ipcMain.handle('file:play', async (event, filePath) => {
+  handleMain('file:play', async (event, filePath) => {
     if (!isTopLevelWindowSender(event)) return { ok: false, error: '요청을 처리할 수 없습니다.' };
     const target = await resolveRecordingMediaFile(settings.recordingsDir, filePath);
     if (!target) return { ok: false, error: '이 녹화 파일을 열 수 없습니다.' };
@@ -315,7 +343,7 @@ function registerIpcHandlers(context) {
     return error ? { ok: false, error } : { ok: true };
   });
 
-  ipcMain.handle('file:delete', async (event, filePath) => {
+  handleMain('file:delete', async (event, filePath) => {
     if (!isTopLevelWindowSender(event)) return { deleted: false };
     const target = await resolveRecordingMediaFile(settings.recordingsDir, filePath);
     if (!target) return { deleted: false };
@@ -326,21 +354,21 @@ function registerIpcHandlers(context) {
     };
   });
 
-  ipcMain.handle('settings:get', async () => settingsDto());
+  handleMain('settings:get', async () => settingsDto());
 
-  ipcMain.handle('settings:selected-preset', async (_event, key) => {
+  handleMain('settings:selected-preset', async (_event, key) => {
     await settings.update({ selectedPreset: key });
     return settingsDto();
   });
 
   // Persists the live recording profile so ad-hoc tweaks survive a restart instead of
   // silently reverting to the selected preset.
-  ipcMain.handle('settings:profile', async (_event, profile = {}) => {
+  handleMain('settings:profile', async (_event, profile = {}) => {
     await settings.update({ profile });
     return settingsDto();
   });
 
-  ipcMain.handle('settings:profile-state', async (_event, payload = {}) => {
+  handleMain('settings:profile-state', async (_event, payload = {}) => {
     await settings.update({
       selectedPreset: payload.selectedPreset == null ? null : payload.selectedPreset,
       profile: payload.profile
@@ -348,7 +376,7 @@ function registerIpcHandlers(context) {
     return settingsDto();
   });
 
-  ipcMain.handle('settings:options', async (_event, options = {}) => {
+  handleMain('settings:options', async (_event, options = {}) => {
     const patch = {};
     if (typeof options.optimizeMp4 === 'boolean') patch.optimizeMp4 = options.optimizeMp4;
     if (typeof options.screenshotFormat === 'string') {
@@ -364,7 +392,7 @@ function registerIpcHandlers(context) {
     return settingsDto();
   });
 
-  ipcMain.handle('settings:custom-preset:save', async (_event, payload = {}) => {
+  handleMain('settings:custom-preset:save', async (_event, payload = {}) => {
     const id = typeof payload.id === 'string' && payload.id.trim()
       ? payload.id.trim()
       : crypto.randomUUID();
@@ -394,7 +422,7 @@ function registerIpcHandlers(context) {
     return { ...settingsDto(), dropped };
   });
 
-  ipcMain.handle('settings:custom-preset:delete', async (_event, id) => {
+  handleMain('settings:custom-preset:delete', async (_event, id) => {
     const targetId = String(id || '');
     const value = settings.value;
     const selectedPreset = value.selectedPreset === `custom:${targetId}`
@@ -412,25 +440,25 @@ function registerIpcHandlers(context) {
     return settingsDto();
   });
 
-  ipcMain.handle('hotkeys:get', async () => hotkeys.dto(settings.value.hotkeys));
+  handleMain('hotkeys:get', async () => hotkeys.dto(settings.value.hotkeys));
 
-  ipcMain.handle('hotkeys:set', async (_event, next = {}) => {
+  handleMain('hotkeys:set', async (_event, next = {}) => {
     await settings.update({ hotkeys: next });
     hotkeys.register(settings.value.hotkeys);
     return hotkeys.dto(settings.value.hotkeys);
   });
 
-  ipcMain.handle('hotkeys:reset', async () => {
+  handleMain('hotkeys:reset', async () => {
     await settings.update({ hotkeys: settingsModule.DEFAULT_HOTKEYS });
     hotkeys.register(settings.value.hotkeys);
     return hotkeys.dto(settings.value.hotkeys);
   });
 
-  ipcMain.handle('window:minimize', (event) => {
+  handleMain('window:minimize', (event) => {
     BrowserWindow.fromWebContents(event.sender)?.minimize();
   });
 
-  ipcMain.handle('window:maximize-toggle', (event) => {
+  handleMain('window:maximize-toggle', (event) => {
     const win = BrowserWindow.fromWebContents(event.sender);
     if (!win) return false;
     if (win.isMaximized()) {
@@ -441,9 +469,14 @@ function registerIpcHandlers(context) {
     return true;
   });
 
-  ipcMain.handle('window:close', (event) => {
+  handleMain('window:close', (event) => {
     BrowserWindow.fromWebContents(event.sender)?.close();
   });
 }
 
-module.exports = { registerIpcHandlers, resolveRecordingMediaFile, isTopLevelWindowSender };
+module.exports = {
+  registerIpcHandlers,
+  resolveRecordingMediaFile,
+  isTopLevelWindowSender,
+  isTrustedFileSender
+};

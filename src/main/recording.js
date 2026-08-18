@@ -19,7 +19,10 @@ const MIN_RECOVERABLE_RECORDING_BYTES = 512;
 const MAX_IPC_CHUNK_BYTES = 64 * 1024 * 1024;
 const MAX_SCREENSHOT_BYTES = 256 * 1024 * 1024;
 const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
-const OPTIMIZING_FILE_PATTERN = /^(.*\.mp4)\.optimizing\.mp4$/i;
+const OPTIMIZING_FILE_PATTERN = new RegExp(
+  `^(.*\\.mp4)\\.optimizing-(${UUID_PATTERN})\\.mp4$`,
+  'i'
+);
 const BACKUP_FILE_PATTERN = new RegExp(
   `^(.*\\.(?:mp4|webm|mkv))\\.backup-${UUID_PATTERN}$`,
   'i'
@@ -195,6 +198,52 @@ async function writeUniqueFile(dir, baseName, extension, buffer) {
   return writeUniqueFile(dir, `${baseName}_${crypto.randomUUID().slice(0, 8)}`, extension, buffer);
 }
 
+function toBoundedBuffer(value, maxBytes) {
+  const view = value instanceof ArrayBuffer
+    ? new Uint8Array(value)
+    : ArrayBuffer.isView(value) ? value : null;
+  const bytes = Number(view?.byteLength || 0);
+  if (!view || bytes === 0 || bytes > maxBytes) {
+    throw new Error('허용되지 않은 바이너리 데이터입니다.');
+  }
+  return Buffer.from(view.buffer, view.byteOffset, view.byteLength);
+}
+
+async function writeAtomicScreenshot(dir, format, buffer) {
+  const id = crypto.randomUUID();
+  const filePath = path.join(dir, `${timestamp()}_screenshot_${id.slice(0, 8)}.${format}`);
+  const temporary = path.join(dir, `.rp4-screenshot-${id}.part`);
+  let handle = null;
+  try {
+    handle = await fs.open(temporary, 'wx');
+    await handle.writeFile(buffer);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fs.rename(temporary, filePath);
+    return filePath;
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    await fs.rm(temporary, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function pruneThumbnailCache(cacheDir, maxEntries = 256) {
+  const entries = await fs.readdir(cacheDir, { withFileTypes: true }).catch(() => []);
+  const candidates = await Promise.all(entries
+    .filter((entry) => entry.isFile() && /^rp4-thumb-[0-9a-f]{64}\.jpg$/i.test(entry.name))
+    .map(async (entry) => {
+      const filePath = path.join(cacheDir, entry.name);
+      const stats = await statFile(filePath);
+      return stats ? { filePath, usedAt: Math.max(stats.atimeMs, stats.mtimeMs) } : null;
+    }));
+  const stale = candidates.filter(Boolean)
+    .sort((a, b) => b.usedAt - a.usedAt)
+    .slice(maxEntries);
+  await Promise.allSettled(stale.map((entry) => fs.rm(entry.filePath, { force: true })));
+}
+
 class RecordingManager {
   /**
    * @param {object} options
@@ -216,6 +265,7 @@ class RecordingManager {
     this.indexDirty = false;
     this.thumbnailQueue = Promise.resolve();
     this.thumbnailInflight = new Map();
+    this.screenshotJobs = new Set();
     this.moveFile = move;
   }
 
@@ -228,7 +278,7 @@ class RecordingManager {
   }
 
   hasPendingRecordings() {
-    return this.sessions.size > 0 || this.finalizing.size > 0;
+    return this.sessions.size > 0 || this.finalizing.size > 0 || this.screenshotJobs.size > 0;
   }
 
   indexFile() {
@@ -378,6 +428,11 @@ class RecordingManager {
   }
 
   async start(meta = {}, { webContentsId } = {}) {
+    const senderBusy = [...this.sessions.values()].some((session) => session.webContentsId === webContentsId)
+      || [...this.finalizing.values()].some((entry) => entry.webContentsId === webContentsId);
+    if (webContentsId != null && senderBusy) {
+      throw new Error('이 창에는 이미 활성 녹화 세션이 있습니다.');
+    }
     await paths.ensureRecordingDirs(this.settings.recordingsDir);
 
     const recordingsDir = this.settings.recordingsDir;
@@ -458,10 +513,11 @@ class RecordingManager {
       return Promise.reject(new Error('녹화 세션이 이미 종료 중입니다.'));
     }
 
-    const chunk = Buffer.from(payload.buffer);
-    if (chunk.length === 0) return Promise.resolve({ bytes: session.bytes });
-    if (chunk.length > MAX_IPC_CHUNK_BYTES) {
-      return Promise.reject(new Error('녹화 청크가 허용된 최대 크기(64MB)를 초과했습니다.'));
+    let chunk;
+    try {
+      chunk = toBoundedBuffer(payload.buffer, MAX_IPC_CHUNK_BYTES);
+    } catch (error) {
+      return Promise.reject(error);
     }
 
     const terminal = payload.terminal === true;
@@ -823,7 +879,7 @@ class RecordingManager {
         const job = this.optimizeQueue.shift();
         if (!(await paths.pathExists(job.filePath))) continue;
 
-        const optimized = `${job.filePath}.optimizing.mp4`;
+        const optimized = `${job.filePath}.optimizing-${crypto.randomUUID()}.mp4`;
         this.optimizingFilePath = job.filePath;
         try {
           this.emit('recording:optimize', { filePath: job.filePath, state: 'start' });
@@ -866,7 +922,7 @@ class RecordingManager {
   async cancelAndDrainOptimizations() {
     this.optimizationCancelled = true;
     this.optimizeQueue.length = 0;
-    ffmpeg.cancelAll();
+    await ffmpeg.cancelAll();
     await this.optimizeDrainPromise?.catch(() => {});
   }
 
@@ -944,11 +1000,27 @@ class RecordingManager {
     if (this.thumbnailInflight.has(key)) return this.thumbnailInflight.get(key);
 
     const task = this.thumbnailQueue.then(async () => {
-      if (!(await paths.pathExists(output))) {
-        await ffmpeg.createThumbnail(filePath, output);
+      let buffer = await fs.readFile(output).catch(() => null);
+      const valid = buffer && buffer.length >= 4 && buffer.length <= 2 * 1024 * 1024
+        && buffer[0] === 0xff && buffer[1] === 0xd8
+        && buffer[buffer.length - 2] === 0xff && buffer[buffer.length - 1] === 0xd9;
+      if (!valid) {
+        await fs.rm(output, { force: true });
+        const temporary = `${output}.tmp-${crypto.randomUUID()}.jpg`;
+        try {
+          await ffmpeg.createThumbnail(filePath, temporary);
+          buffer = await fs.readFile(temporary);
+          const generatedValid = buffer.length >= 4 && buffer.length <= 2 * 1024 * 1024
+            && buffer[0] === 0xff && buffer[1] === 0xd8
+            && buffer[buffer.length - 2] === 0xff && buffer[buffer.length - 1] === 0xd9;
+          if (!generatedValid) throw new Error('생성된 영상 썸네일이 올바르지 않습니다.');
+          await fs.rename(temporary, output);
+        } finally {
+          await fs.rm(temporary, { force: true }).catch(() => {});
+        }
       }
-      const buffer = await fs.readFile(output);
-      if (buffer.length === 0 || buffer.length > 2 * 1024 * 1024) return null;
+      await fs.utimes(output, new Date(), new Date()).catch(() => {});
+      await pruneThumbnailCache(cacheDir);
       return `data:image/jpeg;base64,${buffer.toString('base64')}`;
     });
     this.thumbnailInflight.set(key, task);
@@ -971,7 +1043,7 @@ class RecordingManager {
 
     this.optimizeQueue = this.optimizeQueue.filter((job) => job.filePath !== target);
     if (this.optimizingFilePath === target) {
-      ffmpeg.cancel(`optimize:${target}`);
+      await ffmpeg.cancel(`optimize:${target}`);
       const deadline = Date.now() + 10000;
       while (this.optimizingFilePath === target && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 25));
@@ -994,15 +1066,19 @@ class RecordingManager {
     return true;
   }
 
-  async saveScreenshot(payload = {}) {
-    await paths.ensureRecordingDirs(this.settings.recordingsDir);
-    const buffer = Buffer.from(payload.buffer || []);
-    if (buffer.length === 0) {
-      throw new Error('저장할 스크린샷 데이터가 없습니다.');
-    }
-    if (buffer.length > MAX_SCREENSHOT_BYTES) {
-      throw new Error('스크린샷 데이터는 256MB를 초과할 수 없습니다.');
-    }
+  saveScreenshot(payload = {}) {
+    const job = this.performSaveScreenshot(payload);
+    this.screenshotJobs.add(job);
+    const release = () => this.screenshotJobs.delete(job);
+    void job.then(release, release);
+    return job;
+  }
+
+  async performSaveScreenshot(payload = {}) {
+    const recordingsDir = this.settings.recordingsDir;
+    const screenshotsDir = paths.screenshotsDirFor(recordingsDir);
+    await paths.ensureRecordingDirs(recordingsDir);
+    const buffer = toBoundedBuffer(payload.buffer, MAX_SCREENSHOT_BYTES);
 
     let format = null;
     if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([
@@ -1018,10 +1094,7 @@ class RecordingManager {
     }
     if (!format) throw new Error('지원하지 않는 스크린샷 형식입니다.');
 
-    const baseName = `${timestamp()}_screenshot`;
-    // Screenshots also used a one-second name, so rapid hotkey presses overwrote
-    // each other.
-    const filePath = await writeUniqueFile(this.settings.screenshotsDir, baseName, format, buffer);
+    const filePath = await writeAtomicScreenshot(screenshotsDir, format, buffer);
     return { filePath, fileName: path.basename(filePath) };
   }
 
@@ -1041,6 +1114,7 @@ class RecordingManager {
     }));
 
     await Promise.allSettled([...this.finalizing.values()].map((entry) => entry.promise));
+    await Promise.allSettled([...this.screenshotJobs]);
     await this.flushIndex().catch((error) => {
       this.emit('app:notice', {
         level: 'warn',
@@ -1088,6 +1162,9 @@ module.exports = {
   moveFile,
   replaceFileSafely,
   writeUniqueFile,
+  writeAtomicScreenshot,
+  toBoundedBuffer,
+  pruneThumbnailCache,
   MAX_IPC_CHUNK_BYTES,
   MAX_SCREENSHOT_BYTES
 };
