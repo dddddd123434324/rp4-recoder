@@ -31,7 +31,6 @@ contextBridge.exposeInMainWorld('rp4', {
   startRecording: (meta) => ipcRenderer.invoke('recording:start', meta),
   writeRecordingChunk: (payload) => invokeWithBoundedBuffer('recording:write', payload),
   stopRecording: (payload) => ipcRenderer.invoke('recording:stop', payload),
-  saveClip: (payload) => invokeWithBoundedBuffer('clip:save', payload),
   saveScreenshot: (payload) => invokeWithBoundedBuffer('screenshot:save', payload),
   cancelConversion: (jobId) => ipcRenderer.invoke('convert:cancel', jobId),
 

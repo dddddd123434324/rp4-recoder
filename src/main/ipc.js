@@ -10,6 +10,8 @@ const {
   shell
 } = require('electron/main');
 const crypto = require('node:crypto');
+const fs = require('node:fs/promises');
+const path = require('node:path');
 
 const displays = require('./displays');
 const ffmpeg = require('./ffmpeg');
@@ -17,6 +19,32 @@ const paths = require('./paths');
 const settingsModule = require('./settings');
 const windows = require('./windows');
 const { parseWindowHandle } = require('./window-crop');
+
+const MEDIA_FILE_PATTERN = /\.(mp4|webm|mkv)$/i;
+
+function isTopLevelWindowSender(event) {
+  if (!event?.sender || event.sender.isDestroyed()) return false;
+  const owner = BrowserWindow.fromWebContents(event.sender);
+  return Boolean(owner && event.senderFrame && event.senderFrame === event.sender.mainFrame);
+}
+
+async function resolveRecordingMediaFile(recordingsDir, filePath) {
+  if (typeof filePath !== 'string' || !filePath || !MEDIA_FILE_PATTERN.test(filePath)) return null;
+
+  const root = path.resolve(recordingsDir);
+  const target = path.resolve(filePath);
+  if (path.dirname(target).toLowerCase() !== root.toLowerCase()) return null;
+
+  try {
+    const stats = await fs.lstat(target);
+    if (!stats.isFile() || stats.isSymbolicLink()) return null;
+    const [realRoot, realTarget] = await Promise.all([fs.realpath(root), fs.realpath(target)]);
+    if (path.dirname(realTarget).toLowerCase() !== realRoot.toLowerCase()) return null;
+    return realTarget;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Wires every IPC handler.
@@ -183,8 +211,6 @@ function registerIpcHandlers(context) {
     webContentsId: event.sender.id
   }));
 
-  ipcMain.handle('clip:save', async (_event, payload = {}) => recordings.saveClip(payload));
-
   ipcMain.handle('screenshot:save', async (_event, payload = {}) => recordings.saveScreenshot(payload));
 
   ipcMain.handle('convert:cancel', async (_event, jobId) => ffmpeg.cancel(String(jobId || '')));
@@ -261,30 +287,32 @@ function registerIpcHandlers(context) {
     }
   });
 
-  ipcMain.handle('file:show', async (_event, filePath) => {
-    if (typeof filePath !== 'string' || !filePath) return false;
-    // Only reveal files this app owns, rather than accepting any path from the renderer.
-    if (!paths.isInside(settings.recordingsDir, filePath)) return false;
-    if (!(await paths.pathExists(filePath))) return false;
-    shell.showItemInFolder(filePath);
+  ipcMain.handle('file:show', async (event, filePath) => {
+    if (!isTopLevelWindowSender(event)) return false;
+    const target = await resolveRecordingMediaFile(settings.recordingsDir, filePath);
+    if (!target) return false;
+    shell.showItemInFolder(target);
     return true;
   });
 
-  ipcMain.handle('file:play', async (_event, filePath) => {
-    if (typeof filePath !== 'string' || !filePath) return { ok: false, error: '파일 경로가 없습니다.' };
-    if (!paths.isInside(settings.recordingsDir, filePath)) {
-      return { ok: false, error: '이 파일을 열 수 없습니다.' };
-    }
-    if (!(await paths.pathExists(filePath))) return { ok: false, error: '파일을 찾을 수 없습니다.' };
-    const error = await shell.openPath(filePath);
+  ipcMain.handle('file:play', async (event, filePath) => {
+    if (!isTopLevelWindowSender(event)) return { ok: false, error: '요청을 처리할 수 없습니다.' };
+    const target = await resolveRecordingMediaFile(settings.recordingsDir, filePath);
+    if (!target) return { ok: false, error: '이 녹화 파일을 열 수 없습니다.' };
+    const error = await shell.openPath(target);
     return error ? { ok: false, error } : { ok: true };
   });
 
-  ipcMain.handle('file:delete', async (_event, filePath) => ({
-    deleted: await recordings.trashRecording(filePath, {
-      trash: (target) => shell.trashItem(target)
-    })
-  }));
+  ipcMain.handle('file:delete', async (event, filePath) => {
+    if (!isTopLevelWindowSender(event)) return { deleted: false };
+    const target = await resolveRecordingMediaFile(settings.recordingsDir, filePath);
+    if (!target) return { deleted: false };
+    return {
+      deleted: await recordings.trashRecording(target, {
+        trash: (ownedFile) => shell.trashItem(ownedFile)
+      })
+    };
+  });
 
   ipcMain.handle('settings:get', async () => settingsDto());
 
@@ -406,4 +434,4 @@ function registerIpcHandlers(context) {
   });
 }
 
-module.exports = { registerIpcHandlers };
+module.exports = { registerIpcHandlers, resolveRecordingMediaFile, isTopLevelWindowSender };

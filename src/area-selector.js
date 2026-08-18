@@ -76,19 +76,35 @@ function positionChrome(clientX, clientY) {
   actions.style.top = `${bottomRight.y - actions.offsetHeight - 26}px`;
 }
 
-function normalizeRect(value) {
-  const limits = minSizeClient();
-  const width = Math.max(limits.width, Math.min(window.innerWidth, value.width));
-  const height = Math.max(limits.height, Math.min(window.innerHeight, value.height));
+function clientBoundsForDisplay(display) {
+  if (!display) return { x: 0, y: 0, width: window.innerWidth, height: window.innerHeight };
+  const topLeft = toClient(display.bounds.x, display.bounds.y);
+  const bottomRight = toClient(
+    display.bounds.x + display.bounds.width,
+    display.bounds.y + display.bounds.height
+  );
   return {
-    x: Math.max(0, Math.min(window.innerWidth - width, value.x)),
-    y: Math.max(0, Math.min(window.innerHeight - height, value.y)),
+    x: topLeft.x,
+    y: topLeft.y,
+    width: bottomRight.x - topLeft.x,
+    height: bottomRight.y - topLeft.y
+  };
+}
+
+function normalizeRect(value, display = null) {
+  const limits = minSizeClient();
+  const bounds = clientBoundsForDisplay(display);
+  const width = Math.max(limits.width, Math.min(bounds.width, value.width));
+  const height = Math.max(limits.height, Math.min(bounds.height, value.height));
+  return {
+    x: Math.max(bounds.x, Math.min(bounds.x + bounds.width - width, value.x)),
+    y: Math.max(bounds.y, Math.min(bounds.y + bounds.height - height, value.y)),
     width,
     height
   };
 }
 
-function resizeRect(start, handle, dx, dy) {
+function resizeRect(start, handle, dx, dy, display) {
   const limits = minSizeClient();
   let left = start.x;
   let top = start.y;
@@ -109,7 +125,7 @@ function resizeRect(start, handle, dx, dy) {
     else bottom = top + limits.height;
   }
 
-  return normalizeRect({ x: left, y: top, width: right - left, height: bottom - top });
+  return normalizeRect({ x: left, y: top, width: right - left, height: bottom - top }, display);
 }
 
 function drawSelection() {
@@ -131,6 +147,7 @@ function beginPointer(event) {
   if (selection.contains(event.target) && rect) {
     drag = {
       mode: handle || 'move',
+      display: displayAt(rect.x + rect.width / 2, rect.y + rect.height / 2),
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
@@ -144,6 +161,7 @@ function beginPointer(event) {
   rect = { x: event.clientX, y: event.clientY, width: 1, height: 1 };
   drag = {
     mode: 'create',
+    display: displayAt(event.clientX, event.clientY),
     pointerId: event.pointerId,
     startX: event.clientX,
     startY: event.clientY,
@@ -167,11 +185,11 @@ function movePointer(event) {
       y: Math.min(drag.startY, event.clientY),
       width: Math.abs(dx),
       height: Math.abs(dy)
-    });
+    }, drag.display);
   } else if (drag.mode === 'move') {
-    rect = normalizeRect({ ...start, x: start.x + dx, y: start.y + dy });
+    rect = normalizeRect({ ...start, x: start.x + dx, y: start.y + dy }, drag.display);
   } else {
-    rect = resizeRect(start, drag.mode, dx, dy);
+    rect = resizeRect(start, drag.mode, dx, dy, drag.display);
   }
 
   drawSelection();
@@ -180,8 +198,9 @@ function movePointer(event) {
 function finishPointer(event) {
   if (!drag || event.pointerId !== drag.pointerId) return;
   selection.releasePointerCapture?.(event.pointerId);
+  const display = drag.display;
   drag = null;
-  rect = normalizeRect(rect);
+  rect = normalizeRect(rect, display);
   drawSelection();
 }
 
@@ -202,7 +221,7 @@ function fillDisplay() {
     y: topLeft.y,
     width: bottomRight.x - topLeft.x,
     height: bottomRight.y - topLeft.y
-  });
+  }, display);
   drawSelection();
 }
 

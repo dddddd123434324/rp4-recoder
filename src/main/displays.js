@@ -53,40 +53,30 @@ function rectIntersection(a, b) {
 }
 
 /**
- * Maps an absolute desktop rectangle onto the display that contains most of it and
- * expresses the result as fractions of that display, which is what the capture pipeline
- * needs in order to crop a stream of any resolution.
+ * Maps an absolute desktop rectangle onto one display. Cross-monitor selections are
+ * rejected instead of silently discarding the portion outside the largest intersection.
  */
 function normalizeDesktopArea(rect) {
   if (!rect || rect.width < MIN_SELECTION_PX || rect.height < MIN_SELECTION_PX) return null;
 
   const { displays } = getDisplayPayload();
-  let best = null;
-  let bestArea = 0;
+  const display = displays.find((item) => (
+    rect.x >= item.bounds.x
+    && rect.y >= item.bounds.y
+    && rect.x + rect.width <= item.bounds.x + item.bounds.width
+    && rect.y + rect.height <= item.bounds.y + item.bounds.height
+  ));
+  if (!display) return null;
 
-  for (const display of displays) {
-    const clipped = rectIntersection(rect, display.bounds);
-    const area = clipped.width * clipped.height;
-    if (area > bestArea) {
-      best = { display, clipped };
-      bestArea = area;
-    }
-  }
-
-  if (!best || best.clipped.width < MIN_SELECTION_PX || best.clipped.height < MIN_SELECTION_PX) {
-    return null;
-  }
-
-  const { display, clipped } = best;
   return {
     displayId: display.id,
     display,
-    absolute: clipped,
+    absolute: { ...rect },
     selection: {
-      x: clampNumber((clipped.x - display.bounds.x) / display.bounds.width, 0, 1),
-      y: clampNumber((clipped.y - display.bounds.y) / display.bounds.height, 0, 1),
-      width: clampNumber(clipped.width / display.bounds.width, 0, 1),
-      height: clampNumber(clipped.height / display.bounds.height, 0, 1)
+      x: clampNumber((rect.x - display.bounds.x) / display.bounds.width, 0, 1),
+      y: clampNumber((rect.y - display.bounds.y) / display.bounds.height, 0, 1),
+      width: clampNumber(rect.width / display.bounds.width, 0, 1),
+      height: clampNumber(rect.height / display.bounds.height, 0, 1)
     }
   };
 }

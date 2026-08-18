@@ -25,6 +25,9 @@ window.RP4 = window.RP4 || {};
     // before their first await so two starts can never overlap.
     captureLifecycle: 'idle',
     captureOperationId: 0,
+    shuttingDown: false,
+    recordingStartPromise: null,
+    clipStartPromise: null,
 
     // Normal recording
     recording: null,
@@ -160,7 +163,7 @@ window.RP4 = window.RP4 || {};
   }
 
   function beginCapture(phase) {
-    if (state.captureLifecycle !== 'idle') return null;
+    if (state.shuttingDown || state.captureLifecycle !== 'idle') return null;
     state.captureOperationId += 1;
     state.captureLifecycle = phase;
     return state.captureOperationId;
@@ -185,6 +188,12 @@ window.RP4 = window.RP4 || {};
 
   function captureBusy() {
     return state.captureLifecycle !== 'idle';
+  }
+
+  function prepareCaptureShutdown() {
+    state.shuttingDown = true;
+    state.captureOperationId += 1;
+    state.captureLifecycle = 'shutting-down';
   }
 
   const IPC_SLICE_BYTES = 8 * 1024 * 1024;
@@ -225,7 +234,8 @@ window.RP4 = window.RP4 || {};
     isCurrent: isCurrentCapture,
     transition: transitionCapture,
     finish: finishCapture,
-    isBusy: captureBusy
+    isBusy: captureBusy,
+    prepareShutdown: prepareCaptureShutdown
   };
   RP4.ui = { showToast, setStatus };
 }(window.RP4));

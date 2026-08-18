@@ -124,7 +124,7 @@
 
   /** Shows the resolution actually being produced, not just the one requested. */
   function updatePreviewMeta(output) {
-    const profile = RP4.profile.get();
+    const profile = state.recording?.profile || state.clip?.profile || RP4.profile.get();
     const active = output
       || state.recording?.output
       || state.clip?.output
@@ -142,7 +142,7 @@
   /** Explains how the file will be finished so the save path is never a surprise. */
   function updatePipelineNote() {
     if (!els.pipelineNote) return;
-    const profile = RP4.profile.get();
+    const profile = state.recording?.profile || state.clip?.profile || RP4.profile.get();
     const codec = RP4.capture.pickRecorderMime(profile.format);
     els.pipelineNote.classList.remove('hidden');
 
@@ -183,6 +183,27 @@
 
     els.recordingPill.classList.toggle('hidden', !recording && !clipActive);
     els.recordingPill.classList.toggle('paused', state.isPaused);
+    updateProfileControls();
+  }
+
+  function updateProfileControls() {
+    const locked = RP4.lifecycle.isBusy();
+    const fixedControls = [
+      els.formatSelect,
+      els.resolutionSelect,
+      els.fpsSelect,
+      els.bitrateSelect,
+      els.encoderPresetSelect,
+      els.audioBitrateSelect,
+      els.micToggle,
+      els.systemAudioToggle,
+      els.clipDurationInput,
+      els.clipDurationUp,
+      els.clipDurationDown,
+      els.createPresetButton
+    ];
+    for (const control of fixedControls) control.disabled = locked;
+    for (const control of els.presetBody.querySelectorAll('button')) control.disabled = locked;
   }
 
   function updateClipUi() {
@@ -674,11 +695,11 @@
     els.micToggle.addEventListener('change', () => RP4.profile.markChanged());
     els.systemAudioToggle.addEventListener('change', () => RP4.profile.markChanged());
     els.micVolume.addEventListener('input', () => {
-      RP4.profile.markChanged();
+      RP4.profile.markChanged({ allowWhileActive: true });
       updateVolumeLabels();
     });
     els.systemVolume.addEventListener('input', () => {
-      RP4.profile.markChanged();
+      RP4.profile.markChanged({ allowWhileActive: true });
       updateVolumeLabels();
     });
 
@@ -752,6 +773,7 @@
     });
 
     window.rp4.onFinalizeRecordings(async ({ requestId } = {}) => {
+      RP4.lifecycle.prepareShutdown();
       await Promise.allSettled([
         RP4.recorder.finalizeForShutdown(),
         RP4.clips.finalizeForShutdown(),

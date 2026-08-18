@@ -178,7 +178,8 @@
     }
   }
 
-  function markChanged({ persist = true } = {}) {
+  function markChanged({ persist = true, allowWhileActive = false } = {}) {
+    if (RP4.lifecycle.isBusy() && !allowWhileActive) return;
     setActivePreset(null);
     RP4.app.updatePreviewMeta();
     applyLiveGains();

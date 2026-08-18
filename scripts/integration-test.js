@@ -15,6 +15,7 @@
 const { app, BrowserWindow } = require('electron');
 const { execFile } = require('node:child_process');
 const { EventEmitter } = require('node:events');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const os = require('node:os');
@@ -191,6 +192,23 @@ async function run() {
   check('path containment blocks traversal',
     paths.isInside(RECORDINGS, path.join(RECORDINGS, '..', 'secret.mp4')) === false);
 
+  const displayPayload = require('../src/main/displays').getDisplayPayload();
+  const horizontalPair = displayPayload.displays
+    .flatMap((left) => displayPayload.displays.map((right) => ({ left, right })))
+    .find(({ left, right }) => (
+      left.id !== right.id
+      && left.bounds.x + left.bounds.width === right.bounds.x
+      && Math.max(left.bounds.y, right.bounds.y)
+        + 32 <= Math.min(left.bounds.y + left.bounds.height, right.bounds.y + right.bounds.height)
+    ));
+  if (horizontalPair) {
+    const boundary = horizontalPair.right.bounds.x;
+    const y = Math.max(horizontalPair.left.bounds.y, horizontalPair.right.bounds.y) + 16;
+    check('cross-monitor area selection is rejected',
+      require('../src/main/displays').normalizeDesktopArea({ x: boundary - 16, y, width: 32, height: 32 })
+        === null);
+  }
+
   const recordings = new RecordingManager({ settings, emit: () => {} });
   await recordings.loadIndex();
 
@@ -346,6 +364,23 @@ async function run() {
   check('both same-second files still exist',
     fs.existsSync(savedA.filePath) && fs.existsSync(savedB.filePath));
 
+  // Main-process ordering must remain correct even when callers do not await each write
+  // before asking to stop the session.
+  const raced = await recordings.start(meta, { webContentsId: win.webContents.id });
+  const racedWrites = recorded.buffers.map((buffer) => recordings.write(
+    { sessionId: raced.sessionId, buffer },
+    { webContentsId: win.webContents.id }
+  ));
+  const racedStop = recordings.stop({ sessionId: raced.sessionId, durationMs: 5000 }, {
+    webContentsId: win.webContents.id
+  });
+  await Promise.all(racedWrites);
+  const racedSaved = await racedStop;
+  const racedProbe = await ffprobe(racedSaved.filePath);
+  check('concurrent writes finish before stop closes the file',
+    racedProbe.codec === 'h264' && (racedProbe.durationSec || 0) > 3,
+    `codec=${racedProbe.codec} duration=${racedProbe.durationSec}s`);
+
   // Once a session is marked failed, ordinary writes stop but the terminal
   // dataavailable Blob is still accepted as a best-effort salvage.
   const failedSession = await recordings.start(meta, { webContentsId: win.webContents.id });
@@ -404,14 +439,31 @@ async function run() {
     `video=${fallbackProbe.codec} audio=${fallbackProbe.audioCodec} container=${fallbackProbe.container}`);
 
   // ---- clip mode: init segment + suffix of fragments ----------------------------
-  const clipBuffer = Buffer.concat([
+  const clipBuffers = [
     recorded.buffers[0],
     ...recorded.buffers.slice(Math.max(1, recorded.buffers.length - 2))
-  ]);
+  ];
   const clipStarted = Date.now();
-  const clip = await recordings.saveClip({
-    buffer: clipBuffer,
-    meta: { ...meta, modeLabel: '전체 화면 클립', durationMs: 2000, clip: true }
+  const clipMeta = {
+    ...meta,
+    modeLabel: '전체 화면 클립',
+    durationMs: 2000,
+    trimRecentMs: 2000,
+    trimEndOffsetMs: 0,
+    clip: true
+  };
+  const clipSession = await recordings.start(clipMeta, { webContentsId: win.webContents.id });
+  for (const buffer of clipBuffers) {
+    await recordings.write({ sessionId: clipSession.sessionId, buffer }, {
+      webContentsId: win.webContents.id
+    });
+  }
+  const clip = await recordings.stop({
+    sessionId: clipSession.sessionId,
+    durationMs: 2000,
+    meta: clipMeta
+  }, {
+    webContentsId: win.webContents.id
   });
   const clipMs = Date.now() - clipStarted;
 
@@ -424,6 +476,19 @@ async function run() {
     `start=${clipProbe.startSec}`);
   check('clip save stays fast', clipMs < 5000, `${clipMs} ms`);
 
+  // Recovery artifacts have strict app-generated names. User recordings that merely
+  // contain ".backup-" must never be deleted or renamed.
+  const userBackupName = path.join(RECORDINGS, 'normal.backup-user.mp4');
+  await fsp.copyFile(saved.filePath, userBackupName);
+  const recoveryUuid = crypto.randomUUID();
+  const trueBackup = path.join(RECORDINGS, `restored.mp4.backup-${recoveryUuid}`);
+  const restoredTarget = path.join(RECORDINGS, 'restored.mp4');
+  await fsp.copyFile(saved.filePath, trueBackup);
+  const reconciliation = await recordings.reconcileRecordingsDir();
+  check('ordinary backup-like recording name is preserved', fs.existsSync(userBackupName));
+  check('only UUID-suffixed optimization backup is restored',
+    reconciliation.restored === 1 && fs.existsSync(restoredTarget) && !fs.existsSync(trueBackup));
+
   // ---- metadata survives a restart ---------------------------------------------
   const revived = new RecordingManager({ settings, emit: () => {} });
   await revived.loadIndex();
@@ -432,6 +497,25 @@ async function run() {
   check('recording index persists metadata across restart',
     Boolean(match) && match.durationMs > 0 && match.width === 1280,
     `duration=${match?.durationMs} ${match?.width}x${match?.height}`);
+  const oldFolderMetadata = path.join(`${RECORDINGS}-old`, 'old.mp4');
+  recordings.metadata.set(oldFolderMetadata, { durationMs: 1234 });
+  await recordings.list();
+  check('listing current folder keeps similarly prefixed folder metadata',
+    recordings.metadata.has(oldFolderMetadata));
+
+  const { resolveRecordingMediaFile } = require('../src/main/ipc');
+  check('owned top-level media file passes IPC validation',
+    await resolveRecordingMediaFile(RECORDINGS, saved.filePath) === await fsp.realpath(saved.filePath));
+  const executable = path.join(RECORDINGS, 'not-a-recording.exe');
+  await fsp.writeFile(executable, Buffer.from('MZ'));
+  check('non-media file is rejected by IPC validation',
+    await resolveRecordingMediaFile(RECORDINGS, executable) === null);
+  const nestedDir = path.join(RECORDINGS, 'nested');
+  await fsp.mkdir(nestedDir, { recursive: true });
+  const nestedMedia = path.join(nestedDir, 'nested.mp4');
+  await fsp.copyFile(saved.filePath, nestedMedia);
+  check('nested media file is rejected by IPC validation',
+    await resolveRecordingMediaFile(RECORDINGS, nestedMedia) === null);
 
   // ---- orphaned temp files are recovered, not lost ------------------------------
   const orphan = path.join(settings.tempDir, 'crashed_take.mp4');

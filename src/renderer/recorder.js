@@ -104,15 +104,17 @@
     await startRecording();
   }
 
-  async function startRecording() {
+  async function performStartRecording() {
     const operationId = RP4.lifecycle.begin('starting-recording');
     if (operationId == null) return;
+    RP4.app.updateRecordingUi();
 
     if (!state.selectedSource) {
       await RP4.app.selectDefaultScreen();
     }
     if (!state.selectedSource) {
       RP4.lifecycle.finish(operationId);
+      RP4.app.updateRecordingUi();
       return;
     }
 
@@ -120,6 +122,7 @@
     const codec = RP4.capture.pickRecorderMime(profile.format);
     if (!codec) {
       RP4.lifecycle.finish(operationId);
+      RP4.app.updateRecordingUi();
       RP4.ui.showToast('이 시스템에서 지원하는 녹화 코덱을 찾지 못했습니다.');
       return;
     }
@@ -180,6 +183,7 @@
         recorder,
         sessionId: session.sessionId,
         codec,
+        profile,
         writeQueue: Promise.resolve(),
         queuedBytes: 0,
         failure: null,
@@ -243,10 +247,22 @@
       resetRecordingState(state.recording?.operationId === operationId ? state.recording : null);
       RP4.lifecycle.finish(operationId);
       RP4.app.updateRecordingUi();
-      await startPreview();
+      if (!state.shuttingDown) await startPreview();
       RP4.ui.setStatus('녹화 실패', '녹화를 시작하지 못했습니다.', 'warn');
       RP4.ui.showToast(`녹화를 시작하지 못했습니다. ${error?.message || ''}`.trim());
     }
+  }
+
+  function startRecording() {
+    if (state.shuttingDown) return Promise.resolve();
+    if (state.recordingStartPromise) return state.recordingStartPromise;
+    const promise = performStartRecording();
+    state.recordingStartPromise = promise;
+    const clear = () => {
+      if (state.recordingStartPromise === promise) state.recordingStartPromise = null;
+    };
+    void promise.then(clear, clear);
+    return promise;
   }
 
   /**
@@ -323,7 +339,7 @@
       resetRecordingState(context);
       RP4.app.updateRecordingUi();
       await RP4.files.render();
-      await startPreview();
+      if (!state.shuttingDown) await startPreview();
 
       if (!saved) {
         RP4.ui.setStatus('저장 취소', '기록된 데이터가 없습니다.', 'warn');
@@ -344,7 +360,7 @@
       console.error(error);
       resetRecordingState(context);
       RP4.app.updateRecordingUi();
-      await startPreview();
+      if (!state.shuttingDown) await startPreview();
       RP4.ui.setStatus('저장 실패', '녹화 파일 저장을 완료하지 못했습니다.', 'warn');
       RP4.ui.showToast('녹화 파일 저장을 완료하지 못했습니다.');
     }
@@ -407,6 +423,7 @@
 
   /** Waits for an in-flight recording to finish, used while the app is shutting down. */
   async function finalizeForShutdown() {
+    await state.recordingStartPromise?.catch(() => {});
     if (!state.recording) return;
     const done = new Promise((resolve) => {
       const poll = () => {

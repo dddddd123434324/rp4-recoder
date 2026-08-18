@@ -17,6 +17,19 @@ const MIN_FREE_BYTES_TO_START = 512 * 1024 * 1024;
 const MIN_FREE_BYTES_TO_CONTINUE = 128 * 1024 * 1024;
 const MIN_RECOVERABLE_RECORDING_BYTES = 512;
 const MAX_IPC_CHUNK_BYTES = 64 * 1024 * 1024;
+const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
+const OPTIMIZING_FILE_PATTERN = /^(.*\.mp4)\.optimizing\.mp4$/i;
+const BACKUP_FILE_PATTERN = new RegExp(
+  `^(.*\\.(?:mp4|webm|mkv))\\.backup-${UUID_PATTERN}$`,
+  'i'
+);
+
+function recoveryOriginalName(fileName) {
+  const optimizing = OPTIMIZING_FILE_PATTERN.exec(String(fileName || ''));
+  if (optimizing) return optimizing[1];
+  const backup = BACKUP_FILE_PATTERN.exec(String(fileName || ''));
+  return backup?.[1] || null;
+}
 
 function timestamp(date = new Date()) {
   const pad = (value) => String(value).padStart(2, '0');
@@ -380,6 +393,8 @@ class RecordingManager {
       recordedAudioCodec,
       forceRemux: meta.clip === true,
       bytes: 0,
+      writeChain: Promise.resolve(),
+      acceptingWrites: true,
       startedAtMs: Date.now(),
       failed: null,
       diskCheckUnavailableWarned: available == null,
@@ -404,62 +419,71 @@ class RecordingManager {
     };
   }
 
-  async write(payload = {}, { webContentsId } = {}) {
+  write(payload = {}, { webContentsId } = {}) {
     const session = this.sessions.get(payload.sessionId);
     if (!session) {
-      throw new Error('녹화 세션을 찾을 수 없습니다.');
+      return Promise.reject(new Error('녹화 세션을 찾을 수 없습니다.'));
     }
     // Only the renderer that opened the session may write to it.
     if (session.webContentsId != null && webContentsId != null && session.webContentsId !== webContentsId) {
-      throw new Error('녹화 세션에 접근할 수 없습니다.');
+      return Promise.reject(new Error('녹화 세션에 접근할 수 없습니다.'));
     }
-    if (session.failed && payload.terminal !== true) {
-      throw new Error(session.failed);
+    if (!session.acceptingWrites) {
+      return Promise.reject(new Error('녹화 세션이 이미 종료 중입니다.'));
     }
 
     const chunk = Buffer.from(payload.buffer);
-    if (chunk.length === 0) return { bytes: session.bytes };
+    if (chunk.length === 0) return Promise.resolve({ bytes: session.bytes });
     if (chunk.length > MAX_IPC_CHUNK_BYTES) {
-      throw new Error('녹화 청크가 허용된 최대 크기(64MB)를 초과했습니다.');
+      return Promise.reject(new Error('녹화 청크가 허용된 최대 크기(64MB)를 초과했습니다.'));
     }
 
-    try {
-      let offset = 0;
-      while (offset < chunk.length) {
-        const { bytesWritten } = await session.handle.write(
-          chunk,
-          offset,
-          chunk.length - offset
-        );
-        if (!Number.isFinite(bytesWritten) || bytesWritten <= 0) {
-          throw new Error('파일 쓰기가 진행되지 않았습니다.');
+    const terminal = payload.terminal === true;
+    const writeTask = async () => {
+      if (session.failed && !terminal) throw new Error(session.failed);
+
+      try {
+        let offset = 0;
+        while (offset < chunk.length) {
+          const { bytesWritten } = await session.handle.write(
+            chunk,
+            offset,
+            chunk.length - offset
+          );
+          if (!Number.isFinite(bytesWritten) || bytesWritten <= 0) {
+            throw new Error('파일 쓰기가 진행되지 않았습니다.');
+          }
+          offset += bytesWritten;
+          session.bytes += bytesWritten;
         }
-        offset += bytesWritten;
-        session.bytes += bytesWritten;
+      } catch (error) {
+        // Surface the failure instead of continuing to produce a corrupt file.
+        session.failed = `녹화 데이터를 디스크에 쓸 수 없습니다. ${error.message}`;
+        throw new Error(session.failed, { cause: error });
       }
-    } catch (error) {
-      // Surface the failure instead of continuing to produce a corrupt file.
-      session.failed = `녹화 데이터를 디스크에 쓸 수 없습니다. ${error.message}`;
-      throw new Error(session.failed, { cause: error });
-    }
 
-    // Periodically re-check headroom so we can stop deliberately near a full disk.
-    if (session.bytes - (session.lastSpaceCheckBytes || 0) > 64 * 1024 * 1024) {
-      session.lastSpaceCheckBytes = session.bytes;
-      const available = await freeBytes(session.recordingsDir);
-      if (available == null && !session.diskCheckUnavailableWarned) {
-        session.diskCheckUnavailableWarned = true;
-        this.emit('app:notice', {
-          level: 'warn',
-          message: '녹화 중 저장 장치의 여유 공간을 확인할 수 없습니다. 디스크 공간을 확인해 주세요.'
-        });
-      } else if (available != null && available < MIN_FREE_BYTES_TO_CONTINUE) {
-        session.failed = '저장 공간이 거의 없어 녹화를 중지해야 합니다.';
-        this.emit('recording:disk-full', { sessionId: payload.sessionId });
+      // Periodically re-check headroom so we can stop deliberately near a full disk.
+      if (session.bytes - (session.lastSpaceCheckBytes || 0) > 64 * 1024 * 1024) {
+        session.lastSpaceCheckBytes = session.bytes;
+        const available = await freeBytes(session.recordingsDir);
+        if (available == null && !session.diskCheckUnavailableWarned) {
+          session.diskCheckUnavailableWarned = true;
+          this.emit('app:notice', {
+            level: 'warn',
+            message: '녹화 중 저장 장치의 여유 공간을 확인할 수 없습니다. 디스크 공간을 확인해 주세요.'
+          });
+        } else if (available != null && available < MIN_FREE_BYTES_TO_CONTINUE) {
+          session.failed = '저장 공간이 거의 없어 녹화를 중지해야 합니다.';
+          this.emit('recording:disk-full', { sessionId: payload.sessionId });
+        }
       }
-    }
 
-    return { bytes: session.bytes, warning: session.failed || null };
+      return { bytes: session.bytes, warning: session.failed || null };
+    };
+
+    const result = session.writeChain.then(writeTask);
+    session.writeChain = result.catch(() => {});
+    return result;
   }
 
   /**
@@ -484,6 +508,7 @@ class RecordingManager {
       return Promise.reject(new Error('녹화 세션에 접근할 수 없습니다.'));
     }
 
+    session.acceptingWrites = false;
     this.sessions.delete(payload.sessionId);
     const promise = this.finishSession(session, payload)
       .finally(() => this.finalizing.delete(payload.sessionId));
@@ -492,6 +517,7 @@ class RecordingManager {
   }
 
   async finishSession(session, payload = {}) {
+    await session.writeChain.catch(() => {});
     try {
       await session.handle.close();
     } catch {
@@ -717,15 +743,9 @@ class RecordingManager {
     for (const entry of entries) {
       if (!entry.isFile()) continue;
       const fullPath = path.join(recordingsDir, entry.name);
-      let original = null;
-
-      if (entry.name.endsWith('.optimizing.mp4')) {
-        original = fullPath.slice(0, -'.optimizing.mp4'.length);
-      } else {
-        const marker = fullPath.lastIndexOf('.backup-');
-        if (marker >= 0) original = fullPath.slice(0, marker);
-      }
-      if (!original) continue;
+      const originalName = recoveryOriginalName(entry.name);
+      if (!originalName) continue;
+      const original = path.join(recordingsDir, originalName);
 
       try {
         if (await paths.pathExists(original)) {
@@ -816,78 +836,6 @@ class RecordingManager {
     await this.optimizeDrainPromise?.catch(() => {});
   }
 
-  /**
-   * Saves a clip assembled by the renderer. The renderer hands over one continuous
-   * buffer (init segment + clusters), so this is a plain write plus the same finalize
-   * path as a normal recording — no concat list and no re-encode.
-   */
-  async saveClip(payload = {}) {
-    await paths.ensureRecordingDirs(this.settings.recordingsDir);
-
-    const meta = payload.meta && typeof payload.meta === 'object' ? payload.meta : {};
-    const buffer = Buffer.from(payload.buffer || []);
-    if (buffer.length === 0) {
-      throw new Error('저장할 클립 데이터가 없습니다.');
-    }
-    if (buffer.length > MAX_IPC_CHUNK_BYTES) {
-      throw new Error('클립 데이터는 한 번에 64MB를 초과할 수 없습니다. 청크 저장 방식을 사용해 주세요.');
-    }
-
-    const targetFormat = meta.format === 'webm' ? 'webm' : 'mp4';
-    const recordedContainer = containerFromMimeType(meta.mimeType);
-    const recordedCodec = videoCodecFromMimeType(meta.mimeType);
-    const baseName = [
-      timestamp(),
-      sanitizeName(meta.modeLabel || meta.mode, 'clip'),
-      sanitizeName(meta.sourceName, 'source'),
-      crypto.randomUUID().slice(0, 8)
-    ].join('_');
-
-    const tempPath = path.join(
-      this.settings.tempDir,
-      `${baseName}_${crypto.randomUUID().slice(0, 8)}.${recordedContainer}`
-    );
-    await fs.writeFile(tempPath, buffer);
-
-    const durationMs = Math.max(0, Math.round(Number(meta.durationMs) || 0));
-    const session = {
-      recordingsDir: this.settings.recordingsDir,
-      baseName,
-      tempPath,
-      targetFormat,
-      recordedContainer,
-      recordedCodec,
-      forceRemux: true,
-      meta: { ...meta, clip: true, targetFormat, recordedContainer, recordedCodec }
-    };
-
-    const finalized = await this.finalize(session, { durationMs });
-    const stats = await statFile(finalized.filePath);
-    const outcome = finalized.conversionError ? 'original-preserved' : 'exact';
-    const dtoMeta = {
-      ...session.meta,
-      format: finalized.format,
-      converted: finalized.converted,
-      conversionError: finalized.conversionError || null,
-      outcome,
-      durationMs,
-      stoppedAt: new Date().toISOString(),
-      bytes: stats?.size || 0
-    };
-
-    await this.setMetadata(finalized.filePath, dtoMeta);
-    if (finalized.optimizable && this.settings.value.optimizeMp4) {
-      this.enqueueOptimize(finalized.filePath, durationMs);
-    }
-
-    return {
-      ...this.toDto(finalized.filePath, stats, dtoMeta),
-      converted: finalized.converted,
-      conversionError: finalized.conversionError || null,
-      outcome
-    };
-  }
-
   toDto(filePath, stats, meta = {}) {
     return {
       filePath,
@@ -918,7 +866,7 @@ class RecordingManager {
 
     const files = entries
       .filter((entry) => entry.isFile() && RECORDING_EXTENSIONS.test(entry.name))
-      .filter((entry) => !entry.name.endsWith('.optimizing.mp4'))
+      .filter((entry) => !OPTIMIZING_FILE_PATTERN.test(entry.name))
       .map((entry) => path.join(recordingsDir, entry.name));
 
     const recordings = await Promise.all(files.map(async (filePath) => {
@@ -930,7 +878,9 @@ class RecordingManager {
     const known = new Set(files);
     let pruned = false;
     for (const filePath of [...this.metadata.keys()]) {
-      if (!known.has(filePath) && filePath.startsWith(recordingsDir)) {
+      const sameDirectory = path.dirname(path.resolve(filePath)).toLowerCase()
+        === path.resolve(recordingsDir).toLowerCase();
+      if (!known.has(filePath) && sameDirectory) {
         this.metadata.delete(filePath);
         pruned = true;
       }
@@ -1013,6 +963,8 @@ class RecordingManager {
     this.sessions.clear();
 
     await Promise.allSettled(sessions.map(async ([, session]) => {
+      session.acceptingWrites = false;
+      await session.writeChain.catch(() => {});
       try {
         await session.handle.close();
       } catch {
@@ -1063,6 +1015,7 @@ module.exports = {
   containerFromMimeType,
   videoCodecFromMimeType,
   audioCodecFromMimeType,
+  recoveryOriginalName,
   uniquePath,
   moveFile,
   replaceFileSafely,

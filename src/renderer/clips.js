@@ -163,13 +163,15 @@
     await startClipMode();
   }
 
-  async function startClipMode() {
+  async function performStartClipMode() {
     const operationId = RP4.lifecycle.begin('starting-clip');
     if (operationId == null) return;
+    RP4.app.updateClipUi();
 
     if (!state.selectedSource) await RP4.app.selectDefaultScreen();
     if (!state.selectedSource) {
       RP4.lifecycle.finish(operationId);
+      RP4.app.updateClipUi();
       return;
     }
 
@@ -177,6 +179,7 @@
     const codec = RP4.capture.pickRecorderMime(profile.format);
     if (!codec) {
       RP4.lifecycle.finish(operationId);
+      RP4.app.updateClipUi();
       RP4.ui.showToast('이 시스템에서 지원하는 녹화 코덱을 찾지 못했습니다.');
       return;
     }
@@ -235,10 +238,22 @@
       if (state.clip?.operationId === operationId) state.clip = null;
       RP4.lifecycle.finish(operationId);
       RP4.app.updateClipUi();
-      await RP4.recorder.startPreview();
+      if (!state.shuttingDown) await RP4.recorder.startPreview();
       RP4.ui.setStatus('클립 모드 실패', '클립 녹화 모드를 시작하지 못했습니다.', 'warn');
       RP4.ui.showToast('클립 녹화 모드를 시작하지 못했습니다.');
     }
+  }
+
+  function startClipMode() {
+    if (state.shuttingDown) return Promise.resolve();
+    if (state.clipStartPromise) return state.clipStartPromise;
+    const promise = performStartClipMode();
+    state.clipStartPromise = promise;
+    const clear = () => {
+      if (state.clipStartPromise === promise) state.clipStartPromise = null;
+    };
+    void promise.then(clear, clear);
+    return promise;
   }
 
   async function stopClipMode(expectedSession = state.clip, { failed = false } = {}) {
@@ -265,8 +280,10 @@
     RP4.app.stopTimer();
     RP4.lifecycle.finish(session.operationId);
     RP4.app.updateClipUi();
-    await RP4.recorder.startPreview();
-    if (!failed) RP4.ui.setStatus('준비 완료', '녹화 준비가\n완료되었습니다.', 'ready');
+    if (!state.shuttingDown) {
+      await RP4.recorder.startPreview();
+      if (!failed) RP4.ui.setStatus('준비 완료', '녹화 준비가\n완료되었습니다.', 'ready');
+    }
   }
 
   async function performSaveClip(session) {
@@ -284,7 +301,7 @@
       requestReleased = true;
       if (session.pendingSaveRequests === 0) session.previousEpoch = null;
 
-      const profile = RP4.profile.get();
+      const profile = session.profile;
       const windowMs = profile.clipDurationSeconds * 1000;
       if (!snapshot.initChunk || snapshot.chunks.length === 0) {
         RP4.ui.showToast('아직 저장할 클립 데이터가 없습니다.');
@@ -384,6 +401,7 @@
 
   /** Waits for a snapshot/write/conversion already in progress before releasing capture. */
   async function finalizeForShutdown() {
+    await state.clipStartPromise?.catch(() => {});
     await state.clipSavePromise?.catch(() => {});
     if (state.clip) await stopClipMode(state.clip);
   }
