@@ -195,15 +195,22 @@ class WindowCropService {
         await fs.rm(scriptPath, { force: true });
         throw new Error('window crop host script verification failed');
       }
-      const child = spawn(POWERSHELL_PATH, [
-        '-NoProfile',
-        '-NonInteractive',
-        '-ExecutionPolicy', 'Bypass',
-        '-File', scriptPath
-      ], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      let child;
+      try {
+        child = spawn(POWERSHELL_PATH, [
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy', 'Bypass',
+          '-File', scriptPath
+        ], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      } catch (error) {
+        await fs.rm(scriptPath, { force: true }).catch(() => {});
+        throw error;
+      }
 
       if (this.disposed || generation !== this.generation) {
         child.kill();
+        await fs.rm(scriptPath, { force: true }).catch(() => {});
         return null;
       }
       this.child = child;
@@ -346,7 +353,7 @@ class WindowCropService {
     });
   }
 
-  dispose() {
+  async dispose() {
     this.disposed = true;
     this.generation += 1;
     const child = this.child;
@@ -358,15 +365,27 @@ class WindowCropService {
     }
     this.pending.clear();
     if (!child) return;
+    const exited = new Promise((resolve) => {
+      if (child.exitCode != null || child.signalCode != null) resolve(true);
+      else child.once('exit', () => resolve(true));
+    });
     try {
       child.stdin.write('quit\n');
       child.stdin.end();
     } catch {
       // ignore
     }
-    setTimeout(() => {
-      if (!child.killed) child.kill();
-    }, 300);
+    const graceful = await Promise.race([
+      exited,
+      new Promise((resolve) => setTimeout(() => resolve(false), 500))
+    ]);
+    if (!graceful && !child.killed) {
+      child.kill();
+      await Promise.race([
+        exited,
+        new Promise((resolve) => setTimeout(resolve, 500))
+      ]);
+    }
   }
 }
 

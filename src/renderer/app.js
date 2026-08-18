@@ -794,6 +794,7 @@
     });
 
     window.rp4.onConvertProgress(({ phase, ratio }) => {
+      util.reportShutdownProgress();
       const label = phase === 'transcode' ? '변환 중' : '컨테이너 정리 중';
       setProgress(ratio, `${label} ${Math.round(ratio * 100)}%`);
       if (ratio >= 1) window.setTimeout(() => setProgress(null), 800);
@@ -812,15 +813,27 @@
     });
 
     window.rp4.onFinalizeRecordings(async ({ requestId, saveActiveClip = false } = {}) => {
-      if (saveActiveClip) await RP4.clips.saveClip().catch(() => {});
-      RP4.lifecycle.prepareShutdown();
-      await Promise.allSettled([
-        RP4.recorder.finalizeForShutdown(),
-        RP4.clips.finalizeForShutdown(),
-        RP4.files.finalizeForShutdown(),
-        RP4.profile.flushSave()
-      ]);
-      window.rp4.reportFinalizeComplete(requestId);
+      state.shutdownRequestId = requestId;
+      state.shuttingDown = true;
+      for (const control of document.querySelectorAll('button, input, select')) {
+        control.disabled = true;
+      }
+      window.rp4.reportFinalizeAccepted(requestId);
+      const heartbeat = window.setInterval(() => util.reportShutdownProgress(), 2000);
+      try {
+        if (saveActiveClip) await RP4.clips.saveClip().catch(() => {});
+        RP4.lifecycle.prepareShutdown();
+        await Promise.allSettled([
+          RP4.recorder.finalizeForShutdown(),
+          RP4.clips.finalizeForShutdown(),
+          RP4.files.finalizeForShutdown(),
+          RP4.profile.flushSave()
+        ]);
+        window.rp4.reportFinalizeComplete(requestId);
+      } finally {
+        window.clearInterval(heartbeat);
+        state.shutdownRequestId = null;
+      }
     });
 
     els.screenshotFormatSelect.addEventListener('change', () => {

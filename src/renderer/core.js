@@ -45,6 +45,7 @@ window.RP4 = window.RP4 || {};
     clipSaving: false,
     clipSavePromise: null,
     screenshotPromise: null,
+    shutdownRequestId: null,
 
     timerId: null,
     toastTimer: null,
@@ -202,6 +203,12 @@ window.RP4 = window.RP4 || {};
 
   const IPC_SLICE_BYTES = 8 * 1024 * 1024;
 
+  function reportShutdownProgress() {
+    if (state.shutdownRequestId) {
+      window.rp4.reportFinalizeProgress(state.shutdownRequestId);
+    }
+  }
+
   async function writeBlobInSlices(sessionId, blob, { terminal = false } = {}) {
     for (let offset = 0; offset < blob.size; offset += IPC_SLICE_BYTES) {
       const part = blob.slice(offset, Math.min(blob.size, offset + IPC_SLICE_BYTES));
@@ -210,6 +217,7 @@ window.RP4 = window.RP4 || {};
         buffer: await part.arrayBuffer(),
         terminal
       });
+      reportShutdownProgress();
       if (result?.warning) return result;
     }
     return null;
@@ -231,7 +239,8 @@ window.RP4 = window.RP4 || {};
     isTypingTarget,
     stopStream,
     sleep,
-    writeBlobInSlices
+    writeBlobInSlices,
+    reportShutdownProgress
   };
   RP4.lifecycle = {
     begin: beginCapture,

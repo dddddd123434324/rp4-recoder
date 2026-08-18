@@ -155,7 +155,9 @@ async function run() {
   // ---- settings + path handling -------------------------------------------------
   const settings = new SettingsStore();
   await settings.load();
-  await settings.update({ recordingsDir: RECORDINGS });
+  // Automatic faststart jobs would race tests that deliberately construct recovery
+  // artifacts. Optimization itself is exercised explicitly at the end of this suite.
+  await settings.update({ recordingsDir: RECORDINGS, optimizeMp4: false });
   await paths.ensureRecordingDirs(settings.recordingsDir);
 
   check('settings persist to sandbox userData', fs.existsSync(paths.settingsFile()), paths.settingsFile());
@@ -324,11 +326,13 @@ async function run() {
   const fakeContents = new EventEmitter();
   fakeContents.send = (channel, payload) => {
     if (channel === 'app:finalize-recordings') {
-      setImmediate(() => require('electron').ipcMain.emit(
-        'app:shutdown-ready',
-        { sender: fakeContents },
-        { requestId: payload.requestId }
-      ));
+      const emitAck = (eventName) => require('electron').ipcMain.emit(
+        eventName, { sender: fakeContents }, { requestId: payload.requestId }
+      );
+      setImmediate(() => emitAck('app:shutdown-accepted'));
+      setTimeout(() => emitAck('app:shutdown-progress'), 30);
+      setTimeout(() => emitAck('app:shutdown-progress'), 65);
+      setTimeout(() => emitAck('app:shutdown-ready'), 100);
     }
   };
   const fakeWindow = { isDestroyed: () => false, webContents: fakeContents };
@@ -341,13 +345,29 @@ async function run() {
       return [];
     }
   };
+  const shutdownStartedAt = Date.now();
   const drained = await require('../src/main/windows').drainRecordings(
     fakeWindow,
     fakeRecordings,
-    { timeoutMs: 1000 }
+    { timeoutMs: 50 }
   );
-  check('shutdown waits for matching renderer ACK',
-    drained.rendererReady === true && drained.timedOut === false && shutdownOptions.failureReason === null);
+  check('shutdown heartbeat extends the inactivity deadline',
+    drained.rendererAccepted === true
+      && drained.rendererReady === true
+      && drained.timedOut === false
+      && shutdownOptions.failureReason === null
+      && Date.now() - shutdownStartedAt >= 90);
+
+  let closeAttempts = 0;
+  const closeFailureSession = {
+    handleClosed: false,
+    failed: null,
+    handle: { close: async () => { closeAttempts += 1; throw new Error('simulated EIO'); } }
+  };
+  await recordings.closeSessionHandle(closeFailureSession);
+  await recordings.closeSessionHandle(closeFailureSession);
+  check('unexpected recording close error becomes a single partial-save failure',
+    closeAttempts === 1 && /simulated EIO/.test(closeFailureSession.failed));
 
   // ---- capture real MediaRecorder output ----------------------------------------
   const win = new BrowserWindow({
@@ -633,6 +653,17 @@ async function run() {
   check('orphaned temp recording is recovered', sweep.recovered.length === 1,
     sweep.recovered[0] ? path.basename(sweep.recovered[0]) : 'none');
   check('recovered file left the temp folder', !fs.existsSync(orphan));
+
+  const corruptOrphan = path.join(settings.tempDir, `rp4-${crypto.randomUUID()}.part.mp4`);
+  await fsp.writeFile(corruptOrphan, Buffer.alloc(2048, 0xaa));
+  const corruptSweep = await recordings.sweepTempDir();
+  const corruptRecovered = corruptSweep.recovered[0];
+  const corruptMeta = corruptRecovered ? recordings.metadata.get(corruptRecovered) : null;
+  check('invalid orphan is preserved and explicitly classified partial',
+    Boolean(corruptRecovered)
+      && !fs.existsSync(corruptOrphan)
+      && corruptMeta?.status === 'partial'
+      && corruptMeta?.outcome === 'recovered-partial');
 
   const tiny = path.join(settings.tempDir, `rp4-${crypto.randomUUID()}.part.mp4`);
   await fsp.writeFile(tiny, Buffer.alloc(128));

@@ -160,7 +160,7 @@
    * resolution and while the app is minimized.
    */
   async function performTakeScreenshot() {
-    if (state.sourceSelectionPending) return;
+    if (state.shuttingDown || state.sourceSelectionPending) return;
     if (!state.selectedSource) {
       RP4.ui.showToast('먼저 캡처 소스를 선택해 주세요.');
       return;

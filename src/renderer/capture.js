@@ -583,21 +583,19 @@
     const mode = snapshot.mode || state.selectedMode;
     const areaSelection = snapshot.areaSelection || state.areaSelection;
     if (!source) throw new Error('캡처 소스가 없습니다.');
-    const frame = await window.rp4.captureScreenshotSource(source.id);
+    const frame = await window.rp4.captureScreenshotSource({
+      sourceId: source.id,
+      mode,
+      areaSelection,
+      hasAreaSelection: snapshot.hasAreaSelection
+    });
     const bitmap = await createImageBitmap(new Blob([frame.buffer], { type: 'image/png' }));
     try {
-      let crop = { x: 0, y: 0, width: bitmap.width, height: bitmap.height };
-      if (mode === 'area' && snapshot.hasAreaSelection !== false) {
-        crop = areaCropFor(bitmap.width, bitmap.height, areaSelection);
-      } else if (source.type === 'window') {
-        if (frame.clientCrop) crop = windowCropFor(frame.clientCrop, bitmap.width, bitmap.height);
-      }
-
       const canvas = document.createElement('canvas');
-      canvas.width = crop.width;
-      canvas.height = crop.height;
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
       const context = canvas.getContext('2d');
-      context.drawImage(bitmap, crop.x, crop.y, crop.width, crop.height, 0, 0, crop.width, crop.height);
+      context.drawImage(bitmap, 0, 0);
 
       return canvas;
     } finally {

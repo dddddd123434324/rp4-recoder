@@ -463,20 +463,53 @@ class RecordingManager {
       // being deleted, so an interrupted take is never silently thrown away.
       if (stats.size > MIN_RECOVERABLE_RECORDING_BYTES) {
         const extension = match[2].toLowerCase();
-        const baseName = `${timestamp()}_recovered_${match[1].slice(0, 8)}`;
+        const repairPath = `${fullPath}.repair-${crypto.randomUUID()}.${extension}`;
+        let recoveredSource = fullPath;
+        let repaired = false;
+        let validationFailure = null;
+        try {
+          await ffmpeg.validateMedia(fullPath);
+        } catch (error) {
+          validationFailure = error?.message || String(error);
+          try {
+            await ffmpeg.remux(fullPath, repairPath, {
+              jobId: `recover:${match[1]}`
+            });
+            await ffmpeg.validateMedia(repairPath);
+            recoveredSource = repairPath;
+            repaired = true;
+            validationFailure = null;
+          } catch (repairError) {
+            validationFailure = repairError?.message || validationFailure || String(repairError);
+            await fs.rm(repairPath, { force: true }).catch(() => {});
+          }
+        }
+
+        const partial = Boolean(validationFailure);
+        const baseName = `${timestamp()}_recovered${partial ? '_partial' : ''}_${match[1].slice(0, 8)}`;
         const target = await uniquePath(this.settings.recordingsDir, baseName, extension);
         try {
-          await this.moveFile(fullPath, target);
+          await this.moveFile(recoveredSource, target);
+          if (recoveredSource !== fullPath) {
+            await fs.rm(fullPath, { force: true }).catch(() => {});
+          }
+          const recoveredStats = await statFile(target);
           await this.setMetadata(target, {
-            status: 'complete',
-            outcome: 'recovered',
+            status: partial ? 'partial' : 'complete',
+            partial,
+            outcome: partial ? 'recovered-partial' : 'recovered',
             recovered: true,
+            repaired,
+            failureReason: partial
+              ? `비정상 종료 파일을 완전히 검증하거나 복구하지 못했습니다. ${validationFailure}`.slice(0, 500)
+              : null,
             recoveredAt: new Date().toISOString(),
-            bytes: stats.size
+            bytes: recoveredStats?.size || stats.size
           });
           recovered.push(target);
           continue;
         } catch (error) {
+          await fs.rm(repairPath, { force: true }).catch(() => {});
           failed.push({ filePath: fullPath, error: error?.message || String(error) });
           continue;
         }
@@ -546,6 +579,7 @@ class RecordingManager {
       recordedCodec,
       recordedAudioCodec,
       forceRemux: safeMeta.clip === true,
+      handleClosed: false,
       bytes: 0,
       writeChain: Promise.resolve(),
       acceptingWrites: true,
@@ -673,11 +707,7 @@ class RecordingManager {
 
   async finishSession(session, payload = {}) {
     await session.writeChain.catch(() => {});
-    try {
-      await session.handle.close();
-    } catch {
-      // Already closed; the bytes on disk are still valid.
-    }
+    await this.closeSessionHandle(session);
 
     const tempStats = await statFile(session.tempPath);
     session.bytes = Math.max(session.bytes, tempStats?.size || 0);
@@ -731,6 +761,17 @@ class RecordingManager {
       failureReason: meta.failureReason,
       outcome
     };
+  }
+
+  async closeSessionHandle(session) {
+    if (!session || session.handleClosed) return;
+    session.handleClosed = true;
+    try {
+      await session.handle.close();
+    } catch (error) {
+      const message = `녹화 파일을 닫는 중 오류가 발생했습니다. ${error?.message || error}`;
+      session.failed = session.failed ? `${session.failed} ${message}`.slice(0, 500) : message.slice(0, 500);
+    }
   }
 
   /**
@@ -1196,11 +1237,7 @@ class RecordingManager {
     await Promise.allSettled(sessions.map(async ([, session]) => {
       session.acceptingWrites = false;
       await session.writeChain.catch(() => {});
-      try {
-        await session.handle.close();
-      } catch {
-        // ignore
-      }
+      await this.closeSessionHandle(session);
     }));
 
     await Promise.allSettled([...this.finalizing.values()].map((entry) => entry.promise));

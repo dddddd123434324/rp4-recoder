@@ -9,6 +9,7 @@ const displays = require('./displays');
 const SRC_DIR = path.resolve(__dirname, '..');
 const APP_ROOT = path.resolve(SRC_DIR, '..');
 const ICON_PATH = path.join(APP_ROOT, 'icon.ico');
+const UNRESPONSIVE_GRACE_MS = 10000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -60,12 +61,24 @@ function createMainWindow({ isSmoke, onQuitRequested, onRendererGone, onRenderer
   });
 
   hardenWebContents(win.webContents);
+  let unresponsiveTimer = null;
+  const clearUnresponsiveTimer = () => {
+    clearTimeout(unresponsiveTimer);
+    unresponsiveTimer = null;
+  };
   win.webContents.on('render-process-gone', (_event, details) => {
+    clearUnresponsiveTimer();
     void onRendererGone?.(win, details);
   });
   win.webContents.on('unresponsive', () => {
-    void onRendererUnresponsive?.(win);
+    if (unresponsiveTimer) return;
+    unresponsiveTimer = setTimeout(() => {
+      unresponsiveTimer = null;
+      void onRendererUnresponsive?.(win);
+    }, UNRESPONSIVE_GRACE_MS);
   });
+  win.webContents.on('responsive', clearUnresponsiveTimer);
+  win.webContents.on('destroyed', clearUnresponsiveTimer);
 
   win.once('ready-to-show', () => {
     if (isSmoke) return;
@@ -101,40 +114,68 @@ function createMainWindow({ isSmoke, onQuitRequested, onRendererGone, onRenderer
  * sessions to drain. Closing the window used to abandon the take in the temporary folder, where it was
  * invisible to the user.
  */
-async function drainRecordings(win, recordingManager, { timeoutMs = 20000, saveActiveClip = false } = {}) {
+async function drainRecordings(win, recordingManager, {
+  timeoutMs = 20000,
+  saveActiveClip = false,
+  timeoutFailureReason = null
+} = {}) {
   const requestId = crypto.randomUUID();
-  const deadline = Date.now() + timeoutMs;
   let rendererReady = !win || win.isDestroyed();
+  let rendererAccepted = rendererReady;
 
   if (win && !win.isDestroyed()) {
-    rendererReady = await new Promise((resolve) => {
+    const result = await new Promise((resolve) => {
       let settled = false;
       let timer = null;
-      const finish = (ready) => {
+      let accepted = false;
+      const armInactivityTimer = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => finish(false), timeoutMs);
+      };
+      const finish = (completed) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        ipcMain.removeListener('app:shutdown-accepted', onAccepted);
+        ipcMain.removeListener('app:shutdown-progress', onProgress);
         ipcMain.removeListener('app:shutdown-ready', onReady);
         win.webContents.removeListener('destroyed', onDestroyed);
-        resolve(ready);
+        resolve({ completed, accepted });
+      };
+      const matches = (event, payload) => (
+        event.sender === win.webContents && payload?.requestId === requestId
+      );
+      const onAccepted = (event, payload = {}) => {
+        if (!matches(event, payload)) return;
+        accepted = true;
+        armInactivityTimer();
+      };
+      const onProgress = (event, payload = {}) => {
+        if (!matches(event, payload)) return;
+        armInactivityTimer();
       };
       const onReady = (event, payload = {}) => {
-        if (event.sender !== win.webContents || payload.requestId !== requestId) return;
+        if (!matches(event, payload)) return;
         finish(true);
       };
       const onDestroyed = () => finish(false);
-      timer = setTimeout(() => finish(false), timeoutMs);
 
+      ipcMain.on('app:shutdown-accepted', onAccepted);
+      ipcMain.on('app:shutdown-progress', onProgress);
       ipcMain.on('app:shutdown-ready', onReady);
       win.webContents.once('destroyed', onDestroyed);
+      armInactivityTimer();
       try {
         win.webContents.send('app:finalize-recordings', { requestId, saveActiveClip });
       } catch {
         finish(false);
       }
     });
+    rendererReady = result.completed;
+    rendererAccepted = result.accepted;
   }
 
+  const deadline = Date.now() + timeoutMs;
   while (recordingManager.hasActiveSessions() && Date.now() < deadline) {
     await sleep(150);
   }
@@ -144,9 +185,17 @@ async function drainRecordings(win, recordingManager, { timeoutMs = 20000, saveA
   // only copy of the recording.
   const timedOut = !rendererReady || recordingManager.hasActiveSessions();
   const saved = await recordingManager.finalizeAllSessions({
-    failureReason: timedOut ? '앱 종료 대기 시간이 지나 부분 저장했습니다.' : null
+    failureReason: timedOut
+      ? timeoutFailureReason || '앱 종료 대기 시간이 지나 부분 저장했습니다.'
+      : null
   });
-  return { drained: !recordingManager.hasPendingRecordings(), rendererReady, timedOut, saved };
+  return {
+    drained: !recordingManager.hasPendingRecordings(),
+    rendererReady,
+    rendererAccepted,
+    timedOut,
+    saved
+  };
 }
 
 async function confirmCloseWhileRecording(win) {
@@ -279,5 +328,6 @@ module.exports = {
   confirmCloseWhileClip,
   selectDesktopArea,
   closeAreaSelector,
-  sleep
+  sleep,
+  UNRESPONSIVE_GRACE_MS
 };

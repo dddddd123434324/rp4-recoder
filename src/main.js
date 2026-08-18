@@ -24,7 +24,7 @@ let hotkeys = null;
 let isQuitting = false;
 let smokeFinished = false;
 let rendererCaptureState = { recordingActive: false, clipActive: false, clipSaving: false };
-let rendererFailureHandled = false;
+const failedRendererIds = new Set();
 
 function send(channel, payload) {
   if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return false;
@@ -66,7 +66,12 @@ function finishSmoke(code, message) {
  * `before-quit` cannot be used for this on its own because Electron ignores the promise
  * returned by an async listener, so the process could exit before the files were closed.
  */
-async function shutdown({ saveActiveClip = false } = {}) {
+async function shutdown({
+  saveActiveClip = false,
+  rendererUnavailable = false,
+  failureReason = null,
+  exitCode = 0
+} = {}) {
   if (isQuitting) return;
   isQuitting = true;
 
@@ -81,9 +86,17 @@ async function shutdown({ saveActiveClip = false } = {}) {
   await cleanup('hotkeys', () => hotkeys?.unregisterAll());
   await cleanup('area selector', () => windows.closeAreaSelector());
   if (recordings) {
-    await cleanup('recordings', () => (
-      windows.drainRecordings(mainWindow, recordings, { timeoutMs: 20000, saveActiveClip })
-    ));
+    if (rendererUnavailable) {
+      await cleanup('recordings', () => recordings.finalizeAllSessions({ failureReason }));
+    } else {
+      await cleanup('recordings', () => (
+        windows.drainRecordings(mainWindow, recordings, {
+          timeoutMs: 20000,
+          saveActiveClip,
+          timeoutFailureReason: failureReason
+        })
+      ));
+    }
     await cleanup('session handles', () => recordings.closeAllSessions());
     await cleanup('optimizations', () => recordings.cancelAndDrainOptimizations());
   }
@@ -96,7 +109,7 @@ async function shutdown({ saveActiveClip = false } = {}) {
     mainWindow.destroy();
   }
 
-  app.exit(0);
+  app.exit(exitCode);
 }
 
 /**
@@ -119,21 +132,26 @@ async function handleQuitRequest(win) {
   await shutdown({ saveActiveClip });
 }
 
-async function handleRendererFailure(win, detail) {
-  if (rendererFailureHandled || isQuitting) return;
-  rendererFailureHandled = true;
-  const reason = typeof detail === 'string'
-    ? detail
-    : `렌더러 프로세스 종료: ${detail?.reason || '알 수 없는 오류'}`;
-  await recordings?.finalizeAllSessions({ failureReason: reason }).catch(() => {});
-  if (!IS_SMOKE && win && !win.isDestroyed()) {
-    await dialog.showMessageBox(win, {
-      type: 'error',
-      title: 'RP4 Recorder',
-      message: '프로그램 화면이 응답하지 않아 녹화를 부분 저장했습니다.',
-      detail: '프로그램을 다시 시작해 주세요.'
-    }).catch(() => {});
-  }
+async function handleRendererGone(win, detail) {
+  const rendererId = win?.webContents?.id;
+  if (isQuitting || (rendererId != null && failedRendererIds.has(rendererId))) return;
+  if (rendererId != null) failedRendererIds.add(rendererId);
+  await shutdown({
+    rendererUnavailable: true,
+    failureReason: `렌더러 프로세스 종료: ${detail?.reason || '알 수 없는 오류'}`,
+    exitCode: 1
+  });
+}
+
+async function handleRendererUnresponsive() {
+  if (isQuitting) return;
+  // The grace period in createMainWindow has already elapsed. Try the normal renderer
+  // shutdown protocol first; if it cannot answer, drainRecordings falls back to partial save.
+  await shutdown({
+    saveActiveClip: rendererCaptureState.clipActive || rendererCaptureState.clipSaving,
+    failureReason: '렌더러가 장시간 응답하지 않아 부분 저장했습니다.',
+    exitCode: 1
+  });
 }
 
 async function bootstrap() {
@@ -196,8 +214,8 @@ async function bootstrap() {
     mainWindow = windows.createMainWindow({
       isSmoke: IS_SMOKE,
       onQuitRequested: handleQuitRequest,
-      onRendererGone: handleRendererFailure,
-      onRendererUnresponsive: (win) => handleRendererFailure(win, '렌더러가 응답하지 않습니다.')
+      onRendererGone: handleRendererGone,
+      onRendererUnresponsive: handleRendererUnresponsive
     });
     const rendererLoaded = mainWindow.rp4Loaded;
 
@@ -277,8 +295,8 @@ async function bootstrap() {
       mainWindow = windows.createMainWindow({
         isSmoke: IS_SMOKE,
         onQuitRequested: handleQuitRequest,
-        onRendererGone: handleRendererFailure,
-        onRendererUnresponsive: (win) => handleRendererFailure(win, '렌더러가 응답하지 않습니다.')
+        onRendererGone: handleRendererGone,
+        onRendererUnresponsive: handleRendererUnresponsive
       });
     }
   });

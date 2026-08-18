@@ -452,7 +452,7 @@
       poll();
     });
     await stopRecording();
-    await Promise.race([done, util.sleep(15000)]);
+    await done;
   }
 
   RP4.recorder = {

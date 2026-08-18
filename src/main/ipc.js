@@ -24,6 +24,7 @@ const { parseWindowHandle } = require('./window-crop');
 const MEDIA_FILE_PATTERN = /\.(mp4|webm|mkv)$/i;
 const MAX_SCREENSHOT_BYTES = 256 * 1024 * 1024;
 const MAX_SCREENSHOT_PIXELS = 7680 * 4320;
+const MAX_WEBP_RENDERER_PIXELS = 4096 * 2160;
 
 function clampCropRect(rect, width, height) {
   const x = Math.max(0, Math.min(width - 1, Math.round(Number(rect.x) || 0)));
@@ -256,8 +257,11 @@ function registerIpcHandlers(context) {
     return windowCrop.query(hwnd);
   });
 
-  handleMain('screenshot:capture-source', async (_event, sourceId) => {
-    const captured = await captureScreenshotImage(sourceId, { applyCrop: false });
+  handleMain('screenshot:capture-source', async (_event, payload = {}) => {
+    const captured = await captureScreenshotImage(payload.sourceId, payload);
+    if (captured.width * captured.height > MAX_WEBP_RENDERER_PIXELS) {
+      throw new Error('WebP 스크린샷의 원본 영역이 안전한 처리 한도를 초과했습니다. 화질을 낮추지 않고 저장을 중단합니다.');
+    }
     const buffer = captured.image.toPNG();
     if (buffer.length > MAX_SCREENSHOT_BYTES) {
       throw new Error('원본 스크린샷이 안전한 전송 한도(256MB)를 초과했습니다.');
@@ -266,7 +270,7 @@ function registerIpcHandlers(context) {
       buffer,
       width: captured.width,
       height: captured.height,
-      clientCrop: captured.clientCrop
+      clientCrop: null
     };
   });
 

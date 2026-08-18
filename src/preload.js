@@ -26,7 +26,7 @@ contextBridge.exposeInMainWorld('rp4', {
   listSources: () => ipcRenderer.invoke('sources:list'),
   selectArea: () => ipcRenderer.invoke('area:select'),
   getWindowClientCrop: (sourceId) => ipcRenderer.invoke('window:client-crop', sourceId),
-  captureScreenshotSource: (sourceId) => ipcRenderer.invoke('screenshot:capture-source', sourceId),
+  captureScreenshotSource: (payload) => ipcRenderer.invoke('screenshot:capture-source', payload),
   captureAndSaveScreenshot: (payload) => ipcRenderer.invoke('screenshot:capture-save', payload),
 
   listRecordings: () => ipcRenderer.invoke('recordings:list'),
@@ -66,6 +66,8 @@ contextBridge.exposeInMainWorld('rp4', {
   // Fired when the app is closing so the renderer can flush and finalize a recording
   // before the window goes away.
   onFinalizeRecordings: (callback) => subscribe('app:finalize-recordings', callback),
+  reportFinalizeAccepted: (requestId) => ipcRenderer.send('app:shutdown-accepted', { requestId }),
+  reportFinalizeProgress: (requestId) => ipcRenderer.send('app:shutdown-progress', { requestId }),
   reportFinalizeComplete: (requestId) => ipcRenderer.send('app:shutdown-ready', { requestId }),
 
   window: {
