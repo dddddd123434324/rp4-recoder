@@ -10,7 +10,6 @@
   const { state, els, util } = RP4;
 
   const CHUNK_MS = 1000;
-  const MIN_SEGMENT_MS = 3000;
   const MAX_SEGMENT_MS = 15000;
 
   function epochBytes(epoch) {
@@ -41,6 +40,21 @@
   function clipLimitBytes() {
     const limitMb = Number(state.appSettings.clipBufferLimitMb) || 256;
     return limitMb * 1024 * 1024;
+  }
+
+  function activeBufferLimit(session) {
+    const limit = clipLimitBytes();
+    const reserve = Math.min(64 * 1024 * 1024, Math.max(8 * 1024 * 1024, limit / 4));
+    return Math.max(reserve, limit - (session?.pendingSnapshotBytes || 0));
+  }
+
+  function segmentDurationMs(profile) {
+    const videoBitsPerSecond = Math.max(0.1, Number(profile?.bitrateMbps) || 10) * 1000 * 1000;
+    const audioBitsPerSecond = Math.max(8, Number(profile?.audioBitrateKbps) || 192) * 1000;
+    const bytesPerMs = (videoBitsPerSecond + audioBitsPerSecond) / 8 / 1000;
+    const memoryBoundMs = Math.floor(clipLimitBytes() / Math.max(1, bytesPerMs) / 4);
+    const durationBoundMs = Math.round((Number(profile?.clipDurationSeconds) || 300) * 1000 / 3);
+    return Math.max(CHUNK_MS, Math.min(MAX_SEGMENT_MS, durationBoundMs, memoryBoundMs));
   }
 
   function enqueueOperation(session, task) {
@@ -99,7 +113,7 @@
   function pruneBuffer(session) {
     if (!session || state.clip !== session || session.stopping) return;
     const currentAge = epochDuration(session.currentEpoch);
-    const capacityExceeded = activeBufferBytes(session) > clipLimitBytes();
+    const capacityExceeded = activeBufferBytes(session) > activeBufferLimit(session);
     if ((currentAge < session.segmentMs && !capacityExceeded) || session.rotationPromise) return;
 
     if (capacityExceeded) session.trimmedForSize = true;
@@ -111,10 +125,11 @@
   function pruneCompletedEpochs(session) {
     const targetMs = session.profile.clipDurationSeconds * 1000;
     const durationLimit = targetMs + session.segmentMs;
-    while (session.completedEpochs.length > 1) {
+    const minimumEpochs = session.pendingSnapshotBytes > 0 ? 0 : 1;
+    while (session.completedEpochs.length > minimumEpochs) {
       const totalDuration = activeBufferDuration(session);
       const overDuration = totalDuration > durationLimit;
-      const overCapacity = activeBufferBytes(session) > clipLimitBytes();
+      const overCapacity = activeBufferBytes(session) > activeBufferLimit(session);
       if (!overDuration && !overCapacity) break;
       if (overCapacity) session.trimmedForSize = true;
       session.completedEpochs.shift();
@@ -249,10 +264,7 @@
         sourceSnapshot,
         currentEpoch: null,
         completedEpochs: [],
-        segmentMs: Math.max(
-          MIN_SEGMENT_MS,
-          Math.min(MAX_SEGMENT_MS, Math.round(profile.clipDurationSeconds * 1000 / 3))
-        ),
+        segmentMs: segmentDurationMs(profile),
         startedAt: Date.now(),
         trimmedForSize: false,
         rotationPromise: null,
@@ -497,12 +509,33 @@
         error: '활성 클립 버퍼가 없습니다.'
       });
     }
+    state.lastClipSaveResult = null;
     const promise = performSaveClip(session);
     state.clipSavePromise = promise;
+    void promise.then((result) => {
+      state.lastClipSaveResult = result;
+    }, (error) => {
+      state.lastClipSaveResult = {
+        ok: false,
+        saved: null,
+        partial: false,
+        error: error?.message || String(error || '클립 저장에 실패했습니다.')
+      };
+    });
     void promise.finally(() => {
       if (state.clipSavePromise === promise) state.clipSavePromise = null;
     });
     return promise;
+  }
+
+  function prepareForShutdown(mode) {
+    if (mode === 'wait-current-save') {
+      return state.clipSavePromise || Promise.resolve(
+        state.lastClipSaveResult || { ok: true, saved: null, partial: false, error: null }
+      );
+    }
+    if (mode === 'save-current-buffer') return saveClip();
+    return Promise.resolve({ ok: true, saved: null, partial: false, error: null });
   }
 
   /** Waits for a snapshot/write/conversion already in progress before releasing capture. */
@@ -520,6 +553,7 @@
         + session.currentEpoch.chunks.length,
       bytes: retainedBytes(session),
       limitBytes: clipLimitBytes(),
+      activeLimitBytes: activeBufferLimit(session),
       availableMs: activeBufferDuration(session),
       targetMs: session.profile.clipDurationSeconds * 1000,
       limitedByCapacity: session.trimmedForSize
@@ -531,8 +565,10 @@
     startClipMode,
     stopClipMode,
     saveClip,
+    prepareForShutdown,
     finalizeForShutdown,
     pruneActiveBuffer,
-    bufferStatus
+    bufferStatus,
+    policy: { activeBufferLimit, segmentDurationMs }
   };
 }(window.RP4));

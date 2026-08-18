@@ -291,7 +291,11 @@ async function run() {
   const oversizedIndexPath = path.join(USER_DATA, 'recordings-index.json');
   await fsp.writeFile(oversizedIndexPath, 'x');
   await fsp.truncate(oversizedIndexPath, MAX_INDEX_BYTES + 1);
-  const recordings = new RecordingManager({ settings, emit: () => {} });
+  const emittedRecordingEvents = [];
+  const recordings = new RecordingManager({
+    settings,
+    emit: (channel, payload) => emittedRecordingEvents.push({ channel, payload })
+  });
   const oversizedIndex = await recordings.loadIndex();
   check('oversized recording index is backed up without parsing',
     oversizedIndex.recovered && Boolean(oversizedIndex.backupPath));
@@ -338,8 +342,10 @@ async function run() {
 
   // Main waits for an explicit renderer ACK even before a recording session exists.
   const fakeContents = new EventEmitter();
+  let requestedClipShutdownMode = null;
   fakeContents.send = (channel, payload) => {
     if (channel === 'app:finalize-recordings') {
+      requestedClipShutdownMode = payload.clipShutdownMode;
       const emitAck = (eventName, progress = undefined) => require('electron').ipcMain.emit(
         eventName, { sender: fakeContents }, { requestId: payload.requestId, progress }
       );
@@ -363,12 +369,13 @@ async function run() {
   const drained = await require('../src/main/windows').drainRecordings(
     fakeWindow,
     fakeRecordings,
-    { timeoutMs: 50 }
+    { timeoutMs: 50, clipShutdownMode: 'wait-current-save' }
   );
   check('shutdown heartbeat extends the inactivity deadline',
     drained.rendererAccepted === true
       && drained.rendererReady === true
       && drained.timedOut === false
+      && requestedClipShutdownMode === 'wait-current-save'
       && shutdownOptions.failureReason === null
       && Date.now() - shutdownStartedAt >= 90);
 
@@ -442,6 +449,54 @@ async function run() {
   const page = path.join(SANDBOX, 'page.html');
   fs.writeFileSync(page, '<!doctype html><html><body>itest</body></html>', 'utf8');
   await win.loadFile(page);
+
+  const clipsSource = await fsp.readFile(path.join(__dirname, '..', 'src', 'renderer', 'clips.js'), 'utf8');
+  const clipPolicyResult = JSON.parse(await win.webContents.executeJavaScript(`
+    (async () => {
+      window.RP4 = {
+        state: {
+          appSettings: { clipBufferLimitMb: 256 },
+          captureLifecycle: 'clip',
+          clip: { sentinel: true },
+          clipSavePromise: null,
+          clipSaving: false,
+          lastClipSaveResult: { ok: true, marker: 'completed-before-confirmation' }
+        },
+        els: {},
+        util: {}
+      };
+      eval(${JSON.stringify(clipsSource)});
+      const completed = await window.RP4.clips.prepareForShutdown('wait-current-save');
+      window.RP4.state.lastClipSaveResult = null;
+      window.RP4.state.clipSavePromise = Promise.resolve({ ok: true, marker: 'still-running' });
+      const running = await window.RP4.clips.prepareForShutdown('wait-current-save');
+      const activeLimit = window.RP4.clips.policy.activeBufferLimit({
+        pendingSnapshotBytes: 190 * 1024 * 1024
+      });
+      const highBitrateSegmentMs = window.RP4.clips.policy.segmentDurationMs({
+        bitrateMbps: 1000,
+        audioBitrateKbps: 320,
+        clipDurationSeconds: 300
+      });
+      return JSON.stringify({
+        completedMarker: completed.marker,
+        runningMarker: running.marker,
+        activeLimit,
+        highBitrateSegmentMs,
+        clipSaving: window.RP4.state.clipSaving
+      });
+    })()
+  `));
+  check('shutdown wait mode never starts a second clip save',
+    clipPolicyResult.completedMarker === 'completed-before-confirmation'
+      && clipPolicyResult.runningMarker === 'still-running'
+      && clipPolicyResult.clipSaving === false);
+  check('pending snapshot reduces the active clip memory allowance',
+    clipPolicyResult.activeLimit === 66 * 1024 * 1024,
+    `${clipPolicyResult.activeLimit} bytes`);
+  check('high bitrate shortens rolling clip epochs',
+    clipPolicyResult.highBitrateSegmentMs === 1000,
+    `${clipPolicyResult.highBitrateSegmentMs} ms`);
 
   const recorded = await recordChunks(win, { seconds: 5, timeslice: 1000 });
   check('renderer produced MP4 chunks', recorded.buffers.length >= 2,
@@ -744,6 +799,12 @@ async function run() {
   check('rolling clip epochs concatenate into one decodable clip',
     segmentedProbe.codec === 'h264' && (segmentedProbe.durationSec || 0) > 6,
     `codec=${segmentedProbe.codec} duration=${segmentedProbe.durationSec}s`);
+  check('clip concatenation emits shutdown-visible progress',
+    emittedRecordingEvents.some((entry) => (
+      entry.channel === 'recording:convert-progress'
+        && entry.payload?.phase === 'clip-concat'
+        && Number(entry.payload?.ratio) >= 0
+    )));
 
   const genericMeta = { ...clipMeta, mimeType: 'video/mp4' };
   const genericSession = await recordings.start(genericMeta, { webContentsId: win.webContents.id });

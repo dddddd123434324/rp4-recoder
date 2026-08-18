@@ -771,7 +771,11 @@ class RecordingManager {
         const sourceSegments = [...session.segmentPaths];
         await ffmpeg.concatSegments(session.segmentPaths, combinedPath, {
           jobId: `clip-concat:${session.baseName}`,
-          totalDurationMs: Number(payload.durationMs) || Number(session.meta.durationMs) || 0
+          totalDurationMs: Number(payload.durationMs) || Number(session.meta.durationMs) || 0,
+          onProgress: (ratio) => this.emit('recording:convert-progress', {
+            phase: 'clip-concat',
+            ratio
+          })
         });
         await ffmpeg.validateMedia(combinedPath);
         session.tempPath = combinedPath;

@@ -44,6 +44,7 @@ window.RP4 = window.RP4 || {};
     clip: null,
     clipSaving: false,
     clipSavePromise: null,
+    lastClipSaveResult: null,
     screenshotPromise: null,
     shutdownRequestId: null,
 

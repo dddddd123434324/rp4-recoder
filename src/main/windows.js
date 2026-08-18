@@ -119,7 +119,7 @@ function createMainWindow({ isSmoke, onQuitRequested, onRendererGone, onRenderer
 async function drainRecordings(win, recordingManager, {
   timeoutMs = 20000,
   maxTotalMs = MAX_TOTAL_SHUTDOWN_MS,
-  saveActiveClip = false,
+  clipShutdownMode = 'discard',
   timeoutFailureReason = null
 } = {}) {
   const requestId = crypto.randomUUID();
@@ -182,7 +182,7 @@ async function drainRecordings(win, recordingManager, {
       armInactivityTimer();
       hardTimer = setTimeout(() => finish(false), maxTotalMs);
       try {
-        win.webContents.send('app:finalize-recordings', { requestId, saveActiveClip });
+        win.webContents.send('app:finalize-recordings', { requestId, clipShutdownMode });
       } catch {
         finish(false);
       }
@@ -256,8 +256,8 @@ async function confirmCloseWhileClip(win, { saving = false } = {}) {
       ? '진행 중인 저장을 안전하게 마친 뒤 종료합니다.'
       : '종료하기 전에 현재 버퍼의 최근 장면을 저장할 수 있습니다.'
   });
-  if (saving) return response === 0 ? 'save' : 'cancel';
-  return response === 0 ? 'save' : response === 1 ? 'discard' : 'cancel';
+  if (saving) return response === 0 ? 'wait-current-save' : 'cancel';
+  return response === 0 ? 'save-current-buffer' : response === 1 ? 'discard' : 'cancel';
 }
 
 async function confirmClipSaveFailure(win, error) {

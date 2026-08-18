@@ -67,7 +67,7 @@ function finishSmoke(code, message) {
  * returned by an async listener, so the process could exit before the files were closed.
  */
 async function shutdown({
-  saveActiveClip = false,
+  clipShutdownMode = 'discard',
   rendererUnavailable = false,
   failureReason = null,
   exitCode = 0
@@ -93,13 +93,13 @@ async function shutdown({
       try {
         drainResult = await windows.drainRecordings(mainWindow, recordings, {
           timeoutMs: 20000,
-          saveActiveClip,
+          clipShutdownMode,
           timeoutFailureReason: failureReason
         });
       } catch (error) {
         process.stderr.write(`shutdown recordings error: ${error?.message || error}\n`);
       }
-      if (drainResult?.shutdownFailed && saveActiveClip) {
+      if (drainResult?.shutdownFailed && clipShutdownMode !== 'discard') {
         const decision = await windows.confirmClipSaveFailure(mainWindow, drainResult.error);
         if (decision === 'return') {
           isQuitting = false;
@@ -112,7 +112,7 @@ async function shutdown({
         }
         await windows.drainRecordings(mainWindow, recordings, {
           timeoutMs: 20000,
-          saveActiveClip: false,
+          clipShutdownMode: 'discard',
           timeoutFailureReason: failureReason
         });
       }
@@ -140,19 +140,19 @@ async function shutdown({
 async function handleQuitRequest(win) {
   if (isQuitting) return;
 
-  let saveActiveClip = false;
+  let clipShutdownMode = 'discard';
   if (rendererCaptureState.clipActive || rendererCaptureState.clipSaving) {
     const decision = await windows.confirmCloseWhileClip(win, {
       saving: rendererCaptureState.clipSaving
     });
     if (decision === 'cancel') return;
-    saveActiveClip = decision === 'save';
+    clipShutdownMode = decision;
   } else if (recordings?.hasPendingRecordings()) {
     const shouldSave = await windows.confirmCloseWhileRecording(win);
     if (!shouldSave) return;
   }
 
-  await shutdown({ saveActiveClip });
+  await shutdown({ clipShutdownMode });
 }
 
 async function handleRendererGone(win, detail) {
@@ -171,7 +171,9 @@ async function handleRendererUnresponsive() {
   // The grace period in createMainWindow has already elapsed. Try the normal renderer
   // shutdown protocol first; if it cannot answer, drainRecordings falls back to partial save.
   await shutdown({
-    saveActiveClip: rendererCaptureState.clipActive || rendererCaptureState.clipSaving,
+    clipShutdownMode: rendererCaptureState.clipSaving
+      ? 'wait-current-save'
+      : rendererCaptureState.clipActive ? 'save-current-buffer' : 'discard',
     failureReason: '렌더러가 장시간 응답하지 않아 부분 저장했습니다.',
     exitCode: 1
   });

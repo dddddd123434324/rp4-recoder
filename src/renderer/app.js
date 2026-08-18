@@ -838,14 +838,20 @@
       void RP4.recorder.stopRecording();
     });
 
-    window.rp4.onFinalizeRecordings(async ({ requestId, saveActiveClip = false } = {}) => {
+    window.rp4.onFinalizeRecordings(async ({ requestId, clipShutdownMode = 'discard' } = {}) => {
       state.shutdownRequestId = requestId;
       state.shuttingDown = true;
       document.body.classList.add('shutdown-pending');
       window.rp4.reportFinalizeAccepted(requestId);
+      let heartbeatSequence = 0;
+      util.reportShutdownProgress({ phase: 'shutdown-finalizing', sequence: heartbeatSequence });
+      const heartbeat = window.setInterval(() => {
+        heartbeatSequence += 1;
+        util.reportShutdownProgress({ phase: 'shutdown-finalizing', sequence: heartbeatSequence });
+      }, 5000);
       try {
-        if (saveActiveClip) {
-          const clipResult = await RP4.clips.saveClip();
+        if (clipShutdownMode !== 'discard') {
+          const clipResult = await RP4.clips.prepareForShutdown(clipShutdownMode);
           if (!clipResult?.ok) {
             window.rp4.reportFinalizeFailed(requestId, clipResult?.error);
             state.shuttingDown = false;
@@ -872,6 +878,7 @@
         document.body.classList.remove('shutdown-pending');
         RP4.app.updateClipUi();
       } finally {
+        window.clearInterval(heartbeat);
         state.shutdownRequestId = null;
       }
     });
