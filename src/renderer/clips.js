@@ -203,6 +203,7 @@
       els.previewVideo.muted = true;
       await els.previewVideo.play().catch(() => {});
       els.previewPlaceholder.classList.add('hidden');
+      RP4.capture.notifyAudioStatus(capture);
 
       const session = {
         ...capture,
@@ -334,6 +335,10 @@
         bitrateMbps: profile.bitrateMbps,
         audioBitrateKbps: profile.audioBitrateKbps,
         encoderPreset: profile.encoderPreset,
+        requestedSystemAudio: session.requestedSystemAudio,
+        hasSystemAudio: session.hasSystemAudio,
+        requestedMic: session.requestedMic,
+        hasMic: session.hasMic,
         durationMs: estimatedMs,
         trimRecentMs: estimatedMs,
         trimEndOffsetMs: Math.max(0, snapshot.endedAt - snapshot.requestedAt),
@@ -374,8 +379,8 @@
         RP4.ui.setStatus('클립 원본 보존됨', saved.name, 'warn');
         RP4.ui.showToast(`최근 구간 변환에 실패해 전체 원본을 보존했습니다: ${saved.name}`);
       } else {
-        RP4.ui.setStatus('클립 저장 완료', saved.name, 'ready');
-        RP4.ui.showToast(`클립 저장 완료: ${saved.name}`);
+        RP4.ui.setStatus('클립 저장 완료', `${saved.name} · 버퍼 다시 확보 중`, 'ready');
+        RP4.ui.showToast(`클립 저장 완료: ${saved.name} · 최근 장면 버퍼를 다시 확보합니다.`);
       }
 
       if (wasTrimmedForSize) {

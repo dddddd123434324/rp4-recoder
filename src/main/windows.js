@@ -37,7 +37,7 @@ function hardenWebContents(contents) {
   });
 }
 
-function createMainWindow({ isSmoke, onQuitRequested }) {
+function createMainWindow({ isSmoke, onQuitRequested, onRendererGone, onRendererUnresponsive }) {
   const win = new BrowserWindow({
     width: 1440,
     height: 900,
@@ -60,6 +60,12 @@ function createMainWindow({ isSmoke, onQuitRequested }) {
   });
 
   hardenWebContents(win.webContents);
+  win.webContents.on('render-process-gone', (_event, details) => {
+    void onRendererGone?.(win, details);
+  });
+  win.webContents.on('unresponsive', () => {
+    void onRendererUnresponsive?.(win);
+  });
 
   win.once('ready-to-show', () => {
     if (isSmoke) return;
@@ -72,7 +78,7 @@ function createMainWindow({ isSmoke, onQuitRequested }) {
     void onQuitRequested(win);
   });
 
-  void win.loadFile(path.join(SRC_DIR, 'index.html')).catch(async (error) => {
+  win.rp4Loaded = win.loadFile(path.join(SRC_DIR, 'index.html')).catch(async (error) => {
     if (!isSmoke && !win.isDestroyed()) {
       await dialog.showMessageBox(win, {
         type: 'error',
@@ -85,6 +91,7 @@ function createMainWindow({ isSmoke, onQuitRequested }) {
       win.rp4AllowClose = true;
       win.destroy();
     }
+    throw error;
   });
   return win;
 }
@@ -94,7 +101,7 @@ function createMainWindow({ isSmoke, onQuitRequested }) {
  * sessions to drain. Closing the window used to abandon the take in the temporary folder, where it was
  * invisible to the user.
  */
-async function drainRecordings(win, recordingManager, { timeoutMs = 20000 } = {}) {
+async function drainRecordings(win, recordingManager, { timeoutMs = 20000, saveActiveClip = false } = {}) {
   const requestId = crypto.randomUUID();
   const deadline = Date.now() + timeoutMs;
   let rendererReady = !win || win.isDestroyed();
@@ -121,7 +128,7 @@ async function drainRecordings(win, recordingManager, { timeoutMs = 20000 } = {}
       ipcMain.on('app:shutdown-ready', onReady);
       win.webContents.once('destroyed', onDestroyed);
       try {
-        win.webContents.send('app:finalize-recordings', { requestId });
+        win.webContents.send('app:finalize-recordings', { requestId, saveActiveClip });
       } catch {
         finish(false);
       }
@@ -154,6 +161,20 @@ async function confirmCloseWhileRecording(win) {
     detail: '지금 종료하면 녹화를 마무리한 뒤 파일을 저장합니다.'
   });
   return response === 0;
+}
+
+async function confirmCloseWhileClip(win) {
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'warning',
+    buttons: ['최근 클립 저장 후 종료', '저장하지 않고 종료', '취소'],
+    defaultId: 0,
+    cancelId: 2,
+    noLink: true,
+    title: 'RP4 Recorder',
+    message: '클립 녹화 모드가 실행 중입니다.',
+    detail: '종료하기 전에 현재 버퍼의 최근 장면을 저장할 수 있습니다.'
+  });
+  return response === 0 ? 'save' : response === 1 ? 'discard' : 'cancel';
 }
 
 /**
@@ -255,6 +276,7 @@ module.exports = {
   hardenWebContents,
   drainRecordings,
   confirmCloseWhileRecording,
+  confirmCloseWhileClip,
   selectDesktopArea,
   closeAreaSelector,
   sleep

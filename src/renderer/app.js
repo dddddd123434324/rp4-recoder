@@ -73,7 +73,8 @@
       toast: RP4.$('#toast'),
       minimizeButton: RP4.$('#minimizeButton'),
       maximizeButton: RP4.$('#maximizeButton'),
-      closeButton: RP4.$('#closeButton')
+      closeButton: RP4.$('#closeButton'),
+      versionLabel: RP4.$('#versionLabel')
     });
 
     // Fail loudly during development if the markup and the renderer drift apart, instead
@@ -180,6 +181,11 @@
     els.recordingPill.classList.toggle('hidden', !recording && !clipActive);
     els.recordingPill.classList.toggle('paused', state.isPaused);
     updateProfileControls();
+    void window.rp4.reportCaptureState({
+      recordingActive: Boolean(state.recording),
+      clipActive: Boolean(state.clip),
+      clipSaving: Boolean(state.clipSaving)
+    }).catch(() => {});
   }
 
   function updateProfileControls() {
@@ -805,7 +811,8 @@
       void RP4.recorder.stopRecording();
     });
 
-    window.rp4.onFinalizeRecordings(async ({ requestId } = {}) => {
+    window.rp4.onFinalizeRecordings(async ({ requestId, saveActiveClip = false } = {}) => {
+      if (saveActiveClip) await RP4.clips.saveClip().catch(() => {});
       RP4.lifecycle.prepareShutdown();
       await Promise.allSettled([
         RP4.recorder.finalizeForShutdown(),
@@ -893,6 +900,7 @@
 
     try {
       state.appInfo = await window.rp4.appInfo();
+      els.versionLabel.textContent = `v${state.appInfo.version}`;
       await loadAppSettings();
       await RP4.hotkeys.load();
       updateVolumeLabels();

@@ -27,6 +27,7 @@ contextBridge.exposeInMainWorld('rp4', {
   selectArea: () => ipcRenderer.invoke('area:select'),
   getWindowClientCrop: (sourceId) => ipcRenderer.invoke('window:client-crop', sourceId),
   captureScreenshotSource: (sourceId) => ipcRenderer.invoke('screenshot:capture-source', sourceId),
+  captureAndSaveScreenshot: (payload) => ipcRenderer.invoke('screenshot:capture-save', payload),
 
   listRecordings: () => ipcRenderer.invoke('recordings:list'),
   getRecordingThumbnail: (filePath) => ipcRenderer.invoke('recording:thumbnail', filePath),
@@ -55,6 +56,7 @@ contextBridge.exposeInMainWorld('rp4', {
   resetHotkeys: () => ipcRenderer.invoke('hotkeys:reset'),
 
   reportSmoke: (report) => ipcRenderer.invoke('smoke:report', report),
+  reportCaptureState: (captureState) => ipcRenderer.invoke('capture:state', captureState),
 
   onHotkey: (callback) => subscribe('hotkey:trigger', callback),
   onNotice: (callback) => subscribe('app:notice', callback),

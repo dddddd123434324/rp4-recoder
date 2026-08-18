@@ -1,6 +1,7 @@
 'use strict';
 
 const { spawn } = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const readline = require('node:readline');
@@ -21,7 +22,6 @@ const paths = require('./paths');
  * enough to re-poll continuously while recording.
  */
 
-const HOST_SCRIPT_NAME = 'rp4-window-crop-host.ps1';
 const READY_TOKEN = 'RP4:READY';
 const RESPONSE_PREFIX = 'RP4:';
 const READY_TIMEOUT_MS = 20000;
@@ -134,6 +134,14 @@ while ($true) {
     [Console]::Out.Flush()
 }
 `;
+const HOST_SCRIPT_HASH = crypto.createHash('sha256').update(HOST_SCRIPT, 'utf8').digest('hex');
+const POWERSHELL_PATH = path.join(
+  process.env.SystemRoot || 'C:\\Windows',
+  'System32',
+  'WindowsPowerShell',
+  'v1.0',
+  'powershell.exe'
+);
 
 class WindowCropService {
   constructor() {
@@ -147,10 +155,30 @@ class WindowCropService {
   }
 
   async hostScriptPath() {
-    const target = path.join(paths.configDir(), HOST_SCRIPT_NAME);
+    const target = path.join(paths.configDir(), `rp4-window-crop-host-${crypto.randomUUID()}.ps1`);
     await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, HOST_SCRIPT, 'utf8');
+    const handle = await fs.open(target, 'wx');
+    try {
+      await handle.writeFile(HOST_SCRIPT, 'utf8');
+    } finally {
+      await handle.close();
+    }
     return target;
+  }
+
+  terminateHost(child, generation) {
+    if (this.child === child && this.generation === generation) {
+      this.child = null;
+      this.ready = null;
+      this.generation += 1;
+    }
+    for (const [id, entry] of this.pending) {
+      if (entry.child !== child) continue;
+      clearTimeout(entry.timer);
+      entry.resolve(null);
+      this.pending.delete(id);
+    }
+    if (child && !child.killed) child.kill();
   }
 
   async ensureHost() {
@@ -160,7 +188,14 @@ class WindowCropService {
     const generation = ++this.generation;
     const ready = (async () => {
       const scriptPath = await this.hostScriptPath();
-      const child = spawn('powershell.exe', [
+      const actualHash = crypto.createHash('sha256')
+        .update(await fs.readFile(scriptPath))
+        .digest('hex');
+      if (actualHash !== HOST_SCRIPT_HASH) {
+        await fs.rm(scriptPath, { force: true });
+        throw new Error('window crop host script verification failed');
+      }
+      const child = spawn(POWERSHELL_PATH, [
         '-NoProfile',
         '-NonInteractive',
         '-ExecutionPolicy', 'Bypass',
@@ -201,6 +236,7 @@ class WindowCropService {
           entry.resolve(null);
           this.pending.delete(id);
         }
+        void fs.rm(scriptPath, { force: true }).catch(() => {});
       };
       rl.on('line', (value) => {
         const line = value.trim();
@@ -230,6 +266,9 @@ class WindowCropService {
       } finally {
         clearTimeout(timer);
       }
+
+      // PowerShell has already loaded the script; remove the writable file immediately.
+      await fs.rm(scriptPath, { force: true }).catch(() => {});
 
       if (this.child !== child || this.generation !== generation || this.disposed) {
         if (!child.killed) child.kill();
@@ -293,6 +332,7 @@ class WindowCropService {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         resolve(null);
+        this.terminateHost(child, this.generation);
       }, REQUEST_TIMEOUT_MS);
 
       this.pending.set(id, { resolve, timer, child, generation: this.generation });

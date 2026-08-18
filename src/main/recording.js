@@ -99,6 +99,53 @@ function audioCodecFromMimeType(mimeType) {
   return 'unknown';
 }
 
+function boundedString(value, maxLength = 160) {
+  return typeof value === 'string' ? value.trim().slice(0, maxLength) : undefined;
+}
+
+function boundedNumber(value, min, max, { integer = false } = {}) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return undefined;
+  const bounded = Math.max(min, Math.min(max, number));
+  return integer ? Math.round(bounded) : bounded;
+}
+
+/** Strict renderer-to-main metadata boundary: unknown and oversized fields are dropped. */
+function normalizeRecordingMeta(value = {}) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const output = {};
+  const strings = {
+    mode: 32,
+    modeLabel: 96,
+    sourceName: 160,
+    format: 12,
+    mimeType: 160,
+    encoderPreset: 24
+  };
+  for (const [key, maxLength] of Object.entries(strings)) {
+    const normalized = boundedString(source[key], maxLength);
+    if (normalized !== undefined) output[key] = normalized;
+  }
+  const numbers = {
+    width: [1, 16384, true],
+    height: [1, 16384, true],
+    fps: [1, 480, false],
+    bitrateMbps: [0.1, 1000, false],
+    audioBitrateKbps: [8, 1024, false],
+    durationMs: [0, 24 * 60 * 60 * 1000, true],
+    trimRecentMs: [0, 24 * 60 * 60 * 1000, true],
+    trimEndOffsetMs: [0, 24 * 60 * 60 * 1000, true]
+  };
+  for (const [key, [min, max, integer]] of Object.entries(numbers)) {
+    const normalized = boundedNumber(source[key], min, max, { integer });
+    if (normalized !== undefined) output[key] = normalized;
+  }
+  for (const key of ['clip', 'requestedSystemAudio', 'hasSystemAudio', 'requestedMic', 'hasMic']) {
+    if (typeof source[key] === 'boolean') output[key] = source[key];
+  }
+  return output;
+}
+
 async function statFile(filePath) {
   try {
     return await fs.stat(filePath);
@@ -148,15 +195,18 @@ async function moveFile(from, to) {
  */
 async function replaceFileSafely(original, replacement, {
   move = moveFile,
-  remove = (filePath) => fs.rm(filePath, { force: true })
+  remove = (filePath) => fs.rm(filePath, { force: true }),
+  validate = null
 } = {}) {
   const backup = `${original}.backup-${crypto.randomUUID()}`;
   await move(original, backup);
 
   try {
     await move(replacement, original);
+    if (validate) await validate(original);
   } catch (error) {
     try {
+      await remove(original).catch(() => {});
       await move(backup, original);
     } catch (restoreError) {
       error.restoreError = restoreError;
@@ -468,15 +518,16 @@ class RecordingManager {
       throw new Error('저장 공간이 부족합니다. 최소 512MB 이상의 여유 공간이 필요합니다.');
     }
 
-    const targetFormat = meta.format === 'webm' ? 'webm' : 'mp4';
-    const recordedContainer = containerFromMimeType(meta.mimeType);
-    const recordedCodec = videoCodecFromMimeType(meta.mimeType);
-    const recordedAudioCodec = audioCodecFromMimeType(meta.mimeType);
+    const safeMeta = normalizeRecordingMeta(meta);
+    const targetFormat = safeMeta.format === 'webm' ? 'webm' : 'mp4';
+    const recordedContainer = containerFromMimeType(safeMeta.mimeType);
+    const recordedCodec = videoCodecFromMimeType(safeMeta.mimeType);
+    const recordedAudioCodec = audioCodecFromMimeType(safeMeta.mimeType);
     const sessionId = crypto.randomUUID();
     const baseName = [
       timestamp(),
-      sanitizeName(meta.modeLabel || meta.mode, 'recording'),
-      sanitizeName(meta.sourceName, 'source'),
+      sanitizeName(safeMeta.modeLabel || safeMeta.mode, 'recording'),
+      sanitizeName(safeMeta.sourceName, 'source'),
       sessionId.slice(0, 8)
     ].join('_');
 
@@ -494,7 +545,7 @@ class RecordingManager {
       recordedContainer,
       recordedCodec,
       recordedAudioCodec,
-      forceRemux: meta.clip === true,
+      forceRemux: safeMeta.clip === true,
       bytes: 0,
       writeChain: Promise.resolve(),
       acceptingWrites: true,
@@ -502,7 +553,7 @@ class RecordingManager {
       failed: null,
       diskCheckUnavailableWarned: available == null,
       meta: {
-        ...meta,
+        ...safeMeta,
         targetFormat,
         recordedContainer,
         recordedCodec,
@@ -653,7 +704,7 @@ class RecordingManager {
       : finalized.conversionError ? 'original-preserved' : 'exact';
     const meta = {
       ...session.meta,
-      ...(payload.meta && typeof payload.meta === 'object' ? payload.meta : {}),
+      ...normalizeRecordingMeta(payload.meta),
       format: finalized.format,
       converted: finalized.converted,
       conversionError: finalized.conversionError || null,
@@ -730,6 +781,7 @@ class RecordingManager {
             onProgress: progress
           });
         }
+        await ffmpeg.validateMedia(target);
         await fs.rm(session.tempPath, { force: true });
         return { filePath: target, format: targetFormat, converted: true, optimizable: false };
       } catch (error) {
@@ -764,6 +816,7 @@ class RecordingManager {
         } else {
           await ffmpeg.remux(session.tempPath, target, remuxOptions);
         }
+        await ffmpeg.validateMedia(target);
         await fs.rm(session.tempPath, { force: true });
         return { filePath: target, format: 'mp4', converted: true, optimizable: false };
       } catch (error) {
@@ -784,6 +837,7 @@ class RecordingManager {
           jobId: `convert:${session.baseName}`,
           onProgress: (ratio) => this.emit('recording:convert-progress', { phase: 'transcode', ratio })
         });
+        await ffmpeg.validateMedia(target);
         await fs.rm(session.tempPath, { force: true });
         return { filePath: target, format: 'mp4', converted: true, optimizable: false };
       } catch (error) {
@@ -904,18 +958,31 @@ class RecordingManager {
         const optimized = `${job.filePath}.optimizing-${crypto.randomUUID()}.mp4`;
         this.optimizingFilePath = job.filePath;
         try {
+          const before = await statFile(job.filePath);
+          const available = await freeBytes(path.dirname(job.filePath));
+          const required = (before?.size || 0) * 1.1 + MIN_FREE_BYTES_TO_CONTINUE;
+          if (available != null && available < required) {
+            this.emit('recording:optimize', {
+              filePath: job.filePath,
+              state: 'skipped-low-space'
+            });
+            continue;
+          }
           this.emit('recording:optimize', { filePath: job.filePath, state: 'start' });
           await ffmpeg.remux(job.filePath, optimized, {
             jobId: `optimize:${job.filePath}`,
             totalDurationMs: job.durationMs
           });
 
-          const before = await statFile(job.filePath);
           const after = await statFile(optimized);
           // Only swap when the result looks sane, so a truncated remux cannot replace a
           // good recording.
           if (after && before && after.size > before.size * 0.5) {
-            await replaceFileSafely(job.filePath, optimized, { move: this.moveFile });
+            await ffmpeg.validateMedia(optimized);
+            await replaceFileSafely(job.filePath, optimized, {
+              move: this.moveFile,
+              validate: (filePath) => ffmpeg.validateMedia(filePath)
+            });
             const meta = this.metadata.get(job.filePath);
             if (meta) await this.setMetadata(job.filePath, { ...meta, optimized: true, bytes: after.size });
             this.emit('recording:optimize', { filePath: job.filePath, state: 'done' });
@@ -1057,8 +1124,9 @@ class RecordingManager {
   /** Moves a completed top-level recording to the OS recycle bin and prunes its metadata. */
   async trashRecording(filePath, { trash } = {}) {
     if (typeof filePath !== 'string' || typeof trash !== 'function') return false;
-    const recordingsDir = path.resolve(this.settings.recordingsDir);
-    const target = path.resolve(filePath);
+    const recordingsDir = await fs.realpath(path.resolve(this.settings.recordingsDir)).catch(() => null);
+    const target = await fs.realpath(path.resolve(filePath)).catch(() => null);
+    if (!recordingsDir || !target) return false;
     if (path.dirname(target).toLowerCase() !== recordingsDir.toLowerCase()
       || !RECORDING_EXTENSIONS.test(target)) return false;
     if (!(await paths.pathExists(target))) return false;
@@ -1179,6 +1247,7 @@ module.exports = {
   containerFromMimeType,
   videoCodecFromMimeType,
   audioCodecFromMimeType,
+  normalizeRecordingMeta,
   recoveryOriginalName,
   uniquePath,
   moveFile,

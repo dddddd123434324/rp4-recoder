@@ -23,10 +23,16 @@ let recordings = null;
 let hotkeys = null;
 let isQuitting = false;
 let smokeFinished = false;
+let rendererCaptureState = { recordingActive: false, clipActive: false, clipSaving: false };
+let rendererFailureHandled = false;
 
 function send(channel, payload) {
-  if (mainWindow && !mainWindow.isDestroyed()) {
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return false;
+  try {
     mainWindow.webContents.send(channel, payload);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -60,7 +66,7 @@ function finishSmoke(code, message) {
  * `before-quit` cannot be used for this on its own because Electron ignores the promise
  * returned by an async listener, so the process could exit before the files were closed.
  */
-async function shutdown() {
+async function shutdown({ saveActiveClip = false } = {}) {
   if (isQuitting) return;
   isQuitting = true;
 
@@ -76,7 +82,7 @@ async function shutdown() {
   await cleanup('area selector', () => windows.closeAreaSelector());
   if (recordings) {
     await cleanup('recordings', () => (
-      windows.drainRecordings(mainWindow, recordings, { timeoutMs: 20000 })
+      windows.drainRecordings(mainWindow, recordings, { timeoutMs: 20000, saveActiveClip })
     ));
     await cleanup('session handles', () => recordings.closeAllSessions());
     await cleanup('optimizations', () => recordings.cancelAndDrainOptimizations());
@@ -100,12 +106,34 @@ async function shutdown() {
 async function handleQuitRequest(win) {
   if (isQuitting) return;
 
-  if (recordings?.hasPendingRecordings()) {
+  let saveActiveClip = false;
+  if (rendererCaptureState.clipActive || rendererCaptureState.clipSaving) {
+    const decision = await windows.confirmCloseWhileClip(win);
+    if (decision === 'cancel') return;
+    saveActiveClip = decision === 'save';
+  } else if (recordings?.hasPendingRecordings()) {
     const shouldSave = await windows.confirmCloseWhileRecording(win);
     if (!shouldSave) return;
   }
 
-  await shutdown();
+  await shutdown({ saveActiveClip });
+}
+
+async function handleRendererFailure(win, detail) {
+  if (rendererFailureHandled || isQuitting) return;
+  rendererFailureHandled = true;
+  const reason = typeof detail === 'string'
+    ? detail
+    : `렌더러 프로세스 종료: ${detail?.reason || '알 수 없는 오류'}`;
+  await recordings?.finalizeAllSessions({ failureReason: reason }).catch(() => {});
+  if (!IS_SMOKE && win && !win.isDestroyed()) {
+    await dialog.showMessageBox(win, {
+      type: 'error',
+      title: 'RP4 Recorder',
+      message: '프로그램 화면이 응답하지 않아 녹화를 부분 저장했습니다.',
+      detail: '프로그램을 다시 시작해 주세요.'
+    }).catch(() => {});
+  }
 }
 
 async function bootstrap() {
@@ -146,7 +174,14 @@ async function bootstrap() {
       isTrustedAppContents(webContents) && ['media', 'display-capture'].includes(permission)
     ));
 
-    registerIpcHandlers({ settings, recordings, windowCrop, hotkeys, isSmoke: IS_SMOKE });
+    registerIpcHandlers({
+      settings,
+      recordings,
+      windowCrop,
+      hotkeys,
+      isSmoke: IS_SMOKE,
+      setCaptureState: (value) => { rendererCaptureState = value; }
+    });
 
     ipcMain.handle('smoke:report', async (_event, report = {}) => {
       if (!IS_SMOKE) return false;
@@ -160,15 +195,19 @@ async function bootstrap() {
 
     mainWindow = windows.createMainWindow({
       isSmoke: IS_SMOKE,
-      onQuitRequested: handleQuitRequest
+      onQuitRequested: handleQuitRequest,
+      onRendererGone: handleRendererFailure,
+      onRendererUnresponsive: (win) => handleRendererFailure(win, '렌더러가 응답하지 않습니다.')
     });
+    const rendererLoaded = mainWindow.rp4Loaded;
 
     hotkeys.register(settings.value.hotkeys);
 
     // Recover anything a previous crash left behind, and tell the user if their
     // configured folder was not usable.
     const sweep = await recordings.sweepTempDir();
-    mainWindow.webContents.once('did-finish-load', () => {
+    await rendererLoaded;
+    {
       if (loaded.settingsRecovered) {
         send('app:notice', {
           level: 'warn',
@@ -218,7 +257,7 @@ async function bootstrap() {
           message: `최적화 잔여 파일 ${reconciliation.failed.length}개를 자동 복구하지 못했습니다.`
         });
       }
-    });
+    }
 
     if (IS_SMOKE) {
       setTimeout(() => finishSmoke(1, 'SMOKE FAIL timeout'), SMOKE_TIMEOUT_MS);
@@ -237,7 +276,9 @@ async function bootstrap() {
     if (BrowserWindow.getAllWindows().length === 0) {
       mainWindow = windows.createMainWindow({
         isSmoke: IS_SMOKE,
-        onQuitRequested: handleQuitRequest
+        onQuitRequested: handleQuitRequest,
+        onRendererGone: handleRendererFailure,
+        onRendererUnresponsive: (win) => handleRendererFailure(win, '렌더러가 응답하지 않습니다.')
       });
     }
   });

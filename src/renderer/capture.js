@@ -106,7 +106,11 @@
     };
 
     if (!audio) {
-      return { stream: await navigator.mediaDevices.getUserMedia({ audio: false, video }), systemAudio: false };
+      return {
+        stream: await navigator.mediaDevices.getUserMedia({ audio: false, video }),
+        requestedSystemAudio: false,
+        hasSystemAudio: false
+      };
     }
 
     try {
@@ -114,12 +118,23 @@
         audio: { mandatory: { chromeMediaSource: 'desktop', chromeMediaSourceId: source.id } },
         video
       });
-      return { stream, systemAudio: stream.getAudioTracks().length > 0 };
+      const hasSystemAudio = stream.getAudioTracks().length > 0;
+      return {
+        stream,
+        requestedSystemAudio: true,
+        hasSystemAudio,
+        systemAudioUnavailable: !hasSystemAudio
+      };
     } catch {
       // Chromium can only attach loopback audio to whole-screen sources, so window capture
       // falls back to video only.
       const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video });
-      return { stream, systemAudio: false, systemAudioUnavailable: true };
+      return {
+        stream,
+        requestedSystemAudio: true,
+        hasSystemAudio: false,
+        systemAudioUnavailable: true
+      };
     }
   }
 
@@ -451,6 +466,7 @@
       const outputStream = new MediaStream([videoOut.track]);
       const gains = { system: null, mic: null };
       let audioContext = null;
+      let hasMic = false;
 
       const audioSources = [];
       if (audio && desktop.stream.getAudioTracks().length > 0) {
@@ -468,6 +484,7 @@
             audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: false }
           });
           inputs.push(micStream);
+          hasMic = micStream.getAudioTracks().length > 0;
           audioSources.push({
             key: 'mic',
             stream: micStream,
@@ -506,7 +523,11 @@
       return {
         stream: outputStream,
         output,
-        systemAudio: desktop.systemAudio,
+        requestedSystemAudio: Boolean(desktop.requestedSystemAudio),
+        hasSystemAudio: Boolean(desktop.hasSystemAudio),
+        requestedMic: Boolean(includeMic),
+        hasMic,
+        systemAudio: Boolean(desktop.hasSystemAudio),
         systemAudioUnavailable: Boolean(desktop.systemAudioUnavailable),
         gains,
         audioContext,
@@ -539,6 +560,14 @@
         util.stopStream(stream);
       }
       throw error;
+    }
+  }
+
+  function notifyAudioStatus(capture) {
+    if (capture.requestedSystemAudio && !capture.hasSystemAudio) {
+      RP4.ui.showToast(capture.hasMic
+        ? '이 소스에서는 시스템 오디오를 사용할 수 없어 마이크만 녹음합니다.'
+        : '이 소스에서는 시스템 오디오를 사용할 수 없어 오디오 없이 녹화합니다.');
     }
   }
 
@@ -580,6 +609,7 @@
     pickRecorderMime,
     supportsZeroCopyCrop,
     createCaptureStream,
+    notifyAudioStatus,
     captureStill,
     computeOutputSize
   };

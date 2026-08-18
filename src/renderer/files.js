@@ -173,8 +173,22 @@
       hasAreaSelection: state.hasAreaSelection
     };
     try {
-      const canvas = await RP4.capture.captureStill(snapshot);
       const configuredFormat = state.appSettings.screenshotFormat || 'png';
+      if (configuredFormat !== 'webp') {
+        const saved = await window.rp4.captureAndSaveScreenshot({
+          sourceId: snapshot.source.id,
+          mode: snapshot.mode,
+          areaSelection: snapshot.areaSelection,
+          hasAreaSelection: snapshot.hasAreaSelection,
+          format: configuredFormat,
+          quality: state.appSettings.screenshotQuality
+        });
+        RP4.ui.showToast(`스크린샷 저장: ${saved.fileName} (${saved.width}x${saved.height})`);
+        return;
+      }
+
+      // Electron NativeImage has no WebP encoder, so WebP alone uses the renderer path.
+      const canvas = await RP4.capture.captureStill(snapshot);
       const requestedMime = configuredFormat === 'jpeg'
         ? 'image/jpeg'
         : configuredFormat === 'webp' ? 'image/webp' : 'image/png';

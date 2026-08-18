@@ -23,6 +23,15 @@ const { parseWindowHandle } = require('./window-crop');
 
 const MEDIA_FILE_PATTERN = /\.(mp4|webm|mkv)$/i;
 const MAX_SCREENSHOT_BYTES = 256 * 1024 * 1024;
+const MAX_SCREENSHOT_PIXELS = 7680 * 4320;
+
+function clampCropRect(rect, width, height) {
+  const x = Math.max(0, Math.min(width - 1, Math.round(Number(rect.x) || 0)));
+  const y = Math.max(0, Math.min(height - 1, Math.round(Number(rect.y) || 0)));
+  const cropWidth = Math.max(1, Math.min(width - x, Math.round(Number(rect.width) || width)));
+  const cropHeight = Math.max(1, Math.min(height - y, Math.round(Number(rect.height) || height)));
+  return { x, y, width: cropWidth, height: cropHeight };
+}
 
 function isTrustedFileSender(event, fileName) {
   if (!event?.sender || event.sender.isDestroyed()) return false;
@@ -69,7 +78,7 @@ async function resolveRecordingMediaFile(recordingsDir, filePath) {
  * @param {boolean} context.isSmoke
  */
 function registerIpcHandlers(context) {
-  const { settings, recordings, windowCrop, hotkeys, isSmoke } = context;
+  const { settings, recordings, windowCrop, hotkeys, isSmoke, setCaptureState } = context;
   let folderDialogActive = false;
   const handleMain = (channel, handler) => ipcMain.handle(channel, (event, ...args) => {
     if (!isTopLevelWindowSender(event)) throw new Error('허용되지 않은 IPC 송신자입니다.');
@@ -105,6 +114,80 @@ function registerIpcHandlers(context) {
     };
   }
 
+  async function captureScreenshotImage(sourceId, snapshot = {}) {
+    const id = String(sourceId || '');
+    const type = id.startsWith('screen:') ? 'screen' : id.startsWith('window:') ? 'window' : null;
+    if (!type) throw new Error('스크린샷 소스가 올바르지 않습니다.');
+
+    let width;
+    let height;
+    let clientCrop = null;
+    if (type === 'screen') {
+      const available = await desktopCapturer.getSources({
+        types: ['screen'],
+        thumbnailSize: { width: 0, height: 0 }
+      });
+      const source = available.find((item) => item.id === id);
+      const display = source && screen.getAllDisplays().find((item) => (
+        String(item.id) === String(source.display_id)
+      ));
+      if (!display) throw new Error('스크린샷 화면 크기를 확인할 수 없습니다.');
+      width = Math.round(display.bounds.width * display.scaleFactor);
+      height = Math.round(display.bounds.height * display.scaleFactor);
+    } else {
+      const hwnd = parseWindowHandle(id);
+      clientCrop = hwnd ? await windowCrop.query(hwnd) : null;
+      if (!clientCrop) {
+        throw new Error('최소화된 창은 원본 크기로 캡처할 수 없습니다. 창을 복원해 주세요.');
+      }
+      width = Math.round(clientCrop.frameWidth);
+      height = Math.round(clientCrop.frameHeight);
+    }
+
+    if (width < 1 || height < 1 || width * height > MAX_SCREENSHOT_PIXELS) {
+      throw new Error('스크린샷 원본 해상도가 안전한 처리 한도를 초과했습니다. 이미지를 축소하지 않고 저장을 중단합니다.');
+    }
+    const sources = await desktopCapturer.getSources({
+      types: [type],
+      thumbnailSize: { width, height },
+      fetchWindowIcons: false
+    });
+    const source = sources.find((item) => item.id === id);
+    if (!source || source.thumbnail.isEmpty()) {
+      throw new Error('스크린샷 원본 프레임을 가져올 수 없습니다.');
+    }
+
+    let image = source.thumbnail;
+    const size = image.getSize();
+    if (size.width !== width || size.height !== height) {
+      throw new Error(`원본 해상도 캡처에 실패했습니다. 요청 ${width}x${height}, 결과 ${size.width}x${size.height}`);
+    }
+    let crop = { x: 0, y: 0, width: size.width, height: size.height };
+    if (snapshot.mode === 'area' && snapshot.hasAreaSelection !== false) {
+      const area = snapshot.areaSelection || {};
+      crop = clampCropRect({
+        x: Number(area.x) * size.width,
+        y: Number(area.y) * size.height,
+        width: Number(area.width) * size.width,
+        height: Number(area.height) * size.height
+      }, size.width, size.height);
+    } else if (type === 'window' && clientCrop && snapshot.applyCrop !== false) {
+      const scaleX = size.width / Math.max(1, clientCrop.frameWidth);
+      const scaleY = size.height / Math.max(1, clientCrop.frameHeight);
+      crop = clampCropRect({
+        x: clientCrop.x * scaleX,
+        y: clientCrop.y * scaleY,
+        width: clientCrop.width * scaleX,
+        height: clientCrop.height * scaleY
+      }, size.width, size.height);
+    }
+    if (crop.x || crop.y || crop.width !== size.width || crop.height !== size.height) {
+      image = image.crop(crop);
+    }
+    const outputSize = image.getSize();
+    return { image, width: outputSize.width, height: outputSize.height, clientCrop };
+  }
+
   handleMain('app:info', async () => ({
     appRoot: windows.APP_ROOT,
     configDir: paths.configDir(),
@@ -116,6 +199,15 @@ function registerIpcHandlers(context) {
     ffmpegAvailable: Boolean(ffmpeg.resolveExecutable()),
     isSmoke
   }));
+
+  handleMain('capture:state', async (_event, value = {}) => {
+    setCaptureState?.({
+      recordingActive: value.recordingActive === true,
+      clipActive: value.clipActive === true,
+      clipSaving: value.clipSaving === true
+    });
+    return true;
+  });
 
   handleMain('sources:list', async () => {
     const allDisplays = screen.getAllDisplays();
@@ -165,59 +257,35 @@ function registerIpcHandlers(context) {
   });
 
   handleMain('screenshot:capture-source', async (_event, sourceId) => {
-    const id = String(sourceId || '');
-    const type = id.startsWith('screen:') ? 'screen' : id.startsWith('window:') ? 'window' : null;
-    if (!type) throw new Error('스크린샷 소스가 올바르지 않습니다.');
-
-    let width;
-    let height;
-    let clientCrop = null;
-
-    if (type === 'screen') {
-      const available = await desktopCapturer.getSources({
-        types: ['screen'],
-        thumbnailSize: { width: 0, height: 0 }
-      });
-      const source = available.find((item) => item.id === id);
-      if (!source) throw new Error('스크린샷 화면을 찾을 수 없습니다.');
-      const display = screen.getAllDisplays().find((item) => (
-        String(item.id) === String(source.display_id)
-      ));
-      if (!display) throw new Error('스크린샷 화면 크기를 확인할 수 없습니다.');
-      width = Math.round(display.bounds.width * display.scaleFactor);
-      height = Math.round(display.bounds.height * display.scaleFactor);
-    } else {
-      const hwnd = parseWindowHandle(id);
-      clientCrop = hwnd ? await windowCrop.query(hwnd) : null;
-      if (!clientCrop) {
-        throw new Error('최소화된 창은 원본 크기로 캡처할 수 없습니다. 창을 복원해 주세요.');
-      }
-      width = clientCrop.frameWidth;
-      height = clientCrop.frameHeight;
-    }
-
-    width = Math.max(2, Math.min(7680, Math.round(Number(width) || 0)));
-    height = Math.max(2, Math.min(4320, Math.round(Number(height) || 0)));
-    const sources = await desktopCapturer.getSources({
-      types: [type],
-      thumbnailSize: { width, height },
-      fetchWindowIcons: false
-    });
-    const source = sources.find((item) => item.id === id);
-    if (!source || source.thumbnail.isEmpty()) {
-      throw new Error('스크린샷 원본 프레임을 가져올 수 없습니다.');
-    }
-    const size = source.thumbnail.getSize();
-    const buffer = source.thumbnail.toPNG();
+    const captured = await captureScreenshotImage(sourceId, { applyCrop: false });
+    const buffer = captured.image.toPNG();
     if (buffer.length > MAX_SCREENSHOT_BYTES) {
       throw new Error('원본 스크린샷이 안전한 전송 한도(256MB)를 초과했습니다.');
     }
     return {
       buffer,
-      width: size.width,
-      height: size.height,
-      clientCrop
+      width: captured.width,
+      height: captured.height,
+      clientCrop: captured.clientCrop
     };
+  });
+
+  handleMain('screenshot:capture-save', async (_event, payload = {}) => {
+    if (folderDialogActive) {
+      throw new Error('저장 폴더를 선택하는 동안에는 스크린샷을 저장할 수 없습니다.');
+    }
+    const format = payload.format === 'jpeg' ? 'jpeg' : 'png';
+    const captured = await captureScreenshotImage(payload.sourceId, payload);
+    const quality = Math.max(10, Math.min(100, Math.round(Number(payload.quality) || 100)));
+    // PNG is lossless and never resized. JPEG is encoded once at the explicitly selected quality.
+    const buffer = format === 'jpeg'
+      ? captured.image.toJPEG(quality)
+      : captured.image.toPNG();
+    if (!buffer.length || buffer.length > MAX_SCREENSHOT_BYTES) {
+      throw new Error('스크린샷 인코딩 결과가 안전한 저장 한도를 초과했습니다.');
+    }
+    const saved = await recordings.saveScreenshot({ buffer });
+    return { ...saved, width: captured.width, height: captured.height };
   });
 
   handleMain('recordings:list', async () => recordings.list());
@@ -403,20 +471,18 @@ function registerIpcHandlers(context) {
       profile: settingsModule.normalizeProfile(payload.profile)
     };
 
-    const existing = [...settings.value.customPresets];
-    const index = existing.findIndex((preset) => preset.id === id);
-    if (index >= 0) {
-      existing[index] = nextPreset;
-    } else {
-      existing.unshift(nextPreset);
-    }
-
-    // Report the limit instead of silently dropping the oldest entry.
-    const dropped = Math.max(0, existing.length - settingsModule.MAX_CUSTOM_PRESETS);
-    await settings.update({
-      selectedPreset: `custom:${id}`,
-      customPresets: existing.slice(0, settingsModule.MAX_CUSTOM_PRESETS),
-      profile: nextPreset.profile
+    let dropped = 0;
+    await settings.update((current) => {
+      const existing = [...current.customPresets];
+      const index = existing.findIndex((preset) => preset.id === id);
+      if (index >= 0) existing[index] = nextPreset;
+      else existing.unshift(nextPreset);
+      dropped = Math.max(0, existing.length - settingsModule.MAX_CUSTOM_PRESETS);
+      return {
+        selectedPreset: `custom:${id}`,
+        customPresets: existing.slice(0, settingsModule.MAX_CUSTOM_PRESETS),
+        profile: nextPreset.profile
+      };
     });
 
     return { ...settingsDto(), dropped };
@@ -424,19 +490,14 @@ function registerIpcHandlers(context) {
 
   handleMain('settings:custom-preset:delete', async (_event, id) => {
     const targetId = String(id || '');
-    const value = settings.value;
-    const selectedPreset = value.selectedPreset === `custom:${targetId}`
-      ? settingsModule.DEFAULT_SELECTED_PRESET
-      : value.selectedPreset;
-
-    const patch = {
-      selectedPreset,
-      customPresets: value.customPresets.filter((preset) => preset.id !== targetId)
-    };
-    if (value.selectedPreset === `custom:${targetId}`) {
-      patch.profile = settingsModule.DEFAULT_PROFILE;
-    }
-    await settings.update(patch);
+    await settings.update((current) => {
+      const wasSelected = current.selectedPreset === `custom:${targetId}`;
+      return {
+        selectedPreset: wasSelected ? settingsModule.DEFAULT_SELECTED_PRESET : current.selectedPreset,
+        customPresets: current.customPresets.filter((preset) => preset.id !== targetId),
+        ...(wasSelected ? { profile: settingsModule.DEFAULT_PROFILE } : {})
+      };
+    });
     return settingsDto();
   });
 

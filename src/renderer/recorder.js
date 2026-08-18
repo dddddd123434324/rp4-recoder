@@ -163,9 +163,7 @@
       await playPreview();
       els.previewPlaceholder.classList.add('hidden');
 
-      if (capture.systemAudioUnavailable) {
-        RP4.ui.showToast('이 소스에서는 시스템 오디오를 사용할 수 없어 영상만 녹화합니다.');
-      }
+      RP4.capture.notifyAudioStatus(capture);
 
       const recorder = new MediaRecorder(capture.stream, recorderOptions(profile, codec.mimeType));
       const actualMimeType = recorder.mimeType || codec.mimeType;
@@ -180,7 +178,11 @@
         fps: profile.fps,
         bitrateMbps: profile.bitrateMbps,
         encoderPreset: profile.encoderPreset,
-        audioBitrateKbps: profile.audioBitrateKbps
+        audioBitrateKbps: profile.audioBitrateKbps,
+        requestedSystemAudio: capture.requestedSystemAudio,
+        hasSystemAudio: capture.hasSystemAudio,
+        requestedMic: capture.requestedMic,
+        hasMic: capture.hasMic
       });
 
       if (!RP4.lifecycle.isCurrent(operationId, 'starting-recording')) {

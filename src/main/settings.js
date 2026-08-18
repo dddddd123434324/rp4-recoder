@@ -267,10 +267,12 @@ class SettingsStore {
     };
   }
 
-  /** Merges a patch, normalizes the result, and persists it. */
+  /** Merges a patch, normalizes the result, and persists it atomically. */
   update(patch = {}) {
     const run = async () => {
-      const next = normalize({ ...this.current, ...patch });
+      const resolvedPatch = typeof patch === 'function' ? patch(this.current) : patch;
+      const safePatch = resolvedPatch && typeof resolvedPatch === 'object' ? resolvedPatch : {};
+      const next = normalize({ ...this.current, ...safePatch });
       await this.writeSnapshot(next);
       this.current = next;
       return this.current;

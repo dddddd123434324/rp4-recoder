@@ -144,7 +144,13 @@ async function recordChunks(win, { seconds = 5, timeslice = 1000 }) {
 async function run() {
   const paths = require('../src/main/paths');
   const { SettingsStore, readJson, MAX_SETTINGS_BYTES } = require('../src/main/settings');
-  const { RecordingManager, toBoundedBuffer, MAX_INDEX_BYTES } = require('../src/main/recording');
+  const {
+    RecordingManager,
+    toBoundedBuffer,
+    normalizeRecordingMeta,
+    replaceFileSafely,
+    MAX_INDEX_BYTES
+  } = require('../src/main/recording');
 
   // ---- settings + path handling -------------------------------------------------
   const settings = new SettingsStore();
@@ -183,6 +189,40 @@ async function run() {
     settings.value.selectedPreset === null
       && settings.value.profile?.resolution === '2560x1440'
       && settings.value.profile?.fps === '120');
+
+  await Promise.all(['atomic-a', 'atomic-b'].map((id) => settings.update((current) => ({
+    customPresets: [{ id, name: id, profile: {} }, ...current.customPresets]
+  }))));
+  check('functional settings updates do not lose concurrent preset changes',
+    ['atomic-a', 'atomic-b'].every((id) => settings.value.customPresets.some((item) => item.id === id)));
+
+  const safeMeta = normalizeRecordingMeta({
+    mode: 'screen',
+    sourceName: 'x'.repeat(1000),
+    width: 999999,
+    requestedSystemAudio: true,
+    unknownHugeField: 'y'.repeat(10000)
+  });
+  check('recording metadata uses an allowlist and bounds',
+    safeMeta.sourceName.length === 160
+      && safeMeta.width === 16384
+      && safeMeta.requestedSystemAudio === true
+      && !Object.hasOwn(safeMeta, 'unknownHugeField'));
+
+  const replaceOriginal = path.join(SANDBOX, 'replace-original.bin');
+  const replaceCandidate = path.join(SANDBOX, 'replace-candidate.bin');
+  await fsp.writeFile(replaceOriginal, 'known-good');
+  await fsp.writeFile(replaceCandidate, 'invalid-new');
+  let replacementRejected = false;
+  try {
+    await replaceFileSafely(replaceOriginal, replaceCandidate, {
+      validate: async () => { throw new Error('invalid media'); }
+    });
+  } catch {
+    replacementRejected = true;
+  }
+  check('failed replacement validation restores the original',
+    replacementRejected && await fsp.readFile(replaceOriginal, 'utf8') === 'known-good');
 
   // A drive root must never be accepted as a recordings folder.
   check('drive root rejected as recordings dir', paths.isPlausibleRecordingsDir('D:\\') === false);
