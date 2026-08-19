@@ -526,6 +526,20 @@ async function run() {
     bgraCopy.bytes === 64 * 48 * 4 && bgraCopy.alpha === 255,
     `${bgraCopy.bytes} bytes`);
 
+  const preloadSource = await fsp.readFile(path.join(__dirname, '..', 'src', 'preload.js'), 'utf8');
+  const recorderSource = await fsp.readFile(
+    path.join(__dirname, '..', 'src', 'renderer', 'recorder.js'),
+    'utf8'
+  );
+  check('lossless frames use a transferable MessagePort instead of invoke per frame',
+    preloadSource.includes("ipcRenderer.postMessage('lossless:open-writer'")
+      && recorderSource.includes("type: 'rp4:lossless-writer-port'")
+      && recorderSource.includes("writer.port.postMessage(['write'")
+      && !preloadSource.includes("invokeWithBoundedBuffer('lossless:write-frame'"));
+  check('renderer lossless frame queue is explicitly bounded',
+    /LOSSLESS_FRAME_QUEUE_SIZE\s*=\s*3/.test(recorderSource)
+      && recorderSource.includes('losslessDroppedFrames'));
+
   const clipsSource = await fsp.readFile(path.join(__dirname, '..', 'src', 'renderer', 'clips.js'), 'utf8');
   const clipPolicyResult = JSON.parse(await win.webContents.executeJavaScript(`
     (async () => {
@@ -680,7 +694,9 @@ async function run() {
   }
   await recordings.writeLosslessAudio({
     sessionId: losslessSession.sessionId,
-    buffer: Buffer.alloc(48000 * 2 * 2)
+    // Deliberately only 100 ms of PCM for a one-second video. The finalizer must
+    // pad silence instead of truncating the remaining nine video frames.
+    buffer: Buffer.alloc(4800 * 2 * 2)
   }, { webContentsId: win.webContents.id });
   const losslessSaved = await recordings.stopLossless({
     sessionId: losslessSession.sessionId,
@@ -695,8 +711,56 @@ async function run() {
     `container=${losslessProbe.container} codec=${losslessProbe.codec}`);
   check('lossless AVI audio is uncompressed PCM',
     losslessProbe.audioCodec === 'pcm_s16le', `audio=${losslessProbe.audioCodec}`);
+  check('short PCM is padded without truncating complete video frames',
+    (losslessProbe.durationSec || 0) >= 0.85
+      && recordings.metadata.get(losslessSaved.filePath)?.audioPadded === true,
+    `duration=${losslessProbe.durationSec}s`);
+  const verifiedLossless = await ffmpeg.validateMedia(losslessSaved.filePath, {
+    expectedDurationMs: 1000,
+    expectedFrames: 10,
+    requireAudio: true
+  });
+  check('lossless validation decodes video and required audio end-to-end',
+    verifiedLossless.frameCount === 10 && verifiedLossless.durationMs >= 850,
+    `${verifiedLossless.frameCount} frames, ${verifiedLossless.durationMs}ms`);
   check('lossless temporary frame files are removed after save',
     fs.readdirSync(settings.tempDir).every((name) => !name.includes('.lossless.')));
+  check('lossless AVI is atomically committed without a staging artifact',
+    fs.readdirSync(settings.tempDir).every((name) => !name.includes('lossless-finalizing')));
+
+  let oversizedFrameError = null;
+  try {
+    await recordings.startLossless({ ...losslessMeta, width: 7680, height: 4320 }, {
+      webContentsId: win.webContents.id
+    });
+  } catch (error) {
+    oversizedFrameError = error;
+  }
+  check('oversized native frames fail before recording starts with a stable code',
+    oversizedFrameError?.code === 'FRAME_TOO_LARGE');
+
+  const unknownAvi = path.join(RECORDINGS, 'external-unindexed.avi');
+  await fsp.copyFile(losslessSaved.filePath, unknownAvi);
+  const unknownListed = (await recordings.list()).find((entry) => entry.filePath === unknownAvi);
+  check('metadata-less AVI is listed as unverified',
+    unknownListed?.status === 'unverified' && unknownListed?.outcome === 'unverified');
+  await fsp.rm(unknownAvi, { force: true });
+
+  const staleFinalizingId = crypto.randomUUID();
+  const staleFinalizingPath = path.join(
+    settings.tempDir,
+    `rp4-${staleFinalizingId}.lossless-finalizing.avi`
+  );
+  await fsp.copyFile(losslessSaved.filePath, staleFinalizingPath);
+  const staleFinalizingSweep = await recordings.sweepTempDir();
+  const recoveredFinalizing = staleFinalizingSweep.recovered.find((filePath) => (
+    path.basename(filePath).includes(staleFinalizingId.slice(0, 8))
+  ));
+  check('orphaned finalizing AVI is recovered with an explicit unverified status',
+    Boolean(recoveredFinalizing)
+      && recordings.metadata.get(recoveredFinalizing)?.status === 'unverified'
+      && !fs.existsSync(staleFinalizingPath),
+    recoveredFinalizing ? path.basename(recoveredFinalizing) : 'none');
 
   const invalidSession = await recordings.start(meta, { webContentsId: win.webContents.id });
   await recordings.write({
@@ -727,6 +791,19 @@ async function run() {
     audioOnlyRejected = true;
   }
   check('recording validation rejects audio-only output', audioOnlyRejected);
+
+  const videoOnlyPath = path.join(SANDBOX, 'video-only.avi');
+  await runFfmpeg([
+    '-f', 'lavfi', '-i', 'testsrc2=size=64x48:rate=10',
+    '-t', '0.4', '-c:v', 'rawvideo', videoOnlyPath
+  ]);
+  let missingRequiredAudioRejected = false;
+  try {
+    await ffmpeg.validateMedia(videoOnlyPath, { requireAudio: true });
+  } catch {
+    missingRequiredAudioRejected = true;
+  }
+  check('recording validation rejects missing required audio', missingRequiredAudioRejected);
 
   recordings.optimizeQueue.push({ filePath: 'pending-test.mp4', durationMs: 1 });
   check('pending optimization blocks recording-folder mutation', recordings.hasPendingFileMutations());

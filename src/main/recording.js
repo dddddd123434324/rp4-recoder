@@ -35,6 +35,16 @@ const TEMP_RECORDING_PATTERN = new RegExp(
   `^rp4-(${UUID_PATTERN})\\.part\\.(mp4|webm|mkv)$`,
   'i'
 );
+const LOSSLESS_FINALIZING_PATTERN = new RegExp(
+  `^rp4-(${UUID_PATTERN})\\.lossless-finalizing\\.avi$`,
+  'i'
+);
+
+function codedError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
 
 function recoveryOriginalName(fileName) {
   const optimizing = OPTIMIZING_FILE_PATTERN.exec(String(fileName || ''));
@@ -137,6 +147,13 @@ function normalizeRecordingMeta(value = {}) {
     audioBitrateKbps: [8, 1024, false],
     audioSampleRate: [8000, 192000, true],
     audioChannels: [1, 8, true],
+    requestedFps: [1, 480, false],
+    effectiveFps: [0, 480, false],
+    capturedFrames: [0, 24 * 60 * 60 * 480, true],
+    inputFrames: [0, 24 * 60 * 60 * 480, true],
+    droppedFrames: [0, 24 * 60 * 60 * 480, true],
+    firstFrameTimestampUs: [0, Number.MAX_SAFE_INTEGER, true],
+    lastFrameTimestampUs: [0, Number.MAX_SAFE_INTEGER, true],
     durationMs: [0, 24 * 60 * 60 * 1000, true],
     trimRecentMs: [0, 24 * 60 * 60 * 1000, true],
     trimEndOffsetMs: [0, 24 * 60 * 60 * 1000, true]
@@ -150,6 +167,8 @@ function normalizeRecordingMeta(value = {}) {
     'segmentedClip',
     'lossless',
     'hardwareEncoding',
+    'performanceDegraded',
+    'audioPadded',
     'requestedSystemAudio',
     'hasSystemAudio',
     'requestedMic',
@@ -471,6 +490,50 @@ class RecordingManager {
     const failed = [];
     let removed = 0;
 
+    // A crash can leave FFmpeg's same-volume staging AVI behind. If its raw manifest
+    // still exists, the lossless recovery pass below rebuilds it deterministically.
+    // Without a manifest, expose the artifact only with an explicit verification state.
+    for (const entry of entries) {
+      const match = LOSSLESS_FINALIZING_PATTERN.exec(entry.name);
+      if (!match || !entry.isFile()) continue;
+      const fullPath = path.join(tempDir, entry.name);
+      const manifestPath = path.join(tempDir, `rp4-${match[1]}.lossless.json`);
+      if (await paths.pathExists(manifestPath)) continue;
+
+      const stats = await statFile(fullPath);
+      if (!stats || (maxAgeMs > 0 && Date.now() - stats.mtimeMs < maxAgeMs)) continue;
+      let validationFailure = null;
+      try {
+        await ffmpeg.validateMedia(fullPath);
+      } catch (error) {
+        validationFailure = error?.message || String(error);
+      }
+      const partial = Boolean(validationFailure);
+      const target = await uniquePath(
+        this.settings.recordingsDir,
+        `${timestamp()}_recovered_lossless${partial ? '_partial' : '_unverified'}_${match[1].slice(0, 8)}`,
+        'avi'
+      );
+      try {
+        await this.moveFile(fullPath, target);
+        const recoveredStats = await statFile(target);
+        await this.setMetadata(target, {
+          status: partial ? 'partial' : 'unverified',
+          partial,
+          outcome: partial ? 'recovered-partial' : 'recovered-unverified',
+          recovered: true,
+          failureReason: partial
+            ? `중단된 AVI를 완전히 검증하지 못했습니다. ${validationFailure}`.slice(0, 500)
+            : '최종화 중단 파일을 복구했지만 원본 프레임 수와 길이는 확인할 수 없습니다.',
+          recoveredAt: new Date().toISOString(),
+          bytes: recoveredStats?.size || stats.size
+        });
+        recovered.push(target);
+      } catch (error) {
+        failed.push({ filePath: fullPath, error: error?.message || String(error) });
+      }
+    }
+
     for (const entry of entries) {
       const match = TEMP_RECORDING_PATTERN.exec(entry.name);
       if (!match || !entry.isFile()) continue;
@@ -582,6 +645,7 @@ class RecordingManager {
           rawPath,
           audioPath,
           manifestPath,
+          finalizingPath: path.join(tempDir, `rp4-${match[1]}.lossless-finalizing.avi`),
           width,
           height,
           fps,
@@ -589,6 +653,8 @@ class RecordingManager {
           audioChannels,
           frameBytes,
           frameCount,
+          firstFrameTimestampUs: null,
+          lastFrameTimestampUs: null,
           rawBytes: frameCount * frameBytes,
           audioBytes: (await statFile(audioPath))?.size || 0,
           rawWriteChain: Promise.resolve(),
@@ -730,7 +796,10 @@ class RecordingManager {
     const recordingsDir = this.settings.recordingsDir;
     const available = await freeBytes(recordingsDir);
     if (available != null && available < MIN_LOSSLESS_FREE_BYTES_TO_START) {
-      throw new Error('무압축 녹화에는 최소 2GB 이상의 여유 공간이 필요합니다.');
+      throw codedError(
+        'INSUFFICIENT_SPACE',
+        '무압축 녹화에는 최소 2GB 이상의 여유 공간이 필요합니다.'
+      );
     }
 
     const safeMeta = normalizeRecordingMeta({ ...meta, format: 'avi', lossless: true });
@@ -744,7 +813,10 @@ class RecordingManager {
     const frameBytes = Number(width) * Number(height) * 4;
     if (!width || !height || width % 2 || height % 2
       || frameBytes <= 0 || frameBytes > MAX_LOSSLESS_FRAME_BYTES) {
-      throw new Error('무압축 녹화 해상도가 안전한 프레임 한도를 초과했습니다.');
+      throw codedError(
+        'FRAME_TOO_LARGE',
+        '원본 프레임이 64MiB 안전 한도를 초과해 무압축 녹화를 시작할 수 없습니다.'
+      );
     }
 
     const sessionId = crypto.randomUUID();
@@ -758,6 +830,7 @@ class RecordingManager {
     const rawPath = path.join(tempDir, `rp4-${sessionId}.lossless.raw`);
     const audioPath = path.join(tempDir, `rp4-${sessionId}.lossless.pcm`);
     const manifestPath = path.join(tempDir, `rp4-${sessionId}.lossless.json`);
+    const finalizingPath = path.join(tempDir, `rp4-${sessionId}.lossless-finalizing.avi`);
     let rawHandle = null;
     let audioHandle = null;
     try {
@@ -794,6 +867,7 @@ class RecordingManager {
       rawPath,
       audioPath,
       manifestPath,
+      finalizingPath,
       rawHandle,
       audioHandle,
       width,
@@ -803,6 +877,8 @@ class RecordingManager {
       audioChannels,
       frameBytes,
       frameCount: 0,
+      firstFrameTimestampUs: null,
+      lastFrameTimestampUs: null,
       rawBytes: 0,
       audioBytes: 0,
       queuedBytes: 0,
@@ -824,7 +900,14 @@ class RecordingManager {
       }
     });
 
-    return { sessionId, format: 'avi', recordedCodec: 'rawvideo', frameBytes };
+    return {
+      sessionId,
+      format: 'avi',
+      recordedCodec: 'rawvideo',
+      frameBytes,
+      maxFrameBytes: MAX_LOSSLESS_FRAME_BYTES,
+      maxInFlightFrames: 3
+    };
   }
 
   getOwnedLosslessSession(sessionId, webContentsId) {
@@ -850,7 +933,11 @@ class RecordingManager {
     } catch (error) {
       return Promise.reject(error);
     }
-    return this.enqueueLosslessWrite(session, frame, { audio: false });
+    const timestampUs = Number(payload.timestampUs);
+    return this.enqueueLosslessWrite(session, frame, {
+      audio: false,
+      timestampUs: Number.isFinite(timestampUs) && timestampUs >= 0 ? Math.round(timestampUs) : null
+    });
   }
 
   writeLosslessAudio(payload = {}, { webContentsId } = {}) {
@@ -868,7 +955,7 @@ class RecordingManager {
     return this.enqueueLosslessWrite(session, chunk, { audio: true });
   }
 
-  enqueueLosslessWrite(session, chunk, { audio }) {
+  enqueueLosslessWrite(session, chunk, { audio, timestampUs = null }) {
     if (session.queuedBytes + chunk.length > this.maxSessionQueuedBytes) {
       session.failed = '무압축 녹화 쓰기 대기열이 허용 한도를 초과했습니다.';
       return Promise.reject(new Error(session.failed));
@@ -890,6 +977,10 @@ class RecordingManager {
       else {
         session.rawBytes += chunk.length;
         session.frameCount += 1;
+        if (timestampUs != null) {
+          if (session.firstFrameTimestampUs == null) session.firstFrameTimestampUs = timestampUs;
+          session.lastFrameTimestampUs = timestampUs;
+        }
       }
 
       const totalBytes = session.rawBytes + session.audioBytes;
@@ -975,16 +1066,37 @@ class RecordingManager {
     const durationMs = Number(payload.durationMs) > 0
       ? Math.round(Number(payload.durationMs))
       : Math.max(1, Date.now() - session.startedAtMs);
+    const payloadMeta = normalizeRecordingMeta(payload.meta);
     const effectiveFps = Math.max(0.1, Math.min(240, session.frameCount * 1000 / durationMs));
-    const failureReason = session.failed || (
+    const droppedFrames = Math.max(0, Number(payloadMeta.droppedFrames) || 0);
+    const inputFrames = Math.max(
+      session.frameCount + droppedFrames,
+      Number(payloadMeta.inputFrames) || 0
+    );
+    const performanceDegraded = droppedFrames > 0
+      || (durationMs >= 3000 && effectiveFps < session.fps * 0.85);
+    const performanceWarning = !performanceDegraded
+      ? null
+      : droppedFrames > 0
+        ? `저장 장치 처리 속도로 인해 ${droppedFrames}개 프레임이 누락되었고 실제 FPS는 ${effectiveFps.toFixed(1)}입니다.`
+        : `저장 장치 처리 속도로 인해 실제 FPS가 ${effectiveFps.toFixed(1)}로 낮아졌습니다.`;
+    const explicitFailure = session.failed || (
       typeof payload.failureReason === 'string' && payload.failureReason.trim()
         ? payload.failureReason.trim().slice(0, 500)
         : null
     );
+    const failureReason = explicitFailure || performanceWarning;
     const outputBase = failureReason ? `${session.baseName}_partial` : session.baseName;
     const target = await uniquePath(session.recordingsDir, outputBase, 'avi');
+    const finalizingPath = session.finalizingPath || path.join(
+      await paths.ensureOwnedTempDir(session.recordingsDir),
+      `rp4-${session.sessionId}.lossless-finalizing.avi`
+    );
     const audioStats = await statFile(session.audioPath);
     const hasAudio = Boolean(audioStats?.size);
+    const expectedAudioBytes = durationMs / 1000
+      * session.audioSampleRate * session.audioChannels * 2;
+    const audioPadded = hasAudio && audioStats.size < expectedAudioBytes * 0.98;
     const args = [
       '-y',
       '-f', 'rawvideo',
@@ -1006,10 +1118,12 @@ class RecordingManager {
       ...(hasAudio ? ['-map', '1:a:0?'] : []),
       '-c:v', 'rawvideo',
       '-pix_fmt', 'bgr24',
-      ...(hasAudio ? ['-c:a', 'pcm_s16le', '-shortest'] : []),
-      target
+      ...(hasAudio ? ['-af', 'apad', '-c:a', 'pcm_s16le', '-shortest'] : []),
+      finalizingPath
     );
 
+    await fs.rm(finalizingPath, { force: true }).catch(() => {});
+    let validated = false;
     try {
       await ffmpeg.run(args, {
         jobId: `lossless:${session.sessionId}`,
@@ -1019,41 +1133,63 @@ class RecordingManager {
           ratio
         })
       });
-      await ffmpeg.validateMedia(target);
+      await ffmpeg.validateMedia(finalizingPath, {
+        expectedDurationMs: durationMs,
+        expectedFrames: session.frameCount,
+        requireAudio: hasAudio
+      });
+      validated = true;
+      // The staging directory is a child of recordingsDir, so this rename is a
+      // same-volume atomic commit. The final name never contains a partial AVI.
+      await fs.rename(finalizingPath, target);
     } catch (error) {
-      await fs.rm(target, { force: true }).catch(() => {});
+      if (!validated) await fs.rm(finalizingPath, { force: true }).catch(() => {});
       throw new Error(
         `무압축 AVI를 마무리하지 못했습니다. 원본 프레임은 ${session.rawPath}에 보존했습니다. ${error?.message || error}`,
         { cause: error }
       );
     }
 
+    // Remove the recovery trigger first. If the app dies after the atomic rename,
+    // a valid but metadata-less AVI is shown as unverified instead of being duplicated.
+    await fs.rm(session.manifestPath, { force: true }).catch(() => {});
     await Promise.allSettled([
       fs.rm(session.rawPath, { force: true }),
-      fs.rm(session.audioPath, { force: true }),
-      fs.rm(session.manifestPath, { force: true })
+      fs.rm(session.audioPath, { force: true })
     ]);
     const stats = await statFile(target);
     const meta = {
       ...session.meta,
-      ...normalizeRecordingMeta(payload.meta),
+      ...payloadMeta,
       format: 'avi',
       recordedContainer: 'avi',
       recordedCodec: 'rawvideo',
       recordedAudioCodec: hasAudio ? 'pcm_s16le' : 'none',
       lossless: true,
       hardwareEncoding: false,
+      requestedFps: session.fps,
+      fps: effectiveFps,
       status: failureReason ? 'partial' : 'complete',
       partial: Boolean(failureReason),
       failureReason,
       outcome: failureReason ? 'partial' : 'exact',
       durationMs,
       capturedFrames: session.frameCount,
+      inputFrames,
+      droppedFrames,
       effectiveFps,
+      firstFrameTimestampUs: session.firstFrameTimestampUs,
+      lastFrameTimestampUs: session.lastFrameTimestampUs,
+      performanceDegraded,
+      performanceWarning,
+      audioPadded,
       stoppedAt: new Date().toISOString(),
       bytes: stats?.size || 0
     };
     await this.setMetadata(target, meta);
+    if (performanceWarning) {
+      this.emit('app:notice', { level: 'warn', message: performanceWarning });
+    }
     return {
       ...this.toDto(target, stats, meta),
       status: meta.status,
@@ -1669,6 +1805,9 @@ class RecordingManager {
   }
 
   toDto(filePath, stats, meta = {}) {
+    const hasMetadata = meta && typeof meta === 'object' && Object.keys(meta).length > 0;
+    const extension = path.extname(filePath).slice(1).toLowerCase();
+    const defaultStatus = !hasMetadata && extension === 'avi' ? 'unverified' : 'complete';
     return {
       filePath,
       name: path.basename(filePath),
@@ -1678,14 +1817,19 @@ class RecordingManager {
       width: meta.width || null,
       height: meta.height || null,
       fps: meta.fps || null,
+      requestedFps: meta.requestedFps || null,
+      effectiveFps: meta.effectiveFps || null,
+      capturedFrames: meta.capturedFrames || null,
+      droppedFrames: meta.droppedFrames || 0,
       bitrateMbps: meta.bitrateMbps || null,
       sourceName: meta.sourceName || null,
       modeLabel: meta.modeLabel || null,
-      format: meta.format || path.extname(filePath).slice(1).toLowerCase(),
-      status: meta.status || 'complete',
+      format: meta.format || extension,
+      status: meta.status || defaultStatus,
       partial: Boolean(meta.partial),
       failureReason: meta.failureReason || null,
-      outcome: meta.outcome || 'exact',
+      outcome: meta.outcome || (defaultStatus === 'unverified' ? 'unverified' : 'exact'),
+      performanceWarning: meta.performanceWarning || null,
       conversionError: meta.conversionError || null,
       recovered: Boolean(meta.recovered)
     };

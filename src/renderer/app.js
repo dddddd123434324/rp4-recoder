@@ -151,7 +151,8 @@
     if (!els.pipelineNote) return;
     const profile = state.recording?.profile || state.clip?.profile || RP4.profile.get();
     if (profile.lossless) {
-      els.pipelineNote.textContent = '원본 프레임을 압축하지 않고 AVI로 저장합니다. 파일 용량이 매우 큽니다.';
+      els.pipelineNote.textContent =
+        '원본 프레임을 압축하지 않고 AVI로 저장합니다. 파일 용량이 매우 크며 프레임당 최대 64MiB를 지원합니다.';
       return;
     }
     const codec = RP4.capture.pickRecorderMime(profile.format);
@@ -1064,12 +1065,38 @@
       report.sourceSelectionGuard = !state.recording && !state.clip && !state.screenshotPromise;
       state.sourceSelectionPending = false;
 
+      // Exercise the real preload -> transferable MessagePort -> main-process
+      // lossless writer without touching the user's recording folder. Smoke mode
+      // redirects recordings into its disposable userData sandbox.
+      const losslessSession = await window.rp4.startLosslessRecording({
+        mode: 'screen',
+        modeLabel: '스모크 테스트',
+        sourceName: 'MessagePort',
+        format: 'avi',
+        width: 64,
+        height: 48,
+        fps: 1,
+        lossless: true
+      });
+      const losslessWrite = await RP4.recorder.smokeLosslessTransport(
+        losslessSession.sessionId,
+        64 * 48 * 4
+      );
+      const losslessSaved = await window.rp4.stopLosslessRecording({
+        sessionId: losslessSession.sessionId,
+        durationMs: 1000,
+        meta: { inputFrames: 1, capturedFrames: 1, droppedFrames: 0 }
+      });
+      report.losslessMessagePort = losslessWrite?.frames === 1
+        && losslessSaved?.status === 'complete';
+
       report.ok = Boolean(codec)
         && Boolean(state.appInfo.recordingsDir)
         && report.screenSources > 0
         && report.previewWidth > 0
         && report.previewHeight > 0
-        && report.sourceSelectionGuard;
+        && report.sourceSelectionGuard
+        && report.losslessMessagePort;
     } catch (error) {
       state.sourceSelectionPending = false;
       report.ok = false;

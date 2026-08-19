@@ -1,6 +1,7 @@
 'use strict';
 
 const { app, BrowserWindow, dialog, ipcMain, session } = require('electron/main');
+const path = require('node:path');
 const { fileURLToPath } = require('node:url');
 
 const ffmpeg = require('./main/ffmpeg');
@@ -13,7 +14,7 @@ const { WindowCropService } = require('./main/window-crop');
 const { registerIpcHandlers } = require('./main/ipc');
 
 const IS_SMOKE = process.env.RP4_SMOKE === '1';
-const SMOKE_TIMEOUT_MS = 30000;
+const SMOKE_TIMEOUT_MS = Math.max(5000, Number(process.env.RP4_SMOKE_TIMEOUT_MS) || 30000);
 
 const settings = new SettingsStore();
 const windowCrop = new WindowCropService();
@@ -198,6 +199,11 @@ async function bootstrap() {
 
   try {
     const loaded = await settings.load();
+    if (IS_SMOKE) {
+      await settings.update({
+        recordingsDir: path.join(app.getPath('userData'), 'smoke-recordings')
+      });
+    }
     await paths.ensureRecordingDirs(settings.recordingsDir);
 
     recordings = new RecordingManager({ settings, emit: send });
@@ -224,7 +230,6 @@ async function bootstrap() {
     session.defaultSession.setPermissionCheckHandler((webContents, permission) => (
       isTrustedAppContents(webContents) && ['media', 'display-capture'].includes(permission)
     ));
-
     registerIpcHandlers({
       settings,
       recordings,

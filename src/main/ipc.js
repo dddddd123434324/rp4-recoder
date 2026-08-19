@@ -50,6 +50,13 @@ function isTopLevelWindowSender(event) {
   return isTrustedFileSender(event, 'index.html');
 }
 
+function serializeError(error, fallbackCode = 'RP4_ERROR') {
+  return {
+    code: typeof error?.code === 'string' ? error.code : fallbackCode,
+    message: String(error?.message || error || '알 수 없는 오류가 발생했습니다.').slice(0, 500)
+  };
+}
+
 async function resolveRecordingMediaFile(recordingsDir, filePath) {
   if (typeof filePath !== 'string' || !filePath || !MEDIA_FILE_PATTERN.test(filePath)) return null;
 
@@ -218,6 +225,76 @@ function registerIpcHandlers(context) {
       clipSaving: value.clipSaving === true
     });
     return true;
+  });
+  ipcMain.on('lossless:open-writer', (event, payload = {}) => {
+    const port = event.ports?.[0];
+    if (!port) return;
+    const sessionId = String(payload.sessionId || '');
+    const sendToWriter = (message) => {
+      if (!event.sender.isDestroyed()) {
+        event.sender.send('lossless:writer-message', { sessionId, ...message });
+      }
+    };
+    const rejectPort = (error, code = 'LOSSLESS_PORT_REJECTED') => {
+      sendToWriter({ type: 'fatal', error: serializeError(error, code) });
+      setImmediate(() => port.close());
+    };
+    if (!isTopLevelWindowSender(event)) {
+      rejectPort(new Error('허용되지 않은 무압축 녹화 송신자입니다.'));
+      return;
+    }
+    try {
+      recordings.getOwnedLosslessSession(sessionId, event.sender.id);
+    } catch (error) {
+      rejectPort(error);
+      return;
+    }
+
+    const senderId = event.sender.id;
+    port.on('message', async (messageEvent) => {
+      const raw = messageEvent.data;
+      const message = Array.isArray(raw) ? {
+        type: raw[0],
+        id: raw[1],
+        kind: raw[2],
+        timestampUs: raw[3],
+        buffer: raw[4]
+      } : raw || {};
+      const id = Number(message.id);
+      if (message.type !== 'write' || !Number.isSafeInteger(id) || id <= 0) {
+        sendToWriter({
+          type: 'ack',
+          id: Number.isSafeInteger(id) ? id : 0,
+          ok: false,
+          error: serializeError(new Error('무압축 녹화 전송 형식이 올바르지 않습니다.'))
+        });
+        return;
+      }
+      try {
+        const result = message.kind === 'frame'
+          ? await recordings.writeLosslessFrame({
+              sessionId,
+              timestampUs: message.timestampUs,
+              buffer: message.buffer
+            }, { webContentsId: senderId })
+          : message.kind === 'audio'
+            ? await recordings.writeLosslessAudio({
+                sessionId,
+                buffer: message.buffer
+              }, { webContentsId: senderId })
+            : (() => { throw new Error('알 수 없는 무압축 녹화 데이터 종류입니다.'); })();
+        sendToWriter({ type: 'ack', id, ok: true, result });
+      } catch (error) {
+        sendToWriter({
+          type: 'ack',
+          id,
+          ok: false,
+          error: serializeError(error, 'LOSSLESS_WRITE_FAILED')
+        });
+      }
+    });
+    port.start();
+    sendToWriter({ type: 'ready' });
   });
 
   handleMain('sources:list', async () => {
@@ -417,10 +494,17 @@ function registerIpcHandlers(context) {
   }));
 
   handleMain('lossless:start', async (event, meta = {}) => {
-    if (folderDialogActive) {
-      throw new Error('저장 폴더를 선택하는 동안에는 녹화를 시작할 수 없습니다.');
+    try {
+      if (folderDialogActive) {
+        const error = new Error('저장 폴더를 선택하는 동안에는 녹화를 시작할 수 없습니다.');
+        error.code = 'FOLDER_DIALOG_ACTIVE';
+        throw error;
+      }
+      const value = await recordings.startLossless(meta, { webContentsId: event.sender.id });
+      return { ok: true, value };
+    } catch (error) {
+      return { ok: false, error: serializeError(error, 'LOSSLESS_START_FAILED') };
     }
-    return recordings.startLossless(meta, { webContentsId: event.sender.id });
   });
 
   handleMain('lossless:write-frame', async (event, payload = {}) => (

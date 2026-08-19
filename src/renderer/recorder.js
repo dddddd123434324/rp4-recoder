@@ -8,6 +8,8 @@
 
   const CHUNK_INTERVAL_MS = 2000;
   const MAX_QUEUED_BYTES = 256 * 1024 * 1024;
+  const MAX_LOSSLESS_FRAME_BYTES = 64 * 1024 * 1024;
+  const LOSSLESS_FRAME_QUEUE_SIZE = 3;
 
   function cleanupPreview() {
     if (state.preview) {
@@ -105,6 +107,171 @@
     return RP4.i18n.translate('캡처 장치를 시작하지 못했습니다. 다른 소스를 선택해 주세요.');
   }
 
+  function localizedRecordingStartError(error) {
+    const known = {
+      INSUFFICIENT_SPACE: '무압축 녹화에는 최소 2GB 이상의 여유 공간이 필요합니다.',
+      FRAME_TOO_LARGE: '원본 프레임이 64MiB 안전 한도를 초과해 무압축 녹화를 시작할 수 없습니다.',
+      MESSAGE_PORT_UNAVAILABLE: '이 시스템은 고속 무압축 프레임 전송을 지원하지 않습니다.',
+      FOLDER_DIALOG_ACTIVE: '저장 폴더를 선택하는 동안에는 녹화를 시작할 수 없습니다.'
+    };
+    const key = known[String(error?.code || '')];
+    if (key) return RP4.i18n.translate(key);
+    const message = String(error?.message || '')
+      .replace(/^Error invoking remote method '[^']+':\s*/i, '')
+      .trim()
+      .slice(0, 300);
+    if (!message) return RP4.i18n.translate('녹화를 시작하지 못했습니다.');
+    const translated = RP4.i18n.translate(message);
+    if (RP4.i18n.language === 'en' && translated === message && /[가-힣]/.test(message)) {
+      return RP4.i18n.translate('녹화를 시작하지 못했습니다.');
+    }
+    return translated;
+  }
+
+  function losslessTransportError(payload = {}) {
+    const error = new Error(String(payload.message || '무압축 녹화 전송에 실패했습니다.'));
+    if (typeof payload.code === 'string') error.code = payload.code;
+    return error;
+  }
+
+  function settleLosslessWriter(writer) {
+    if (writer.pending.size > 0) return;
+    for (const resolve of writer.drainWaiters.splice(0)) resolve();
+  }
+
+  function failLosslessWriter(writer, error) {
+    writer.failure = error;
+    clearTimeout(writer.readyTimeout);
+    writer.rejectReady(error);
+    for (const pending of writer.pending.values()) pending.reject(error);
+    writer.pending.clear();
+    settleLosslessWriter(writer);
+  }
+
+  async function openLosslessWriter(context) {
+    if (typeof window.MessageChannel !== 'function') {
+      throw losslessTransportError({
+        code: 'MESSAGE_PORT_UNAVAILABLE',
+        message: '이 시스템은 고속 무압축 프레임 전송을 지원하지 않습니다.'
+      });
+    }
+    const channel = new window.MessageChannel();
+    const writer = {
+      port: channel.port1,
+      nextId: 1,
+      pending: new Map(),
+      drainWaiters: [],
+      failure: null,
+      resolveReady: null,
+      rejectReady: null,
+      ready: null,
+      readyTimeout: null,
+      unsubscribe: null,
+      framePool: []
+    };
+    writer.ready = new Promise((resolve, reject) => {
+      writer.resolveReady = resolve;
+      writer.rejectReady = reject;
+    });
+    writer.unsubscribe = window.rp4.onLosslessWriterMessage((message = {}) => {
+      if (message.sessionId !== context.sessionId) return;
+      if (message.type === 'ready') {
+        clearTimeout(writer.readyTimeout);
+        writer.resolveReady();
+        return;
+      }
+      if (message.type === 'fatal') {
+        failLosslessWriter(writer, losslessTransportError(message.error));
+        return;
+      }
+      if (message.type !== 'ack') return;
+      const pending = writer.pending.get(Number(message.id));
+      if (!pending) return;
+      writer.pending.delete(Number(message.id));
+      if (pending.frameBuffer) writer.framePool.push(pending.frameBuffer);
+      if (message.ok === true) pending.resolve(message.result);
+      else pending.reject(losslessTransportError(message.error));
+      settleLosslessWriter(writer);
+    });
+    writer.port.start();
+    writer.readyTimeout = window.setTimeout(() => failLosslessWriter(
+      writer,
+      losslessTransportError({
+        code: 'MESSAGE_PORT_TIMEOUT',
+        message: '무압축 녹화 전송 채널 준비 시간이 초과되었습니다.'
+      })
+    ), 5000);
+    context.losslessWriter = writer;
+    window.postMessage({
+      type: 'rp4:lossless-writer-port',
+      sessionId: context.sessionId
+    }, '*', [channel.port2]);
+    await writer.ready;
+
+    const frameBytes = Number(context.losslessFrameBytes)
+      || Number(context.output?.width) * Number(context.output?.height) * 4;
+    if (Number.isSafeInteger(frameBytes) && frameBytes > 0
+      && frameBytes <= MAX_LOSSLESS_FRAME_BYTES) {
+      writer.framePool = Array.from(
+        { length: LOSSLESS_FRAME_QUEUE_SIZE },
+        () => new ArrayBuffer(frameBytes)
+      );
+    }
+  }
+
+  async function writeLosslessPacket(context, kind, buffer, timestampUs = null) {
+    const writer = context.losslessWriter;
+    if (!writer) throw new Error('무압축 녹화 전송 채널이 열리지 않았습니다.');
+    await writer.ready;
+    if (writer.failure) throw writer.failure;
+    if (!(buffer instanceof ArrayBuffer)
+      || buffer.byteLength <= 0 || buffer.byteLength > MAX_LOSSLESS_FRAME_BYTES) {
+      throw new Error('한 번에 전송할 수 있는 데이터 크기를 초과했습니다.');
+    }
+    const id = writer.nextId++;
+    const completion = new Promise((resolve, reject) => {
+      writer.pending.set(id, {
+        resolve,
+        reject,
+        frameBuffer: kind === 'frame' ? buffer : null
+      });
+    });
+    try {
+      writer.port.postMessage(['write', id, kind, timestampUs, buffer]);
+    } catch (error) {
+      writer.pending.delete(id);
+      if (kind === 'frame') writer.framePool.push(buffer);
+      settleLosslessWriter(writer);
+      throw error;
+    }
+    return completion;
+  }
+
+  async function closeLosslessWriter(context) {
+    const writer = context.losslessWriter;
+    if (!writer) return;
+    await writer.ready.catch(() => {});
+    if (writer.pending.size > 0) {
+      await new Promise((resolve) => writer.drainWaiters.push(resolve));
+    }
+    writer.unsubscribe?.();
+    writer.port.close();
+    context.losslessWriter = null;
+    if (writer.failure) throw writer.failure;
+  }
+
+  function updateLosslessPerformance(context) {
+    const elapsed = Math.max(1, Date.now() - context.startedAt);
+    context.losslessActualFps = context.losslessWrittenFrames * 1000 / elapsed;
+    if (elapsed < 3000 || context.losslessPerformanceWarned) return;
+    if (context.losslessDroppedFrames === 0
+      && context.losslessActualFps >= context.profile.fps * 0.85) return;
+    context.losslessPerformanceWarned = true;
+    RP4.ui.showToast(RP4.i18n.translate(
+      '저장 장치 처리 속도가 목표 FPS를 따라가지 못해 일부 프레임이 누락되고 있습니다.'
+    ));
+  }
+
   async function startLosslessPipelines(context) {
     if (typeof window.MediaStreamTrackProcessor !== 'function'
       || typeof window.VideoFrame !== 'function') {
@@ -118,6 +285,14 @@
     context.losslessTrack = rawTrack;
     context.losslessReader = reader;
     context.losslessAudioWriteQueue = Promise.resolve();
+    context.losslessFrameWrites = new Set();
+    context.losslessInputFrames = 0;
+    context.losslessWrittenFrames = 0;
+    context.losslessDroppedFrames = 0;
+    context.losslessFirstTimestampUs = null;
+    context.losslessLastTimestampUs = null;
+    context.losslessActualFps = 0;
+    context.losslessPerformanceWarned = false;
 
     const audioTracks = context.stream.getAudioTracks();
     if (audioTracks.length > 0) {
@@ -161,10 +336,7 @@
           }
         }
         context.losslessAudioWriteQueue = context.losslessAudioWriteQueue.then(async () => {
-          const result = await window.rp4.writeLosslessAudio({
-            sessionId: context.sessionId,
-            buffer
-          });
+          const result = await writeLosslessPacket(context, 'audio', buffer);
           if (result?.warning) throw new Error(result.warning);
         }).catch((error) => {
           failRecording(context, error);
@@ -176,28 +348,63 @@
       while (!context.stopping) {
         const { value: frame, done } = await reader.read();
         if (done || !frame) break;
+        let reservedBuffer = null;
         try {
           if (context.isPaused) continue;
+          context.losslessInputFrames += 1;
+          const timestampUs = Number(frame.timestamp);
+          if (Number.isFinite(timestampUs) && timestampUs >= 0) {
+            if (context.losslessFirstTimestampUs == null) {
+              context.losslessFirstTimestampUs = timestampUs;
+            }
+            context.losslessLastTimestampUs = timestampUs;
+          }
+          if (context.losslessFrameWrites.size >= LOSSLESS_FRAME_QUEUE_SIZE) {
+            context.losslessDroppedFrames += 1;
+            updateLosslessPerformance(context);
+            continue;
+          }
           const width = frame.displayWidth || frame.codedWidth;
           const height = frame.displayHeight || frame.codedHeight;
           if (width !== context.output.width || height !== context.output.height) {
             throw new Error(`무압축 프레임 크기가 변경되었습니다. (${width}x${height})`);
           }
-          const buffer = new ArrayBuffer(width * height * 4);
-          await frame.copyTo(new Uint8Array(buffer), {
+          const writer = context.losslessWriter;
+          reservedBuffer = writer?.framePool.pop() || null;
+          if (!reservedBuffer) {
+            context.losslessDroppedFrames += 1;
+            updateLosslessPerformance(context);
+            continue;
+          }
+          await frame.copyTo(new Uint8Array(reservedBuffer), {
             format: 'BGRA',
             layout: [{ offset: 0, stride: width * 4 }]
           });
-          const result = await window.rp4.writeLosslessFrame({
-            sessionId: context.sessionId,
-            buffer
+          const write = writeLosslessPacket(
+            context,
+            'frame',
+            reservedBuffer,
+            timestampUs
+          ).then((result) => {
+            context.losslessWrittenFrames = Math.max(
+              context.losslessWrittenFrames + 1,
+              Number(result?.frames) || 0
+            );
+            if (result?.warning) throw new Error(result.warning);
+            updateLosslessPerformance(context);
+          }).catch((error) => {
+            if (!context.stopping) failRecording(context, error);
+          }).finally(() => {
+            context.losslessFrameWrites.delete(write);
           });
-          context.losslessFrameCount = Number(result?.frames) || context.losslessFrameCount + 1;
-          if (result?.warning) throw new Error(result.warning);
+          context.losslessFrameWrites.add(write);
+          reservedBuffer = null;
         } finally {
+          if (reservedBuffer) context.losslessWriter?.framePool.push(reservedBuffer);
           frame.close();
         }
       }
+      await Promise.allSettled([...context.losslessFrameWrites]);
     })().catch((error) => {
       if (!context.stopping) failRecording(context, error);
     });
@@ -210,7 +417,11 @@
     context.losslessPcmSilentOutput?.disconnect();
     await context.losslessReader?.cancel().catch(() => {});
     await context.losslessPumpPromise?.catch(() => {});
+    await Promise.allSettled([...(context.losslessFrameWrites || [])]);
     await context.losslessAudioWriteQueue?.catch(() => {});
+    await closeLosslessWriter(context).catch((error) => {
+      if (!context.failure) context.failure = error?.message || String(error);
+    });
     context.losslessTrack?.stop();
     util.stopStream(context.losslessAudioStream);
     if (context.losslessOwnsPcmContext) {
@@ -269,6 +480,7 @@
 
     let session = null;
     let capture = null;
+    let failurePhase = 'capture';
 
     try {
       RP4.ui.setStatus('녹화 준비 중', '캡처 스트림을 준비하고 있습니다.', 'warn');
@@ -284,6 +496,16 @@
         mode: sourceSnapshot.mode,
         areaSelection: sourceSnapshot.areaSelection
       });
+      failurePhase = 'recording';
+
+      if (profile.lossless
+        && capture.output.width * capture.output.height * 4 > MAX_LOSSLESS_FRAME_BYTES) {
+        const error = new Error(
+          '원본 프레임이 64MiB 안전 한도를 초과해 무압축 녹화를 시작할 수 없습니다.'
+        );
+        error.code = 'FRAME_TOO_LARGE';
+        throw error;
+      }
 
       if (!RP4.lifecycle.isCurrent(operationId, 'starting-recording')) {
         capture.cleanup();
@@ -355,6 +577,7 @@
         operationId,
         recorder,
         lossless: profile.lossless,
+        losslessFrameBytes: session.frameBytes,
         losslessAudioSampleRate,
         losslessAudioChannels,
         sessionId: session.sessionId,
@@ -381,6 +604,7 @@
       RP4.lifecycle.transition(operationId, 'recording');
 
       if (context.lossless) {
+        await openLosslessWriter(context);
         await startLosslessPipelines(context);
       } else {
         recorder.addEventListener('dataavailable', (event) => {
@@ -445,7 +669,9 @@
       RP4.app.updateRecordingUi();
       if (!state.shuttingDown) await startPreview();
       RP4.ui.setStatus('녹화 실패', '녹화를 시작하지 못했습니다.', 'warn');
-      RP4.ui.showToast(localizedCaptureStartError(error));
+      RP4.ui.showToast(failurePhase === 'capture'
+        ? localizedCaptureStartError(error)
+        : localizedRecordingStartError(error));
     }
   }
 
@@ -542,7 +768,15 @@
           height: context.output.height,
           fps: context.profile.fps,
           lossless: true,
-          hardwareEncoding: false
+          hardwareEncoding: false,
+          inputFrames: context.losslessInputFrames,
+          droppedFrames: context.losslessDroppedFrames,
+          capturedFrames: context.losslessWrittenFrames,
+          effectiveFps: context.losslessActualFps,
+          firstFrameTimestampUs: context.losslessFirstTimestampUs,
+          lastFrameTimestampUs: context.losslessLastTimestampUs,
+          performanceDegraded: context.losslessDroppedFrames > 0
+            || context.losslessActualFps < context.profile.fps * 0.85
         }
       });
       resetRecordingState(context);
@@ -710,6 +944,17 @@
     await done;
   }
 
+  async function smokeLosslessTransport(sessionId, frameBytes) {
+    const context = { sessionId, losslessWriter: null, losslessFrameBytes: frameBytes };
+    await openLosslessWriter(context);
+    try {
+      const buffer = context.losslessWriter.framePool.pop();
+      return await writeLosslessPacket(context, 'frame', buffer, 0);
+    } finally {
+      await closeLosslessWriter(context);
+    }
+  }
+
   RP4.recorder = {
     startPreview,
     restartPreview,
@@ -719,6 +964,7 @@
     stopRecording,
     togglePause,
     elapsedMs,
-    finalizeForShutdown
+    finalizeForShutdown,
+    smokeLosslessTransport
   };
 }(window.RP4));

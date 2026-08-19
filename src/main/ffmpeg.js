@@ -36,7 +36,12 @@ function parseProgress(text) {
  * with a 0..1 ratio. The returned promise rejects with `code === 'CANCELLED'` when the
  * job is cancelled through `cancel()`.
  */
-function run(args, { onProgress, totalDurationMs = 0, jobId } = {}) {
+function run(args, {
+  onProgress,
+  totalDurationMs = 0,
+  jobId,
+  captureProgress = false
+} = {}) {
   const executable = resolveExecutable();
   if (!executable) {
     return Promise.reject(new Error('FFmpeg 실행 파일을 찾을 수 없습니다.'));
@@ -64,16 +69,19 @@ function run(args, { onProgress, totalDurationMs = 0, jobId } = {}) {
 
     let stderr = '';
     let stdoutBuffer = '';
+    let finalProgress = {};
 
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk) => {
       stdoutBuffer += chunk;
       const blocks = stdoutBuffer.split(/(?<=progress=\w+\r?\n)/);
       stdoutBuffer = blocks.pop() || '';
-      if (!onProgress) return;
+      if (!onProgress && !captureProgress) return;
 
       for (const block of blocks) {
         const fields = parseProgress(block);
+        finalProgress = { ...finalProgress, ...fields };
+        if (!onProgress) continue;
         const microseconds = Number(fields.out_time_us ?? fields.out_time_ms);
         if (!Number.isFinite(microseconds) || totalDurationMs <= 0) continue;
         const ratio = microseconds / 1000 / totalDurationMs;
@@ -97,6 +105,10 @@ function run(args, { onProgress, totalDurationMs = 0, jobId } = {}) {
     child.on('close', (code) => {
       activeJobs.delete(id);
       resolveClosed();
+      if (captureProgress && stdoutBuffer.trim()) {
+        finalProgress = { ...finalProgress, ...parseProgress(stdoutBuffer) };
+        stdoutBuffer = '';
+      }
       if (cancelled) {
         const error = new Error('작업이 취소되었습니다.');
         error.code = 'CANCELLED';
@@ -105,7 +117,7 @@ function run(args, { onProgress, totalDurationMs = 0, jobId } = {}) {
       }
       if (code === 0) {
         if (onProgress) onProgress(1);
-        resolve();
+        resolve({ progress: finalProgress });
         return;
       }
       reject(new Error(stderr.trim() || `FFmpeg가 코드 ${code}로 종료되었습니다.`));
@@ -132,16 +144,49 @@ function hasActiveJobs() {
   return activeJobs.size > 0;
 }
 
-/** Parses a recording end-to-end and requires a video stream. */
-async function validateMedia(inputPath) {
-  await run([
+/**
+ * Decodes the primary video and every audio stream end-to-end. Optional expectations
+ * prevent a truncated-but-parseable file from being accepted as a complete recording.
+ */
+async function validateMedia(inputPath, {
+  expectedDurationMs = 0,
+  expectedFrames = 0,
+  requireAudio = false,
+  minDurationRatio = 0.95,
+  minFrameRatio = 0.95
+} = {}) {
+  const result = await run([
     '-v', 'error',
     '-i', inputPath,
     '-map', '0:v:0',
-    '-c', 'copy',
+    '-map', requireAudio ? '0:a:0' : '0:a?',
     '-f', 'null',
     '-'
-  ]);
+  ], { captureProgress: true });
+
+  const progress = result?.progress || {};
+  const frameCount = Number(progress.frame);
+  const microseconds = Number(progress.out_time_us ?? progress.out_time_ms);
+  const durationMs = Number.isFinite(microseconds) ? microseconds / 1000 : 0;
+  const durationFloor = Math.max(0, Number(expectedDurationMs))
+    * Math.max(0.5, Math.min(1, Number(minDurationRatio) || 0.95));
+  const frameFloor = Math.max(0, Number(expectedFrames))
+    * Math.max(0.5, Math.min(1, Number(minFrameRatio) || 0.95));
+  const finalFrameAllowanceMs = expectedFrames > 0
+    ? Math.max(1, Number(expectedDurationMs) / Number(expectedFrames) * 1.1)
+    : 0;
+
+  if (durationFloor > 0 && durationMs + finalFrameAllowanceMs < durationFloor) {
+    throw new Error(
+      `검증된 미디어 길이가 예상보다 짧습니다. (${Math.round(durationMs)}ms / ${Math.round(expectedDurationMs)}ms)`
+    );
+  }
+  if (frameFloor > 0 && (!Number.isFinite(frameCount) || frameCount < frameFloor)) {
+    throw new Error(
+      `검증된 영상 프레임 수가 예상보다 적습니다. (${frameCount || 0} / ${Math.round(expectedFrames)})`
+    );
+  }
+  return { durationMs, frameCount: Number.isFinite(frameCount) ? frameCount : 0 };
 }
 
 async function createThumbnail(inputPath, outputPath) {
