@@ -11,6 +11,7 @@
 
   const CHUNK_MS = 1000;
   const MAX_SEGMENT_MS = 15000;
+  const MIN_SAVEABLE_CLIP_MS = 250;
 
   function epochBytes(epoch) {
     if (!epoch) return 0;
@@ -28,13 +29,15 @@
   }
 
   function epochDuration(epoch, now = Date.now()) {
-    return Math.max(0, (epoch?.endedAt || now) - (epoch?.startedAt || now));
+    if (!epoch?.startedAt) return 0;
+    const pausedNow = epoch.pausedAt ? now - epoch.pausedAt : 0;
+    return Math.max(0, (epoch.endedAt || now) - epoch.startedAt
+      - (epoch.pausedAccumMs || 0) - pausedNow);
   }
 
   function activeBufferDuration(session) {
     const epochs = [...(session?.completedEpochs || []), session?.currentEpoch].filter(Boolean);
-    if (!epochs.length) return 0;
-    return Math.max(0, Date.now() - epochs[0].startedAt);
+    return epochs.reduce((total, epoch) => total + epochDuration(epoch), 0);
   }
 
   function clipLimitBytes() {
@@ -78,7 +81,9 @@
       initChunk: null,
       chunks: [],
       startedAt: Date.now(),
-      endedAt: null
+      endedAt: null,
+      pausedAccumMs: 0,
+      pausedAt: 0
     };
     const profile = session.profile;
     const recorder = new MediaRecorder(session.stream, {
@@ -173,7 +178,8 @@
 
     const targetMs = session.profile.clipDurationSeconds * 1000;
     while (epochs.length > 1
-      && requestedAt - (epochs[1]?.startedAt || requestedAt) >= targetMs) {
+      && epochs.reduce((total, epoch) => total + epochDuration(epoch), 0) - epochDuration(epochs[0])
+        >= targetMs) {
       epochs.shift();
     }
 
@@ -181,9 +187,11 @@
       requestedAt,
       startedAt: epochs[0]?.startedAt || requestedAt,
       endedAt: current?.endedAt || Date.now(),
+      durationMs: epochs.reduce((total, epoch) => total + epochDuration(epoch), 0),
       epochs: epochs.map((epoch) => ({
         startedAt: epoch.startedAt,
         endedAt: epoch.endedAt,
+        pausedAccumMs: epoch.pausedAccumMs || 0,
         initChunk: epoch.initChunk,
         chunks: epoch.chunks.map((entry) => ({ ...entry })),
         mimeType: epoch.mimeType
@@ -372,6 +380,8 @@
       if (snapshotRemainingBytes > clipLimitBytes() - reserve
         && activeRecorder?.state === 'recording') {
         activeRecorder.pause();
+        const activeEpoch = session.currentEpoch;
+        if (activeEpoch) activeEpoch.pausedAt = Date.now();
         pausedForSnapshot = true;
       }
       wasTrimmedForSize = snapshot.trimmedForSize;
@@ -383,10 +393,13 @@
         return { ok: false, saved: null, partial: false, error: '아직 저장할 클립 데이터가 없습니다.' };
       }
 
-      const estimatedMs = Math.min(
-        windowMs,
-        Math.max(CHUNK_MS, snapshot.requestedAt - snapshot.startedAt)
-      );
+      if (snapshot.durationMs < MIN_SAVEABLE_CLIP_MS) {
+        const error = '클립 버퍼가 아직 충분히 쌓이지 않았습니다.';
+        RP4.ui.showToast(error);
+        return { ok: false, saved: null, partial: false, error };
+      }
+
+      const estimatedMs = Math.max(1, Math.min(windowMs, snapshot.durationMs));
       RP4.ui.setStatus('클립 저장 중', '클릭 시점까지의 최근 장면을 저장하고 있습니다.', 'warn');
 
       const meta = {
@@ -499,6 +512,11 @@
       if (pausedForSnapshot && session.currentEpoch?.recorder?.state === 'paused') {
         try {
           session.currentEpoch.recorder.resume();
+          const epoch = session.currentEpoch;
+          if (epoch.pausedAt) {
+            epoch.pausedAccumMs += Date.now() - epoch.pausedAt;
+            epoch.pausedAt = 0;
+          }
         } catch {
           // The clip may have been stopped while the snapshot was being written.
         }

@@ -91,7 +91,15 @@ async function shutdown({
   let drainResult = null;
   if (recordings) {
     if (rendererUnavailable) {
-      await cleanup('recordings', () => recordings.finalizeAllSessions({ failureReason }));
+      // A crashed renderer cannot participate in the IPC shutdown handshake, but it must
+      // still use the same bounded finalization/recovery policy as a normal close.
+      await cleanup('recordings', async () => {
+        drainResult = await windows.drainRecordings(null, recordings, {
+          timeoutMs: 20000,
+          clipShutdownMode: 'discard',
+          timeoutFailureReason: failureReason
+        });
+      });
     } else {
       try {
         drainResult = await windows.drainRecordings(mainWindow, recordings, {
@@ -272,6 +280,9 @@ async function bootstrap() {
     const sweep = await recordings.sweepTempDir();
     const reconciliation = await recordings.reconcileRecordingsDir();
     void recordings.resumePendingMediaJobs();
+    if (sweep.recovered.length > 0 || reconciliation.restored > 0) {
+      send('recordings:changed', { reason: 'startup-recovery' });
+    }
     {
       if (loaded.settingsRecovered) {
         send('app:notice', {

@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('node:fs/promises');
+const { constants: fsConstants } = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
@@ -47,10 +48,33 @@ function canonicalPathKey(filePath) {
 }
 
 class CanonicalPathMap extends Map {
-  get(key) { return super.get(canonicalPathKey(key)); }
-  set(key, value) { return super.set(canonicalPathKey(key), value); }
-  has(key) { return super.has(canonicalPathKey(key)); }
-  delete(key) { return super.delete(canonicalPathKey(key)); }
+  constructor(recordingsDir) {
+    super();
+    this.recordingsDir = recordingsDir;
+  }
+
+  key(key) { return canonicalPathKey(key); }
+
+  findKey(key) {
+    const direct = this.key(key);
+    if (super.has(direct)) return direct;
+    // `realpath()` in destructive IPC paths resolves a Windows junction, while the
+    // index intentionally keeps the user-selected display path. Match the same direct
+    // child name only when the stored path belongs to that configured directory.
+    const name = path.basename(direct);
+    const configured = canonicalPathKey(this.recordingsDir());
+    for (const storedKey of super.keys()) {
+      if (path.basename(storedKey) === name && path.dirname(storedKey) === configured) {
+        return storedKey;
+      }
+    }
+    return direct;
+  }
+
+  get(key) { return super.get(this.findKey(key)); }
+  set(key, value) { return super.set(this.key(key), value); }
+  has(key) { return super.has(this.findKey(key)); }
+  delete(key) { return super.delete(this.findKey(key)); }
 }
 
 async function mapWithConcurrency(items, limit, mapper) {
@@ -246,6 +270,77 @@ async function uniquePath(dir, baseName, extension) {
   return path.join(dir, `${baseName}_${crypto.randomUUID().slice(0, 8)}.${extension}`);
 }
 
+function numberedPath(dir, baseName, extension, attempt) {
+  const suffix = attempt === 0 ? '' : ` (${attempt + 1})`;
+  return path.join(dir, `${baseName}${suffix}.${extension}`);
+}
+
+/**
+ * Commits an app-owned staging file without ever replacing an existing user file.
+ *
+ * The source lives below RP4's private temp directory.  Linking it straight into
+ * the recordings folder preserves that private ACL on Windows, so first make a
+ * short-lived staging copy in the destination directory.  That copy inherits the
+ * user's recording-folder permissions; the link into the final name is then an
+ * atomic no-clobber operation on normal local filesystems.
+ */
+async function commitFileNoClobber(from, target) {
+  const destinationDir = path.dirname(target);
+  let destinationStaging = null;
+  try {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const candidate = path.join(
+        destinationDir,
+        `.rp4-${crypto.randomUUID()}.commit.part`
+      );
+      try {
+        await fs.copyFile(from, candidate, fsConstants.COPYFILE_EXCL);
+        destinationStaging = candidate;
+        break;
+      } catch (error) {
+        if (error?.code !== 'EEXIST' || attempt === 19) throw error;
+      }
+    }
+
+    try {
+      await fs.link(destinationStaging, target);
+    } catch (error) {
+      if (error?.code === 'EEXIST') throw error;
+      if (!['EXDEV', 'EPERM', 'EOPNOTSUPP', 'ENOTSUP'].includes(error?.code)) throw error;
+      // Filesystems without hard links still retain no-overwrite semantics.  The
+      // temporary destination file is intentionally hidden from RP4's media list.
+      await fs.copyFile(destinationStaging, target, fsConstants.COPYFILE_EXCL);
+    }
+
+    await fs.rm(from, { force: true }).catch(() => {});
+    return target;
+  } finally {
+    if (destinationStaging) await fs.rm(destinationStaging, { force: true }).catch(() => {});
+  }
+}
+
+async function commitStagedFileToUnique(from, dir, baseName, extension) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const target = numberedPath(dir, baseName, extension, attempt);
+    try {
+      return await commitFileNoClobber(from, target);
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+    }
+  }
+  return commitStagedFileToUnique(
+    from,
+    dir,
+    `${baseName}_${crypto.randomUUID().slice(0, 8)}`,
+    extension
+  );
+}
+
+async function recordingStagingPath(recordingsDir, extension) {
+  const tempDir = await paths.ensureOwnedTempDir(recordingsDir);
+  return path.join(tempDir, `rp4-${crypto.randomUUID()}.part.${extension}`);
+}
+
 /** Same-volume rename, with a copy fallback if the target is on another device. */
 async function moveFile(from, to) {
   try {
@@ -414,7 +509,7 @@ class RecordingManager {
     this.sessions = new Map();
     this.losslessSessions = new Map();
     this.finalizing = new Map();
-    this.metadata = new CanonicalPathMap();
+    this.metadata = new CanonicalPathMap(() => this.settings.recordingsDir);
     this.reconciling = false;
     this.shutdownAbandoned = false;
     this.optimizeQueue = [];
@@ -543,6 +638,7 @@ class RecordingManager {
         params: { error: error?.message || String(error) }
       });
     }
+    this.emit('recordings:changed', { filePath });
   }
 
   async flushIndex() {
@@ -726,7 +822,7 @@ class RecordingManager {
               expectedDurationMs: Number(manifest.durationMs) || 0,
               expectedFrames: Number(manifest.frameCount) || undefined
             });
-            await fs.rename(finalizingPath, committedTarget);
+            await commitFileNoClobber(finalizingPath, committedTarget);
             committed = true;
           }
           if (committed) {
@@ -1280,7 +1376,7 @@ class RecordingManager {
     );
     const failureReason = explicitFailure;
     const outputBase = failureReason ? `${session.baseName}_partial` : session.baseName;
-    const target = await uniquePath(session.recordingsDir, outputBase, 'avi');
+    let target = await uniquePath(session.recordingsDir, outputBase, 'avi');
     const finalizingPath = session.finalizingPath || path.join(
       await paths.ensureOwnedTempDir(session.recordingsDir),
       `rp4-${session.sessionId}.lossless-finalizing.avi`
@@ -1329,21 +1425,30 @@ class RecordingManager {
       await ffmpeg.validateMedia(finalizingPath, {
         expectedDurationMs: durationMs,
         expectedFrames: session.frameCount,
-        requireAudio: hasAudio
+        requireAudio: hasAudio,
+        maxDurationRatio: 1.05
       });
       validated = true;
-      const journal = {
-        ...(session.manifest || {}),
-        version: 2,
-        state: 'ready-to-commit',
-        targetName: path.basename(target),
-        durationMs,
-        frameCount: session.frameCount
-      };
-      await writeJsonAtomic(session.manifestPath, journal);
-      // The staging directory is a child of recordingsDir, so this rename is a
-      // same-volume atomic commit. The final name never contains a partial AVI.
-      await fs.rename(finalizingPath, target);
+      for (let attempt = 0; attempt < 500; attempt += 1) {
+        const journal = {
+          ...(session.manifest || {}),
+          version: 2,
+          state: 'ready-to-commit',
+          targetName: path.basename(target),
+          durationMs,
+          frameCount: session.frameCount
+        };
+        await writeJsonAtomic(session.manifestPath, journal);
+        try {
+          // Commit without replacing an unrelated file that may have appeared after the
+          // name check. The journal still points at the staged file if the app crashes.
+          await commitFileNoClobber(finalizingPath, target);
+          break;
+        } catch (error) {
+          if (error?.code !== 'EEXIST' || attempt === 499) throw error;
+          target = numberedPath(session.recordingsDir, outputBase, 'avi', attempt + 1);
+        }
+      }
     } catch (error) {
       if (!validated) await fs.rm(finalizingPath, { force: true }).catch(() => {});
       throw new Error(
@@ -1655,81 +1760,51 @@ class RecordingManager {
     const { targetFormat, recordedContainer, recordedCodec, recordedAudioCodec } = session;
     const canStreamCopyToMp4 = targetFormat === 'mp4' && recordedCodec === 'h264';
 
-    // Clip epochs contain every Blob from one MediaRecorder in order. FFmpeg can therefore
-    // seek from the end of a complete stream without assuming any Blob is independently
-    // decodable.
+    // A user-visible recent clip has an exact privacy boundary. Re-encode across the
+    // start boundary rather than stream-copying from a preceding H.264 keyframe.
     if (session.forceRemux) {
-      const target = await uniquePath(session.recordingsDir, session.baseName, targetFormat);
+      const staging = await recordingStagingPath(session.recordingsDir, targetFormat);
       const recentDurationMs = Number(session.meta.trimRecentMs) || durationMs;
       const endOffsetMs = Math.max(0, Number(session.meta.trimEndOffsetMs) || 0);
       try {
         this.emit('recording:convert-progress', { phase: 'clip', ratio: 0 });
         const progress = (ratio) => this.emit('recording:convert-progress', { phase: 'clip', ratio });
 
-        if (targetFormat === 'mp4' && recordedCodec === 'unknown'
-          && recordedContainer === 'mp4') {
-          // Some Chromium builds report only "video/mp4" even when the payload is
-          // H.264. Try the lossless path first and transcode only when the actual file
-          // proves incompatible.
-          try {
-            await ffmpeg.trimRecent(session.tempPath, target, {
-              durationMs: recentDurationMs,
-              endOffsetMs,
-              jobId: `clip:${session.baseName}`,
-              onProgress: progress
-            });
-            await ffmpeg.validateMedia(target, { expectedDurationMs: recentDurationMs });
-          } catch {
-            await fs.rm(target, { force: true }).catch(() => {});
-            await ffmpeg.transcodeToMp4(session.tempPath, target, {
-              fps: session.meta.fps,
-              bitrateMbps: session.meta.bitrateMbps,
-              audioBitrateKbps: session.meta.audioBitrateKbps,
-              encoderPreset: session.meta.encoderPreset,
-              recentDurationMs,
-              recentEndOffsetMs: endOffsetMs,
-              jobId: `clip:${session.baseName}`,
-              onProgress: progress
-            });
-          }
-        } else if (targetFormat === 'mp4' && recordedCodec !== 'h264') {
-          await ffmpeg.transcodeToMp4(session.tempPath, target, {
-            fps: session.meta.fps,
-            bitrateMbps: session.meta.bitrateMbps,
-            audioBitrateKbps: session.meta.audioBitrateKbps,
-            encoderPreset: session.meta.encoderPreset,
-            recentDurationMs,
-            recentEndOffsetMs: endOffsetMs,
-            jobId: `clip:${session.baseName}`,
-            onProgress: progress
-          });
-        } else if (targetFormat === 'mp4' && recordedContainer !== 'mp4') {
-          await ffmpeg.trimRecentToMp4(session.tempPath, target, {
-            durationMs: recentDurationMs,
-            endOffsetMs,
-            audioBitrateKbps: session.meta.audioBitrateKbps,
-            jobId: `clip:${session.baseName}`,
-            onProgress: progress
-          });
-        } else {
-          await ffmpeg.trimRecent(session.tempPath, target, {
-            durationMs: recentDurationMs,
-            endOffsetMs,
-            jobId: `clip:${session.baseName}`,
-            onProgress: progress
-          });
-        }
-        await ffmpeg.validateMedia(target, { expectedDurationMs: recentDurationMs });
+        await ffmpeg.trimRecentPrecisely(session.tempPath, staging, {
+          durationMs: recentDurationMs,
+          endOffsetMs,
+          fps: session.meta.fps,
+          bitrateMbps: session.meta.bitrateMbps,
+          audioBitrateKbps: session.meta.audioBitrateKbps,
+          encoderPreset: session.meta.encoderPreset,
+          jobId: `clip:${session.baseName}`,
+          onProgress: progress
+        });
+        await ffmpeg.validateMedia(staging, {
+          expectedDurationMs: recentDurationMs,
+          maxDurationRatio: 1.05
+        });
+        const target = await commitStagedFileToUnique(
+          staging,
+          session.recordingsDir,
+          session.baseName,
+          targetFormat
+        );
         await fs.rm(session.tempPath, { force: true });
         return { filePath: target, format: targetFormat, converted: true, optimizable: false };
       } catch (error) {
-        return this.keepOriginal(session, target, error);
+        await fs.rm(staging, { force: true }).catch(() => {});
+        return this.keepOriginal(session, error);
       }
     }
 
     if (recordedContainer === targetFormat) {
-      const target = await uniquePath(session.recordingsDir, session.baseName, targetFormat);
-      await this.moveFile(session.tempPath, target);
+      const target = await commitStagedFileToUnique(
+        session.tempPath,
+        session.recordingsDir,
+        session.baseName,
+        targetFormat
+      );
       return {
         filePath: target,
         format: targetFormat,
@@ -1742,7 +1817,7 @@ class RecordingManager {
     }
 
     if (canStreamCopyToMp4) {
-      const target = await uniquePath(session.recordingsDir, session.baseName, 'mp4');
+      const staging = await recordingStagingPath(session.recordingsDir, 'mp4');
       try {
         this.emit('recording:convert-progress', { phase: 'remux', ratio: 0 });
         const remuxOptions = {
@@ -1751,23 +1826,30 @@ class RecordingManager {
           onProgress: (ratio) => this.emit('recording:convert-progress', { phase: 'remux', ratio })
         };
         if (recordedAudioCodec === 'opus') {
-          await ffmpeg.remuxH264ToMp4(session.tempPath, target, remuxOptions);
+          await ffmpeg.remuxH264ToMp4(session.tempPath, staging, remuxOptions);
         } else {
-          await ffmpeg.remux(session.tempPath, target, remuxOptions);
+          await ffmpeg.remux(session.tempPath, staging, remuxOptions);
         }
-        await ffmpeg.validateMedia(target, { expectedDurationMs: durationMs });
+        await ffmpeg.validateMedia(staging, { expectedDurationMs: durationMs });
+        const target = await commitStagedFileToUnique(
+          staging,
+          session.recordingsDir,
+          session.baseName,
+          'mp4'
+        );
         await fs.rm(session.tempPath, { force: true });
         return { filePath: target, format: 'mp4', converted: true, optimizable: false };
       } catch (error) {
-        return this.keepOriginal(session, target, error);
+        await fs.rm(staging, { force: true }).catch(() => {});
+        return this.keepOriginal(session, error);
       }
     }
 
     if (targetFormat === 'mp4') {
-      const target = await uniquePath(session.recordingsDir, session.baseName, 'mp4');
+      const staging = await recordingStagingPath(session.recordingsDir, 'mp4');
       try {
         this.emit('recording:convert-progress', { phase: 'transcode', ratio: 0 });
-        await ffmpeg.transcodeToMp4(session.tempPath, target, {
+        await ffmpeg.transcodeToMp4(session.tempPath, staging, {
           fps: session.meta.fps,
           bitrateMbps: session.meta.bitrateMbps,
           audioBitrateKbps: session.meta.audioBitrateKbps,
@@ -1776,30 +1858,40 @@ class RecordingManager {
           jobId: `convert:${session.baseName}`,
           onProgress: (ratio) => this.emit('recording:convert-progress', { phase: 'transcode', ratio })
         });
-        await ffmpeg.validateMedia(target, { expectedDurationMs: durationMs });
+        await ffmpeg.validateMedia(staging, { expectedDurationMs: durationMs });
+        const target = await commitStagedFileToUnique(
+          staging,
+          session.recordingsDir,
+          session.baseName,
+          'mp4'
+        );
         await fs.rm(session.tempPath, { force: true });
         return { filePath: target, format: 'mp4', converted: true, optimizable: false };
       } catch (error) {
-        return this.keepOriginal(session, target, error);
+        await fs.rm(staging, { force: true }).catch(() => {});
+        return this.keepOriginal(session, error);
       }
     }
 
     // Requested WebM but recorded something else: keep the real container rather than
     // lying about the extension.
-    const target = await uniquePath(session.recordingsDir, session.baseName, recordedContainer);
-    await this.moveFile(session.tempPath, target);
+    const target = await commitStagedFileToUnique(
+      session.tempPath,
+      session.recordingsDir,
+      session.baseName,
+      recordedContainer
+    );
     return { filePath: target, format: recordedContainer, converted: false, optimizable: false };
   }
 
   /** Conversion failed: keep the untouched recording so nothing is ever lost. */
-  async keepOriginal(session, failedTarget, error) {
-    await fs.rm(failedTarget, { force: true });
-    const target = await uniquePath(
+  async keepOriginal(session, error) {
+    const target = await commitStagedFileToUnique(
+      session.tempPath,
       session.recordingsDir,
       `${session.baseName}_original`,
       session.recordedContainer
     );
-    await this.moveFile(session.tempPath, target);
     return {
       filePath: target,
       format: session.recordedContainer,
@@ -1811,12 +1903,12 @@ class RecordingManager {
 
   /** A write failed: preserve every byte under an explicit partial name. */
   async keepPartial(session, failureReason) {
-    const target = await uniquePath(
+    const target = await commitStagedFileToUnique(
+      session.tempPath,
       session.recordingsDir,
       `${session.baseName}_partial`,
       session.recordedContainer
     );
-    await this.moveFile(session.tempPath, target);
     return {
       filePath: target,
       format: session.recordedContainer,
@@ -2365,6 +2457,7 @@ class RecordingManager {
           params: { error: error?.message || String(error) }
         });
       }
+      this.emit('recordings:changed', { filePath: target, deleted: true });
       return true;
     } finally {
       this.deletingFiles.delete(target);
@@ -2501,6 +2594,8 @@ module.exports = {
   normalizeRecordingMeta,
   recoveryOriginalName,
   uniquePath,
+  commitFileNoClobber,
+  commitStagedFileToUnique,
   moveFile,
   replaceFileSafely,
   openOwnedRegularFile,

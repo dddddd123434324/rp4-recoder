@@ -9,6 +9,7 @@
   const VIDEO_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="13" rx="1.6"/><path d="M8 21h8M12 18v3"/></svg>';
   const thumbnailRecordings = new WeakMap();
   let observedRecordingList = null;
+  let renderGeneration = 0;
   const recordingListResizeObserver = new ResizeObserver(() => layoutRecentFiles());
   const thumbnailObserver = new IntersectionObserver((entries) => {
     for (const entry of entries) {
@@ -167,9 +168,11 @@
 
   async function render() {
     if (!els.recordingList) return;
+    const generation = ++renderGeneration;
 
     try {
       const recordings = await window.rp4.listRecordings();
+      if (generation !== renderGeneration || !els.recordingList) return;
       for (const thumb of els.recordingList.querySelectorAll('.recording-thumb')) {
         thumbnailObserver.unobserve(thumb);
       }

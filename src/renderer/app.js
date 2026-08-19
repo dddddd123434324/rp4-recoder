@@ -629,7 +629,7 @@
     els.screenshotQualityNote.textContent = lossless
       ? 'PNG는 원본 해상도를 무손실로 저장하므로 품질이 최고로 고정됩니다.'
       : format === 'webp'
-        ? 'WebP는 원본 화질을 낮추지 않으며 최대 4096×2160 영역까지 저장할 수 있습니다.'
+        ? 'WebP는 원본 해상도를 유지하며 선택한 품질로 압축합니다. 무손실 저장은 PNG를 사용해 주세요.'
         : 'JPG는 선택한 품질이 높을수록 파일 용량도 커집니다.';
   }
 
@@ -713,7 +713,11 @@
     els.clipSaveButton.addEventListener('click', () => void RP4.clips.saveClip());
 
     els.refreshFilesButton.addEventListener('click', () => void RP4.files.render());
-    els.openFolderButton.addEventListener('click', () => void window.rp4.openRecordingsFolder());
+    els.openFolderButton.addEventListener('click', () => void window.rp4.openRecordingsFolder()
+      .then((result) => {
+        if (!result?.ok) RP4.ui.showToast(result?.error || '녹화 폴더를 열지 못했습니다.');
+      })
+      .catch(() => RP4.ui.showToast('녹화 폴더를 열지 못했습니다.')));
     els.chooseFolderButton.addEventListener('click', () => void chooseRecordingsFolder());
     els.recordingList.addEventListener('wheel', (event) => {
       if (els.recordingList.scrollWidth <= els.recordingList.clientWidth) return;
@@ -861,6 +865,7 @@
         : notice.message;
       if (message) RP4.ui.showToast(message, { durationMs: 6000 });
     });
+    window.rp4.onRecordingsChanged(() => void RP4.files.render());
 
     window.rp4.onConvertProgress(({ phase, ratio }) => {
       util.reportShutdownProgress({ phase, ratio: Number(ratio) || 0 });

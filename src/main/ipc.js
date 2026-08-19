@@ -549,8 +549,10 @@ function registerIpcHandlers(context) {
 
   handleMain('folder:open-recordings', async () => {
     await paths.ensureRecordingDirs(settings.recordingsDir);
-    await shell.openPath(settings.recordingsDir);
-    return settings.recordingsDir;
+    const error = await shell.openPath(settings.recordingsDir);
+    return error
+      ? { ok: false, error, recordingsDir: settings.recordingsDir }
+      : { ok: true, recordingsDir: settings.recordingsDir };
   });
 
   handleMain('folder:choose-recordings', async (event) => {

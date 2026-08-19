@@ -164,6 +164,7 @@ async function validateMedia(inputPath, {
   expectedFrames = 0,
   requireAudio = false,
   minDurationRatio = 0.95,
+  maxDurationRatio = 0,
   minFrameRatio = 0.95,
   jobId
 } = {}) {
@@ -191,6 +192,15 @@ async function validateMedia(inputPath, {
   if (durationFloor > 0 && durationMs + finalFrameAllowanceMs < durationFloor) {
     throw new Error(
       `검증된 미디어 길이가 예상보다 짧습니다. (${Math.round(durationMs)}ms / ${Math.round(expectedDurationMs)}ms)`
+    );
+  }
+  const suppliedMaxDurationRatio = Number(maxDurationRatio);
+  const durationCeiling = suppliedMaxDurationRatio > 0
+    ? Math.max(0, Number(expectedDurationMs)) * Math.max(1, suppliedMaxDurationRatio)
+    : 0;
+  if (durationCeiling > 0 && durationMs > durationCeiling + finalFrameAllowanceMs) {
+    throw new Error(
+      `검증된 미디어 길이가 예상보다 깁니다. (${Math.round(durationMs)}ms / ${Math.round(expectedDurationMs)}ms)`
     );
   }
   if (frameFloor > 0 && (!Number.isFinite(frameCount) || frameCount < frameFloor)) {
@@ -359,6 +369,49 @@ async function trimRecentToMp4(inputPath, outputPath, options = {}) {
 }
 
 /**
+ * Extracts an exact recent interval by decoding through the boundary and re-encoding it.
+ * Stream-copy clipping can begin at the preceding keyframe and leak footage older than the
+ * requested interval, so it is deliberately not used for user-visible Clip Mode.
+ */
+async function trimRecentPrecisely(inputPath, outputPath, options = {}) {
+  const durationMs = Math.max(1, Number(options.durationMs) || 1);
+  const seconds = durationMs / 1000;
+  const seekSeconds = seconds + Math.max(0, Number(options.endOffsetMs) || 0) / 1000;
+  const extension = path.extname(outputPath).toLowerCase();
+  const fps = Math.max(1, Math.min(240, Number(options.fps) || 60));
+  const bitrateMbps = Math.max(1, Number(options.bitrateMbps) || 10);
+  const audioBitrateKbps = Math.max(64, Math.min(320, Number(options.audioBitrateKbps) || 192));
+  const preset = ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium']
+    .includes(options.encoderPreset) ? options.encoderPreset : 'veryfast';
+  const webm = extension === '.webm';
+
+  await fs.rm(outputPath, { force: true });
+  await run([
+    '-y',
+    '-sseof', `-${seekSeconds.toFixed(3)}`,
+    '-i', inputPath,
+    '-t', seconds.toFixed(3),
+    '-map', '0:v:0',
+    '-map', '0:a:0?',
+    '-vf', `fps=${fps},pad=ceil(iw/2)*2:ceil(ih/2)*2`,
+    '-c:v', webm ? 'libvpx-vp9' : 'libx264',
+    ...(webm ? ['-b:v', `${bitrateMbps}M`, '-row-mt', '1'] : [
+      '-preset', preset,
+      '-b:v', `${bitrateMbps}M`,
+      '-pix_fmt', 'yuv420p'
+    ]),
+    '-c:a', webm ? 'libopus' : 'aac',
+    '-b:a', `${audioBitrateKbps}k`,
+    ...(webm ? [] : ['-movflags', '+faststart']),
+    outputPath
+  ], {
+    jobId: options.jobId,
+    onProgress: options.onProgress,
+    totalDurationMs: durationMs
+  });
+}
+
+/**
  * Full software re-encode. Only reached when the recorder could not produce H.264 at
  * all, so it is a compatibility fallback rather than part of the normal path.
  */
@@ -415,5 +468,6 @@ module.exports = {
   remuxH264ToMp4,
   trimRecent,
   trimRecentToMp4,
+  trimRecentPrecisely,
   transcodeToMp4
 };

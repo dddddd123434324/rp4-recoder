@@ -231,13 +231,30 @@
    * The output size is fixed for the lifetime of the track: changing resolution mid-stream
    * would force the H.264 encoder to re-initialise.
    */
-  function createProcessedTrack(videoTrack, { getCrop, output }) {
+  function createProcessedTrack(videoTrack, { getCrop, output, onFailure = null }) {
     const processor = new window.MediaStreamTrackProcessor({ track: videoTrack });
     const generator = new window.MediaStreamTrackGenerator({ kind: 'video' });
 
     let canvas = null;
     let context = null;
     let stopped = false;
+    let consecutiveFailures = 0;
+    let firstFailureAt = 0;
+    let failureReported = false;
+
+    const reportPersistentFailure = (error) => {
+      const now = Date.now();
+      if (!firstFailureAt || now - firstFailureAt > 2000) {
+        firstFailureAt = now;
+        consecutiveFailures = 0;
+      }
+      consecutiveFailures += 1;
+      if (failureReported || consecutiveFailures < 30) return;
+      failureReported = true;
+      onFailure?.(new Error(
+        `영상 프레임 변환이 반복적으로 실패했습니다. ${error?.message || error || ''}`.trim()
+      ));
+    };
 
     const ensureCanvas = () => {
       if (!canvas) {
@@ -288,8 +305,11 @@
               duration: frame.duration ?? undefined
             }));
           }
-        } catch {
-          // Drop the frame rather than tearing the whole pipeline down.
+          consecutiveFailures = 0;
+          firstFailureAt = 0;
+        } catch (error) {
+          reportPersistentFailure(error);
+          if (failureReported) controller.error(error);
         } finally {
           frame.close();
         }
@@ -299,8 +319,11 @@
     processor.readable
       .pipeThrough(transformer)
       .pipeTo(generator.writable)
-      .catch(() => {
-        // Resolves as a rejection whenever the track ends; nothing to do.
+      .catch((error) => {
+        if (!stopped && !failureReported) {
+          failureReported = true;
+          onFailure?.(new Error(`영상 처리 파이프라인이 종료되었습니다. ${error?.message || error || ''}`.trim()));
+        }
       });
 
     return {
@@ -321,7 +344,12 @@
    * requestVideoFrameCallback with a timer backstop; `backgroundThrottling` is disabled on
    * the window so neither is throttled when the app is not visible.
    */
-  async function createCanvasCroppedTrack(videoTrack, { getCrop, output, fps }) {
+  async function createCanvasCroppedTrack(videoTrack, {
+    getCrop,
+    output,
+    fps,
+    onFailure = null
+  }) {
     const video = document.createElement('video');
     video.muted = true;
     video.playsInline = true;
@@ -337,11 +365,30 @@
     let stopped = false;
     let frameHandle = 0;
     let timerHandle = 0;
+    let consecutiveFailures = 0;
+    let firstFailureAt = 0;
+    let failureReported = false;
+
+    const reportFailure = (error) => {
+      const now = Date.now();
+      if (!firstFailureAt || now - firstFailureAt > 2000) {
+        firstFailureAt = now;
+        consecutiveFailures = 0;
+      }
+      consecutiveFailures += 1;
+      if (failureReported || consecutiveFailures < 30) return;
+      failureReported = true;
+      stopped = true;
+      onFailure?.(new Error(
+        `영상 프레임 변환이 반복적으로 실패했습니다. ${error?.message || error || ''}`.trim()
+      ));
+    };
 
     const draw = () => {
       if (stopped) return;
       if (video.readyState >= 2 && video.videoWidth && video.videoHeight) {
-        const crop = getCrop(video.videoWidth, video.videoHeight);
+        try {
+          const crop = getCrop(video.videoWidth, video.videoHeight);
         const scale = Math.min(output.width / crop.width, output.height / crop.height);
         const drawWidth = Math.max(1, Math.round(crop.width * scale));
         const drawHeight = Math.max(1, Math.round(crop.height * scale));
@@ -352,11 +399,16 @@
           context.fillStyle = '#000';
           context.fillRect(0, 0, output.width, output.height);
         }
-        context.drawImage(
+          context.drawImage(
           video,
           crop.x, crop.y, crop.width, crop.height,
           offsetX, offsetY, drawWidth, drawHeight
-        );
+          );
+          consecutiveFailures = 0;
+          firstFailureAt = 0;
+        } catch (error) {
+          reportFailure(error);
+        }
       }
       schedule();
     };
@@ -418,7 +470,8 @@
     source = state.selectedSource,
     mode = state.selectedMode,
     areaSelection = state.areaSelection,
-    profile = RP4.profile.get()
+    profile = RP4.profile.get(),
+    onVideoProcessingFailure = null
   }) {
     if (!source) throw new Error('캡처 소스가 없습니다.');
 
@@ -461,8 +514,17 @@
         const initialRect = getCrop(frameWidth, frameHeight);
         output = computeOutputSize(initialRect.width, initialRect.height, profile);
         videoOut = supportsZeroCopyCrop()
-          ? createProcessedTrack(videoTrack, { getCrop, output })
-          : await createCanvasCroppedTrack(videoTrack, { getCrop, output, fps: profile.fps });
+          ? createProcessedTrack(videoTrack, {
+              getCrop,
+              output,
+              onFailure: onVideoProcessingFailure
+            })
+          : await createCanvasCroppedTrack(videoTrack, {
+              getCrop,
+              output,
+              fps: profile.fps,
+              onFailure: onVideoProcessingFailure
+            });
         disposers.push(() => videoOut.stop?.());
       }
 

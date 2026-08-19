@@ -30,6 +30,7 @@ window.RP4 = window.RP4 || {};
     captureOperationId: 0,
     shuttingDown: false,
     recordingStartPromise: null,
+    startingRecording: null,
     clipStartPromise: null,
 
     // Normal recording

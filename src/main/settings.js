@@ -300,8 +300,12 @@ class SettingsStore {
     const target = paths.settingsFile();
     const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
     await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(temporary, JSON.stringify(snapshot, null, 2), 'utf8');
-    await fs.rename(temporary, target);
+    try {
+      await fs.writeFile(temporary, JSON.stringify(snapshot, null, 2), 'utf8');
+      await fs.rename(temporary, target);
+    } finally {
+      await fs.rm(temporary, { force: true }).catch(() => {});
+    }
   }
 
   save() {

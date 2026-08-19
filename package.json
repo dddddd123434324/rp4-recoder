@@ -30,6 +30,7 @@
     "files": [
       "src/**/*",
       "icon.ico",
+      "THIRD_PARTY_NOTICES.md",
       "package.json"
     ],
     "win": {

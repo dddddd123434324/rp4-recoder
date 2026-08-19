@@ -19,10 +19,13 @@
 
     const card = document.createElement('div');
     card.className = 'modal-card dialog-card';
+    const headingId = `rp4-dialog-title-${crypto.randomUUID()}`;
+    card.setAttribute('aria-labelledby', headingId);
 
     const header = document.createElement('div');
     header.className = 'panel-header';
     const heading = document.createElement('h2');
+    heading.id = headingId;
     heading.textContent = RP4.i18n.translate(title);
     header.append(heading);
 
@@ -73,6 +76,9 @@
 
     return new Promise((resolve) => {
       const parts = buildDialog(options);
+      const previousFocus = document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
       let settled = false;
 
       const settle = (value) => {
@@ -81,20 +87,33 @@
         activeDialog = null;
         document.removeEventListener('keydown', onKeyDown, true);
         parts.overlay.remove();
+        if (previousFocus?.isConnected) previousFocus.focus();
         resolve(value);
       };
 
       function onKeyDown(event) {
+        if (event.isComposing) return;
         if (event.key === 'Escape') {
           event.preventDefault();
           event.stopPropagation();
           settle(null);
           return;
         }
-        if (event.key === 'Enter' && !event.shiftKey) {
+        if (event.key === 'Enter' && !event.shiftKey
+          && (event.target === parts.confirm || event.target === parts.input)) {
           event.preventDefault();
           event.stopPropagation();
           settle(parts.input ? parts.input.value : true);
+          return;
+        }
+        if (event.key === 'Tab') {
+          const focusable = [parts.input, parts.cancel, parts.confirm].filter(Boolean);
+          const current = focusable.indexOf(document.activeElement);
+          const next = event.shiftKey
+            ? (current <= 0 ? focusable.length - 1 : current - 1)
+            : (current < 0 || current === focusable.length - 1 ? 0 : current + 1);
+          event.preventDefault();
+          focusable[next].focus();
         }
       }
 

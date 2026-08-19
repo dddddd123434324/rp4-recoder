@@ -87,6 +87,7 @@ contextBridge.exposeInMainWorld('rp4', {
 
   onHotkey: (callback) => subscribe('hotkey:trigger', callback),
   onNotice: (callback) => subscribe('app:notice', callback),
+  onRecordingsChanged: (callback) => subscribe('recordings:changed', callback),
   onConvertProgress: (callback) => subscribe('recording:convert-progress', callback),
   onOptimizeState: (callback) => subscribe('recording:optimize', callback),
   onVerifyState: (callback) => subscribe('recording:verify', callback),

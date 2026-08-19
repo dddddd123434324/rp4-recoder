@@ -151,6 +151,7 @@ async function run() {
     normalizeRecordingMeta,
     replaceFileSafely,
     openOwnedRegularFile,
+    commitStagedFileToUnique,
     MAX_INDEX_BYTES
   } = require('../src/main/recording');
 
@@ -168,6 +169,21 @@ async function run() {
   // artifacts. Optimization itself is exercised explicitly at the end of this suite.
   await settings.update({ recordingsDir: RECORDINGS, optimizeMp4: false });
   await paths.ensureRecordingDirs(settings.recordingsDir);
+
+  const existingCommitTarget = path.join(RECORDINGS, 'commit-race.mp4');
+  const stagedCommitTarget = path.join(settings.tempDir, `rp4-${crypto.randomUUID()}.part.mp4`);
+  await fsp.writeFile(existingCommitTarget, Buffer.from('keep-existing'));
+  await fsp.writeFile(stagedCommitTarget, Buffer.from('new-recording'));
+  const committedRacePath = await commitStagedFileToUnique(
+    stagedCommitTarget,
+    RECORDINGS,
+    'commit-race',
+    'mp4'
+  );
+  check('final recording commit never overwrites a newly occupied target name',
+    (await fsp.readFile(existingCommitTarget, 'utf8')) === 'keep-existing'
+      && (await fsp.readFile(committedRacePath, 'utf8')) === 'new-recording'
+      && path.basename(committedRacePath) === 'commit-race (2).mp4');
 
   check('settings persist to sandbox userData', fs.existsSync(paths.settingsFile()), paths.settingsFile());
   check('recordings dir is the configured one', settings.recordingsDir === RECORDINGS);
@@ -684,6 +700,49 @@ async function run() {
       && i18nResult.korean.text === '스크린샷'
       && i18nResult.korean.label === '닫기');
 
+  const modalSource = await fsp.readFile(path.join(__dirname, '..', 'src', 'renderer', 'modal.js'), 'utf8');
+  const modalKeyboardResult = JSON.parse(await win.webContents.executeJavaScript(`
+    (async () => {
+      document.body.innerHTML = '<button id="before">before</button>';
+      const before = document.getElementById('before');
+      before.focus();
+      window.RP4 = { i18n: { translate: (value) => value } };
+      eval(${JSON.stringify(modalSource)});
+      const first = window.RP4.dialog.confirmAction({ title: 'Delete', message: 'x' });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const cancel = document.querySelector('.dialog-button');
+      cancel.focus();
+      cancel.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Enter', bubbles: true, cancelable: true
+      }));
+      const stillOpenAfterCancelEnter = window.RP4.dialog.isDialogOpen();
+      cancel.click();
+      const cancelResult = await first;
+      const second = window.RP4.dialog.confirmAction({ title: 'Delete', message: 'x' });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const confirm = document.querySelector('.dialog-button.primary');
+      confirm.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Enter', bubbles: true, cancelable: true, isComposing: true
+      }));
+      const stillOpenWhileComposing = window.RP4.dialog.isDialogOpen();
+      document.querySelector('.dialog-button').click();
+      const composingResult = await second;
+      return JSON.stringify({
+        stillOpenAfterCancelEnter,
+        cancelResult,
+        stillOpenWhileComposing,
+        composingResult,
+        focusRestored: document.activeElement === before
+      });
+    })()
+  `));
+  check('confirmation modal honors cancel focus, IME composition, and focus restoration',
+    modalKeyboardResult.stillOpenAfterCancelEnter === true
+      && modalKeyboardResult.cancelResult === false
+      && modalKeyboardResult.stillOpenWhileComposing === true
+      && modalKeyboardResult.composingResult === false
+      && modalKeyboardResult.focusRestored === true);
+
   const bgraCopy = JSON.parse(await win.webContents.executeJavaScript(`
     (async () => {
       const canvas = document.createElement('canvas');
@@ -726,6 +785,26 @@ async function run() {
     path.join(__dirname, '..', 'src', 'renderer', 'recorder.js'),
     'utf8'
   );
+  const pausedTimeline = JSON.parse(await win.webContents.executeJavaScript(`
+    (() => {
+      window.RP4 = { state: {}, els: {}, util: {} };
+      eval(${JSON.stringify(recorderSource)});
+      const context = {
+        losslessSourceFirstTimestampUs: null,
+        losslessLastTimestampUs: null,
+        losslessFirstTimestampUs: null,
+        losslessPausedAccumUs: 0
+      };
+      const first = window.RP4.recorder.normalizeLosslessTimestamp(context, 1000000);
+      const beforePause = window.RP4.recorder.normalizeLosslessTimestamp(context, 2000000);
+      context.losslessPausedAccumUs = 10000000;
+      const resumed = window.RP4.recorder.normalizeLosslessTimestamp(context, 12000000);
+      return JSON.stringify({ first, beforePause, resumed, last: context.losslessLastTimestampUs });
+    })()
+  `));
+  check('lossless frame timestamps exclude a paused source-time interval',
+    pausedTimeline.first === 0 && pausedTimeline.beforePause === 1000000
+      && pausedTimeline.resumed === 1000000 && pausedTimeline.last === 1000000);
   check('lossless frames use a transferable MessagePort instead of invoke per frame',
     preloadSource.includes("ipcRenderer.postMessage('lossless:open-writer'")
       && recorderSource.includes("type: 'rp4:lossless-writer-port'")
@@ -736,7 +815,7 @@ async function run() {
       && !ipcSource.includes("handleMain('lossless:write-audio'"));
   check('screenshot encoding uses one quality policy and exposes the WebP limit',
     ipcSource.includes('normalizeScreenshotQuality(payload.quality)')
-      && rendererAppSourceForScreenshot.includes('최대 4096×2160 영역까지'));
+      && rendererAppSourceForScreenshot.includes('WebP는 원본 해상도를 유지하며 선택한 품질로 압축합니다.'));
   check('renderer lossless frame queue is explicitly bounded',
     /LOSSLESS_FRAME_QUEUE_SIZE\s*=\s*3/.test(recorderSource)
       && recorderSource.includes('losslessDroppedFrames'));
@@ -1036,6 +1115,22 @@ async function run() {
     missingRequiredAudioRejected = true;
   }
   check('recording validation rejects missing required audio', missingRequiredAudioRejected);
+
+  const overlongPath = path.join(SANDBOX, 'overlong.mp4');
+  await runFfmpeg([
+    '-f', 'lavfi', '-i', 'testsrc2=size=64x48:rate=10',
+    '-t', '2', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', overlongPath
+  ]);
+  let overlongRejected = false;
+  try {
+    await ffmpeg.validateMedia(overlongPath, {
+      expectedDurationMs: 1000,
+      maxDurationRatio: 1.05
+    });
+  } catch {
+    overlongRejected = true;
+  }
+  check('media validation rejects output longer than the requested clip boundary', overlongRejected);
 
   recordings.optimizeQueue.push({ filePath: 'pending-test.mp4', durationMs: 1 });
   check('pending optimization blocks recording-folder mutation', recordings.hasPendingFileMutations());
@@ -1419,6 +1514,14 @@ async function run() {
   await recordings.list();
   check('listing current folder keeps similarly prefixed folder metadata',
     recordings.metadata.has(oldFolderMetadata));
+
+  const junctionLikeManager = new RecordingManager({
+    settings: { recordingsDir: 'C:\\RP4-recordings-link' },
+    emit: () => {}
+  });
+  junctionLikeManager.metadata.set('C:\\RP4-recordings-link\\managed.mp4', { durationMs: 1 });
+  check('metadata resolves a real junction target to its configured recording path',
+    junctionLikeManager.metadata.get('D:\\real-recordings\\managed.mp4')?.durationMs === 1);
 
   const { resolveRecordingMediaFile } = require('../src/main/ipc');
   check('owned top-level media file passes IPC validation',
