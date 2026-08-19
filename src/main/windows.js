@@ -11,6 +11,7 @@ const SRC_DIR = path.resolve(__dirname, '..');
 const APP_ROOT = path.resolve(SRC_DIR, '..');
 const ICON_PATH = path.join(APP_ROOT, 'icon.ico');
 const UNRESPONSIVE_GRACE_MS = 10000;
+const UNRESPONSIVE_RECORDING_GRACE_MS = 60000;
 const MAX_TOTAL_SHUTDOWN_MS = 10 * 60 * 1000;
 
 function sleep(ms) {
@@ -24,7 +25,9 @@ function sleep(ms) {
 function hardenWebContents(contents) {
   contents.setWindowOpenHandler(({ url }) => {
     if (/^https?:\/\//i.test(url)) {
-      void shell.openExternal(url);
+      void shell.openExternal(url).catch((error) => {
+        process.stderr.write(`open external URL failed: ${error?.stack || error}\n`);
+      });
     }
     return { action: 'deny' };
   });
@@ -40,7 +43,12 @@ function hardenWebContents(contents) {
   });
 }
 
-function createMainWindow({ isSmoke, onRendererGone, onRendererUnresponsive }) {
+function createMainWindow({
+  isSmoke,
+  onRendererGone,
+  onRendererUnresponsive,
+  getRendererUnresponsiveGraceMs
+}) {
   const win = new BrowserWindow({
     width: 1440,
     height: 900,
@@ -70,14 +78,23 @@ function createMainWindow({ isSmoke, onRendererGone, onRendererUnresponsive }) {
   };
   win.webContents.on('render-process-gone', (_event, details) => {
     clearUnresponsiveTimer();
-    void onRendererGone?.(win, details);
+    void Promise.resolve(onRendererGone?.(win, details)).catch((error) => {
+      process.stderr.write(`renderer-gone handler failed: ${error?.stack || error}\n`);
+    });
   });
   win.webContents.on('unresponsive', () => {
     if (unresponsiveTimer) return;
+    const requestedGraceMs = Number(getRendererUnresponsiveGraceMs?.(win));
+    const graceMs = Math.max(
+      UNRESPONSIVE_GRACE_MS,
+      Number.isFinite(requestedGraceMs) ? requestedGraceMs : UNRESPONSIVE_GRACE_MS
+    );
     unresponsiveTimer = setTimeout(() => {
       unresponsiveTimer = null;
-      void onRendererUnresponsive?.(win);
-    }, UNRESPONSIVE_GRACE_MS);
+      void Promise.resolve(onRendererUnresponsive?.(win)).catch((error) => {
+        process.stderr.write(`renderer-unresponsive handler failed: ${error?.stack || error}\n`);
+      });
+    }, graceMs);
   });
   win.webContents.on('responsive', clearUnresponsiveTimer);
   win.webContents.on('destroyed', clearUnresponsiveTimer);
@@ -124,7 +141,9 @@ function createTray({ getMainWindow, getLanguage, onQuitRequested }) {
   const buildContextMenu = () => Menu.buildFromTemplate([
     {
       label: getLanguage?.() === 'en' ? 'Exit' : '종료',
-      click: () => void onQuitRequested?.(getMainWindow?.())
+      click: () => void Promise.resolve(onQuitRequested?.(getMainWindow?.())).catch((error) => {
+        process.stderr.write(`tray quit handler failed: ${error?.stack || error}\n`);
+      })
     }
   ]);
   tray.on('click', () => showMainWindow(getMainWindow?.()));
@@ -285,6 +304,35 @@ async function confirmCloseWhileRecording(win, language = 'ko') {
   return response === 0;
 }
 
+/**
+ * A renderer can temporarily stop responding while encoding a high-resolution image
+ * or collecting native frames.  Do not turn that observation into an automatic quit;
+ * after the grace period, let the user decide whether to wait or safely finalize.
+ */
+async function confirmRendererUnresponsive(win, {
+  language = 'ko',
+  recordingActive = false
+} = {}) {
+  const english = language === 'en';
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'warning',
+    buttons: english ? ['Keep Waiting', 'Save and Exit'] : ['계속 대기', '안전 저장 후 종료'],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+    title: 'RP4 Recorder',
+    message: english ? 'RP4 Recorder is not responding.' : 'RP4 Recorder가 응답하지 않습니다.',
+    detail: english
+      ? recordingActive
+        ? 'Recording or image processing may be busy. Keep waiting, or finalize the current work and exit.'
+        : 'The app may recover. Keep waiting, or exit safely.'
+      : recordingActive
+        ? '녹화 또는 이미지 처리가 일시적으로 바쁠 수 있습니다. 계속 기다리거나 현재 작업을 안전하게 저장한 뒤 종료할 수 있습니다.'
+        : '앱이 다시 응답할 수 있습니다. 계속 기다리거나 안전하게 종료할 수 있습니다.'
+  }).catch(() => ({ response: 0 }));
+  return response === 1 ? 'exit' : 'wait';
+}
+
 async function confirmCloseWhileClip(win, { saving = false, language = 'ko' } = {}) {
   const english = language === 'en';
   const { response } = await dialog.showMessageBox(win, {
@@ -427,11 +475,13 @@ module.exports = {
   hardenWebContents,
   drainRecordings,
   confirmCloseWhileRecording,
+  confirmRendererUnresponsive,
   confirmCloseWhileClip,
   confirmClipSaveFailure,
   selectDesktopArea,
   closeAreaSelector,
   sleep,
   UNRESPONSIVE_GRACE_MS,
+  UNRESPONSIVE_RECORDING_GRACE_MS,
   MAX_TOTAL_SHUTDOWN_MS
 };

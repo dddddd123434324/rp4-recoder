@@ -27,6 +27,8 @@ let isQuitting = false;
 let smokeFinished = false;
 let rendererCaptureState = { recordingActive: false, clipActive: false, clipSaving: false };
 const failedRendererIds = new Set();
+let rendererUnresponsivePromptOpen = false;
+let fatalAsyncShutdownScheduled = false;
 
 function send(channel, payload) {
   if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return false;
@@ -60,6 +62,41 @@ function finishSmoke(code, message) {
     return;
   }
   process.stdout.write(`${message}\n`, () => app.exit(code));
+}
+
+function reportFatalAsyncFailure(error, source = 'asynchronous task') {
+  process.stderr.write(`${source} failed: ${error?.stack || error}\n`);
+  if (fatalAsyncShutdownScheduled || isQuitting) return;
+  fatalAsyncShutdownScheduled = true;
+  void (async () => {
+    if (isQuitting) {
+      app.exit(1);
+      return;
+    }
+    await shutdown({
+      rendererUnavailable: true,
+      failureReason: '처리되지 않은 비동기 오류로 녹화를 안전하게 마무리합니다.',
+      exitCode: 1
+    });
+  })().catch((shutdownError) => {
+    process.stderr.write(`fatal asynchronous shutdown failed: ${shutdownError?.stack || shutdownError}\n`);
+    app.exit(1);
+  });
+}
+
+function requestShutdown(options = {}) {
+  void shutdown(options).catch((error) => {
+    process.stderr.write(`shutdown failed: ${error?.stack || error}\n`);
+    app.exit(1);
+  });
+}
+
+function rendererUnresponsiveGraceMs() {
+  return rendererCaptureState.recordingActive
+    || rendererCaptureState.clipActive
+    || rendererCaptureState.clipSaving
+    ? windows.UNRESPONSIVE_RECORDING_GRACE_MS
+    : windows.UNRESPONSIVE_GRACE_MS;
 }
 
 /**
@@ -185,17 +222,27 @@ async function handleRendererGone(win, detail) {
   });
 }
 
-async function handleRendererUnresponsive() {
-  if (isQuitting) return;
-  // The grace period in createMainWindow has already elapsed. Try the normal renderer
-  // shutdown protocol first; if it cannot answer, drainRecordings falls back to partial save.
-  await shutdown({
-    clipShutdownMode: rendererCaptureState.clipSaving
-      ? 'wait-current-save'
-      : rendererCaptureState.clipActive ? 'save-current-buffer' : 'discard',
-    failureReason: '렌더러가 장시간 응답하지 않아 부분 저장했습니다.',
-    exitCode: 1
-  });
+async function handleRendererUnresponsive(win) {
+  if (isQuitting || rendererUnresponsivePromptOpen) return;
+  rendererUnresponsivePromptOpen = true;
+  try {
+    const decision = await windows.confirmRendererUnresponsive(win, {
+      language: settings.value.language,
+      recordingActive: rendererCaptureState.recordingActive
+        || rendererCaptureState.clipActive
+        || rendererCaptureState.clipSaving
+    });
+    if (decision !== 'exit' || isQuitting) return;
+    await shutdown({
+      clipShutdownMode: rendererCaptureState.clipSaving
+        ? 'wait-current-save'
+        : rendererCaptureState.clipActive ? 'save-current-buffer' : 'discard',
+      failureReason: '렌더러 응답 없음 상태에서 사용자가 안전 종료를 선택했습니다.',
+      exitCode: 1
+    });
+  } finally {
+    rendererUnresponsivePromptOpen = false;
+  }
 }
 
 async function bootstrap() {
@@ -260,8 +307,11 @@ async function bootstrap() {
 
     mainWindow = windows.createMainWindow({
       isSmoke: IS_SMOKE,
-      onRendererGone: handleRendererGone,
-      onRendererUnresponsive: handleRendererUnresponsive
+      onRendererGone: (win, details) => handleRendererGone(win, details)
+        .catch((error) => reportFatalAsyncFailure(error, 'renderer-gone recovery')),
+      onRendererUnresponsive: (win) => handleRendererUnresponsive(win)
+        .catch((error) => reportFatalAsyncFailure(error, 'renderer-unresponsive recovery')),
+      getRendererUnresponsiveGraceMs: rendererUnresponsiveGraceMs
     });
     if (!IS_SMOKE) {
       tray = windows.createTray({
@@ -279,7 +329,14 @@ async function bootstrap() {
     // decode large files and must never hold the first paint hostage.
     const sweep = await recordings.sweepTempDir();
     const reconciliation = await recordings.reconcileRecordingsDir();
-    void recordings.resumePendingMediaJobs();
+    void recordings.resumePendingMediaJobs().catch((error) => {
+      process.stderr.write(`resume media jobs failed: ${error?.stack || error}\n`);
+      send('app:notice', {
+        level: 'warn',
+        messageKey: 'mediaJobsResumeFailed',
+        params: { error: error?.message || String(error) }
+      });
+    });
     if (sweep.recovered.length > 0 || reconciliation.restored > 0) {
       send('recordings:changed', { reason: 'startup-recovery' });
     }
@@ -361,8 +418,11 @@ async function bootstrap() {
     if (BrowserWindow.getAllWindows().length === 0) {
       mainWindow = windows.createMainWindow({
         isSmoke: IS_SMOKE,
-        onRendererGone: handleRendererGone,
-        onRendererUnresponsive: handleRendererUnresponsive
+        onRendererGone: (win, details) => handleRendererGone(win, details)
+          .catch((error) => reportFatalAsyncFailure(error, 'renderer-gone recovery')),
+        onRendererUnresponsive: (win) => handleRendererUnresponsive(win)
+          .catch((error) => reportFatalAsyncFailure(error, 'renderer-unresponsive recovery')),
+        getRendererUnresponsiveGraceMs: rendererUnresponsiveGraceMs
       });
     } else {
       windows.showMainWindow(mainWindow);
@@ -372,12 +432,12 @@ async function bootstrap() {
   app.on('before-quit', (event) => {
     if (isQuitting) return;
     event.preventDefault();
-    void shutdown();
+    requestShutdown();
   });
 
   app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') {
-      void shutdown();
+      requestShutdown();
     }
   });
 }
@@ -387,5 +447,5 @@ process.on('uncaughtExceptionMonitor', (error) => {
 });
 
 process.on('unhandledRejection', (reason) => {
-  process.stderr.write(`unhandled rejection: ${reason?.stack || reason}\n`);
+  reportFatalAsyncFailure(reason, 'unhandled rejection');
 });

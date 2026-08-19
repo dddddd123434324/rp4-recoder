@@ -47,6 +47,16 @@ function canonicalPathKey(filePath) {
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
 
+/**
+ * Background jobs are restricted to direct children of one recordings folder.  Use the
+ * case-normalized file name as their identity so a configured Windows junction and its
+ * real target address the same job.
+ */
+function recordingWorkKey(filePath) {
+  const name = path.basename(path.resolve(String(filePath || '')));
+  return process.platform === 'win32' ? name.toLowerCase() : name;
+}
+
 class CanonicalPathMap extends Map {
   constructor(recordingsDir) {
     super();
@@ -276,47 +286,36 @@ function numberedPath(dir, baseName, extension, attempt) {
 }
 
 /**
- * Commits an app-owned staging file without ever replacing an existing user file.
+ * Commits an app-owned staging file without replacing an existing user file.
  *
- * The source lives below RP4's private temp directory.  Linking it straight into
- * the recordings folder preserves that private ACL on Windows, so first make a
- * short-lived staging copy in the destination directory.  That copy inherits the
- * user's recording-folder permissions; the link into the final name is then an
- * atomic no-clobber operation on normal local filesystems.
+ * RP4's staging directory is a direct child of the recordings directory, so an NTFS
+ * hard link followed by unlinking the staging name is O(1): no second copy, no extra
+ * full-file disk reservation, and no overwrite race.  A filesystem without hard-link
+ * support gets an explicit exclusive-copy fallback with enough free-space headroom.
  */
 async function commitFileNoClobber(from, target) {
-  const destinationDir = path.dirname(target);
-  let destinationStaging = null;
   try {
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      const candidate = path.join(
-        destinationDir,
-        `.rp4-${crypto.randomUUID()}.commit.part`
+    await fs.link(from, target);
+  } catch (error) {
+    if (error?.code === 'EEXIST') throw error;
+    if (!['EXDEV', 'EPERM', 'EOPNOTSUPP', 'ENOTSUP'].includes(error?.code)) throw error;
+
+    const source = await statFile(from);
+    if (!source?.isFile()) throw error;
+    const available = await freeBytes(path.dirname(target));
+    const required = source.size + MIN_FREE_BYTES_TO_CONTINUE;
+    if (available != null && available < required) {
+      throw codedError(
+        'INSUFFICIENT_COMMIT_SPACE',
+        '저장 파일을 안전하게 마무리할 여유 공간이 부족합니다.'
       );
-      try {
-        await fs.copyFile(from, candidate, fsConstants.COPYFILE_EXCL);
-        destinationStaging = candidate;
-        break;
-      } catch (error) {
-        if (error?.code !== 'EEXIST' || attempt === 19) throw error;
-      }
     }
-
-    try {
-      await fs.link(destinationStaging, target);
-    } catch (error) {
-      if (error?.code === 'EEXIST') throw error;
-      if (!['EXDEV', 'EPERM', 'EOPNOTSUPP', 'ENOTSUP'].includes(error?.code)) throw error;
-      // Filesystems without hard links still retain no-overwrite semantics.  The
-      // temporary destination file is intentionally hidden from RP4's media list.
-      await fs.copyFile(destinationStaging, target, fsConstants.COPYFILE_EXCL);
-    }
-
-    await fs.rm(from, { force: true }).catch(() => {});
-    return target;
-  } finally {
-    if (destinationStaging) await fs.rm(destinationStaging, { force: true }).catch(() => {});
+    // Non-NTFS/network filesystems may not support hard links. Preserve no-clobber
+    // semantics there even though the fallback necessarily copies the file once.
+    await fs.copyFile(from, target, fsConstants.COPYFILE_EXCL);
   }
+  await fs.rm(from, { force: true }).catch(() => {});
+  return target;
 }
 
 async function commitStagedFileToUnique(from, dir, baseName, extension) {
@@ -515,6 +514,8 @@ class RecordingManager {
     this.optimizeQueue = [];
     this.optimizing = false;
     this.optimizingFilePath = null;
+    this.optimizingFileKey = null;
+    this.optimizingJobId = null;
     this.optimizeDrainPromise = null;
     this.optimizationCancelled = false;
     this.indexChain = Promise.resolve();
@@ -2007,7 +2008,13 @@ class RecordingManager {
 
   enqueueOptimize(filePath, durationMs) {
     if (this.optimizationCancelled) return;
-    this.optimizeQueue.push({ filePath, durationMs });
+    const key = recordingWorkKey(filePath);
+    if (this.deletingFiles.has(key)
+      || this.optimizingFileKey === key
+      || this.optimizeQueue.some((job) => (job.key || recordingWorkKey(job.filePath)) === key)) {
+      return;
+    }
+    this.optimizeQueue.push({ filePath, durationMs, key });
     this.ensureOptimizeDrain();
   }
 
@@ -2024,19 +2031,21 @@ class RecordingManager {
 
   enqueueVerification(filePath, durationMs, optimizable = false) {
     if (this.verificationCancelled) return Promise.resolve(false);
-    if (this.verificationJobs.has(filePath)) return this.verificationJobs.get(filePath);
+    const key = recordingWorkKey(filePath);
+    if (this.verificationJobs.has(key)) return this.verificationJobs.get(key);
 
     let resolveJob;
     const promise = new Promise((resolve) => { resolveJob = resolve; });
     const job = {
       filePath,
+      key,
       durationMs,
       optimizable,
       jobId: `verify:${crypto.randomUUID()}`,
       promise,
       resolve: resolveJob
     };
-    this.verificationJobs.set(filePath, promise);
+    this.verificationJobs.set(key, promise);
     this.verificationQueue.push(job);
     this.ensureVerificationDrain();
     return promise;
@@ -2047,11 +2056,11 @@ class RecordingManager {
     while (this.verificationRunning.size < VERIFICATION_CONCURRENCY
       && this.verificationQueue.length > 0) {
       const job = this.verificationQueue.shift();
-      this.verificationRunning.set(job.filePath, job);
+      this.verificationRunning.set(job.key, job);
       void this.runVerification(job).then(job.resolve, () => job.resolve(false)).finally(() => {
-        this.verificationRunning.delete(job.filePath);
-        if (this.verificationJobs.get(job.filePath) === job.promise) {
-          this.verificationJobs.delete(job.filePath);
+        this.verificationRunning.delete(job.key);
+        if (this.verificationJobs.get(job.key) === job.promise) {
+          this.verificationJobs.delete(job.key);
         }
         this.ensureVerificationDrain();
       });
@@ -2059,15 +2068,15 @@ class RecordingManager {
   }
 
   async runVerification(job) {
-    const { filePath, durationMs, optimizable } = job;
-    if (this.deletingFiles.has(filePath)) return false;
+    const { filePath, key, durationMs, optimizable } = job;
+    if (this.deletingFiles.has(key)) return false;
     this.emit('recording:verify', { filePath, state: 'start' });
     try {
       await ffmpeg.validateMedia(filePath, {
         expectedDurationMs: durationMs,
         jobId: job.jobId
       });
-      if (this.deletingFiles.has(filePath)) return false;
+      if (this.deletingFiles.has(key)) return false;
       const meta = this.metadata.get(filePath);
       if (meta) {
         await this.setMetadata(filePath, {
@@ -2084,7 +2093,7 @@ class RecordingManager {
       }
       return true;
     } catch (error) {
-      if (this.deletingFiles.has(filePath)) return false;
+      if (this.deletingFiles.has(key)) return false;
       if (error?.code === 'CANCELLED') {
         // Preserve `verifying`; startup will resume an interrupted background decode.
         this.emit('recording:verify', { filePath, state: 'cancelled' });
@@ -2112,8 +2121,8 @@ class RecordingManager {
   async cancelAndDrainVerifications({ timeoutMs = VERIFICATION_SHUTDOWN_TIMEOUT_MS } = {}) {
     this.verificationCancelled = true;
     for (const job of this.verificationQueue.splice(0)) {
-      if (this.verificationJobs.get(job.filePath) === job.promise) {
-        this.verificationJobs.delete(job.filePath);
+      if (this.verificationJobs.get(job.key) === job.promise) {
+        this.verificationJobs.delete(job.key);
       }
       job.resolve(false);
     }
@@ -2132,20 +2141,21 @@ class RecordingManager {
   }
 
   async cancelVerification(filePath, { timeoutMs = VERIFICATION_SHUTDOWN_TIMEOUT_MS } = {}) {
+    const key = recordingWorkKey(filePath);
     const remaining = [];
     for (const job of this.verificationQueue) {
-      if (job.filePath !== filePath) {
+      if (job.key !== key) {
         remaining.push(job);
         continue;
       }
-      if (this.verificationJobs.get(job.filePath) === job.promise) {
-        this.verificationJobs.delete(job.filePath);
+      if (this.verificationJobs.get(job.key) === job.promise) {
+        this.verificationJobs.delete(job.key);
       }
       job.resolve(false);
     }
     this.verificationQueue = remaining;
 
-    const running = this.verificationRunning.get(filePath);
+    const running = this.verificationRunning.get(key);
     if (!running) return true;
     const [, drained] = await Promise.all([
       ffmpeg.cancel(running.jobId, { timeoutMs }),
@@ -2177,10 +2187,15 @@ class RecordingManager {
     try {
       while (this.optimizeQueue.length > 0) {
         const job = this.optimizeQueue.shift();
+        const jobKey = job.key || recordingWorkKey(job.filePath);
+        if (this.deletingFiles.has(jobKey)) continue;
         if (!(await paths.pathExists(job.filePath))) continue;
+        if (this.deletingFiles.has(jobKey)) continue;
 
         const optimized = `${job.filePath}.optimizing-${crypto.randomUUID()}.mp4`;
         this.optimizingFilePath = job.filePath;
+        this.optimizingFileKey = jobKey;
+        this.optimizingJobId = `optimize:${crypto.randomUUID()}`;
         try {
           const before = await statFile(job.filePath);
           const available = await freeBytes(path.dirname(job.filePath));
@@ -2192,15 +2207,21 @@ class RecordingManager {
             });
             continue;
           }
+          if (this.deletingFiles.has(jobKey)) continue;
           this.emit('recording:optimize', { filePath: job.filePath, state: 'start' });
           const sourceContract = await ffmpeg.validateMedia(job.filePath, {
             expectedDurationMs: job.durationMs,
-            jobId: `optimize:${job.filePath}`
+            jobId: this.optimizingJobId
           }) || {};
           await ffmpeg.remux(job.filePath, optimized, {
-            jobId: `optimize:${job.filePath}`,
+            jobId: this.optimizingJobId,
             totalDurationMs: job.durationMs
           });
+
+          if (this.deletingFiles.has(jobKey)) {
+            await fs.rm(optimized, { force: true });
+            continue;
+          }
 
           const after = await statFile(optimized);
           // Only swap when the result looks sane, so a truncated remux cannot replace a
@@ -2234,6 +2255,8 @@ class RecordingManager {
           });
         } finally {
           this.optimizingFilePath = null;
+          this.optimizingFileKey = null;
+          this.optimizingJobId = null;
         }
       }
     } finally {
@@ -2333,9 +2356,10 @@ class RecordingManager {
   async thumbnail(filePath) {
     const stats = await statFile(filePath);
     if (!stats?.isFile()) return null;
+    const workKey = recordingWorkKey(filePath);
     const cacheDir = path.join(paths.configDir(), 'recording-thumbnails');
     const key = crypto.createHash('sha256')
-      .update(`${filePath}\0${stats.size}\0${stats.mtimeMs}`)
+      .update(`${workKey}\0${stats.size}\0${stats.mtimeMs}`)
       .digest('hex');
     const output = path.join(cacheDir, `rp4-thumb-${key}.jpg`);
     await fs.mkdir(cacheDir, { recursive: true });
@@ -2343,17 +2367,18 @@ class RecordingManager {
 
     const job = {
       filePath,
+      workKey,
       jobId: `thumbnail:${crypto.randomUUID()}`,
       cancelled: false,
       started: false,
       settled: false,
       promise: null
     };
-    if (!this.thumbnailJobs.has(filePath)) this.thumbnailJobs.set(filePath, new Set());
-    this.thumbnailJobs.get(filePath).add(job);
+    if (!this.thumbnailJobs.has(workKey)) this.thumbnailJobs.set(workKey, new Set());
+    this.thumbnailJobs.get(workKey).add(job);
     const task = this.thumbnailQueue.then(async () => {
       job.started = true;
-      if (job.cancelled || this.deletingFiles.has(filePath)) {
+      if (job.cancelled || this.deletingFiles.has(workKey)) {
         throw codedError('CANCELLED', '썸네일 생성을 취소했습니다.');
       }
       let buffer = await fs.readFile(output).catch(() => null);
@@ -2365,7 +2390,7 @@ class RecordingManager {
         const temporary = `${output}.tmp-${crypto.randomUUID()}.jpg`;
         try {
           await ffmpeg.createThumbnail(filePath, temporary, { jobId: job.jobId });
-          if (job.cancelled || this.deletingFiles.has(filePath)) {
+          if (job.cancelled || this.deletingFiles.has(workKey)) {
             throw codedError('CANCELLED', '썸네일 생성을 취소했습니다.');
           }
           buffer = await fs.readFile(temporary);
@@ -2390,14 +2415,15 @@ class RecordingManager {
     } finally {
       job.settled = true;
       this.thumbnailInflight.delete(key);
-      const jobs = this.thumbnailJobs.get(filePath);
+      const jobs = this.thumbnailJobs.get(workKey);
       jobs?.delete(job);
-      if (jobs?.size === 0) this.thumbnailJobs.delete(filePath);
+      if (jobs?.size === 0) this.thumbnailJobs.delete(workKey);
     }
   }
 
   async cancelThumbnail(filePath, { timeoutMs = VERIFICATION_SHUTDOWN_TIMEOUT_MS } = {}) {
-    const jobs = [...(this.thumbnailJobs.get(filePath) || [])];
+    const workKey = recordingWorkKey(filePath);
+    const jobs = [...(this.thumbnailJobs.get(workKey) || [])];
     for (const job of jobs) job.cancelled = true;
     const running = jobs.filter((job) => job.started && !job.settled);
     if (running.length === 0) return true;
@@ -2424,23 +2450,26 @@ class RecordingManager {
     if (!targetMeta) return false;
 
     const previousMeta = targetMeta;
+    const targetKey = recordingWorkKey(target);
     let deleted = false;
-    this.deletingFiles.add(target);
+    this.deletingFiles.add(targetKey);
     try {
-      this.optimizeQueue = this.optimizeQueue.filter((job) => job.filePath !== target);
+      this.optimizeQueue = this.optimizeQueue.filter((job) => (
+        (job.key || recordingWorkKey(job.filePath)) !== targetKey
+      ));
       const [verificationStopped, thumbnailStopped] = await Promise.all([
         this.cancelVerification(target),
         this.cancelThumbnail(target)
       ]);
       if (!verificationStopped || !thumbnailStopped) return false;
 
-      if (this.optimizingFilePath === target) {
-        await ffmpeg.cancel(`optimize:${target}`, { timeoutMs: 5000 });
+      if (this.optimizingFileKey === targetKey) {
+        await ffmpeg.cancel(this.optimizingJobId, { timeoutMs: 5000 });
         const deadline = Date.now() + 5000;
-        while (this.optimizingFilePath === target && Date.now() < deadline) {
+        while (this.optimizingFileKey === targetKey && Date.now() < deadline) {
           await new Promise((resolve) => setTimeout(resolve, 25));
         }
-        if (this.optimizingFilePath === target) return false;
+        if (this.optimizingFileKey === targetKey) return false;
       }
 
       if (!(await paths.pathExists(target))) return false;
@@ -2460,7 +2489,7 @@ class RecordingManager {
       this.emit('recordings:changed', { filePath: target, deleted: true });
       return true;
     } finally {
-      this.deletingFiles.delete(target);
+      this.deletingFiles.delete(targetKey);
       if (!deleted && previousMeta?.status === 'verifying' && await paths.pathExists(target)) {
         this.enqueueVerification(
           target,
@@ -2593,6 +2622,7 @@ module.exports = {
   audioCodecFromMimeType,
   normalizeRecordingMeta,
   recoveryOriginalName,
+  recordingWorkKey,
   uniquePath,
   commitFileNoClobber,
   commitStagedFileToUnique,

@@ -40,6 +40,7 @@
     '파일 작업을 완료하지 못했습니다.': 'Could not complete the file operation.',
     '파일을 찾을 수 없습니다.': 'The file could not be found.',
     '녹화 파일을 재생할 수 없습니다.': 'The recording cannot be played.',
+    '녹화 파일 삭제': 'Delete Recording',
     '이 파일을 휴지통으로 이동할까요?': 'Move this file to the Recycle Bin?',
     '녹화 파일을 삭제하지 못했습니다.': 'Could not delete the recording.',
     '녹화 파일을 휴지통으로 이동했습니다.': 'The recording was moved to the Recycle Bin.',
@@ -191,6 +192,7 @@
     '검증 실패': 'Verification Failed',
     '원본 보존': 'Original Preserved',
     '복구됨': 'Recovered',
+    '외부 파일 · 읽기 전용': 'External File · Read Only',
     '새 프리셋': 'New Preset',
     '프리셋 수정': 'Edit Preset',
     '프리셋 삭제': 'Delete Preset',
@@ -289,6 +291,18 @@
     metadataFlushFailed: {
       ko: '녹화 메타데이터 저장을 완료하지 못했습니다. ({error})',
       en: 'Could not finish saving recording metadata. ({error})'
+    },
+    mediaJobsResumeFailed: {
+      ko: '이전 녹화의 백그라운드 검증을 다시 시작하지 못했습니다. ({error})',
+      en: 'Could not resume background verification for previous recordings. ({error})'
+    },
+    recordingDeleteConfirm: {
+      ko: '{fileName}\n\n이 파일을 휴지통으로 이동할까요?',
+      en: '{fileName}\n\nMove this file to the Recycle Bin?'
+    },
+    screenshotSaved: {
+      ko: '스크린샷 저장: {fileName} ({width}x{height})',
+      en: 'Screenshot saved: {fileName} ({width}x{height})'
     }
   };
 

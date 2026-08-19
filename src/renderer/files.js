@@ -5,6 +5,11 @@
  */
 (function initFiles(RP4) {
   const { state, els, util } = RP4;
+  const t = (value) => RP4.i18n.translate(value);
+  const message = (key, params, fallback) => RP4.i18n.formatMessage(key, {
+    ...params,
+    fallback
+  });
 
   const VIDEO_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="13" rx="1.6"/><path d="M8 21h8M12 18v3"/></svg>';
   const thumbnailRecordings = new WeakMap();
@@ -68,7 +73,7 @@
     button.addEventListener('click', () => {
       void Promise.resolve(onClick()).catch((error) => {
         console.error(error);
-        RP4.ui.showToast('파일 작업을 완료하지 못했습니다.');
+        RP4.ui.showToast(t('파일 작업을 완료하지 못했습니다.'));
       });
     });
     return button;
@@ -101,12 +106,12 @@
     info.append(name, detail);
 
     const badges = [];
-    if (recording.partial || recording.status === 'partial') badges.push(['부분 저장', 'warn']);
-    if (recording.status === 'verifying') badges.push(['검증 중', 'info']);
-    if (recording.status === 'invalid') badges.push(['검증 실패', 'warn']);
-    if (recording.outcome === 'original-preserved') badges.push(['원본 보존', 'warn']);
-    if (recording.recovered || recording.outcome === 'recovered') badges.push(['복구됨', 'info']);
-    if (recording.managed === false) badges.push(['외부 파일 · 읽기 전용', 'info']);
+    if (recording.partial || recording.status === 'partial') badges.push([t('부분 저장'), 'warn']);
+    if (recording.status === 'verifying') badges.push([t('검증 중'), 'info']);
+    if (recording.status === 'invalid') badges.push([t('검증 실패'), 'warn']);
+    if (recording.outcome === 'original-preserved') badges.push([t('원본 보존'), 'warn']);
+    if (recording.recovered || recording.outcome === 'recovered') badges.push([t('복구됨'), 'info']);
+    if (recording.managed === false) badges.push([t('외부 파일 · 읽기 전용'), 'info']);
     if (badges.length > 0) {
       const badgeRow = document.createElement('div');
       badgeRow.className = 'recording-badges';
@@ -124,38 +129,42 @@
 
     const open = actionButton({
       text: '…',
-      title: '파일 위치 열기',
+      title: t('파일 위치 열기'),
       onClick: async () => {
         const shown = await window.rp4.showFile(recording.filePath);
-        if (!shown) RP4.ui.showToast('파일을 찾을 수 없습니다.');
+        if (!shown) RP4.ui.showToast(t('파일을 찾을 수 없습니다.'));
       }
     });
     const play = actionButton({
       text: '▶',
-      title: '녹화 재생',
+      title: t('녹화 재생'),
       onClick: async () => {
         const result = await window.rp4.playRecording(recording.filePath);
-        if (!result?.ok) RP4.ui.showToast(result?.error || '녹화 파일을 재생할 수 없습니다.');
+        if (!result?.ok) RP4.ui.showToast(result?.error || t('녹화 파일을 재생할 수 없습니다.'));
       }
     });
     const remove = actionButton({
       text: '×',
-      title: '녹화 삭제',
+      title: t('녹화 삭제'),
       className: 'danger',
       onClick: async () => {
         const confirmed = await RP4.dialog.confirmAction({
-          title: '녹화 파일 삭제',
-          message: `${recording.name}\n\n이 파일을 휴지통으로 이동할까요?`,
-          confirmLabel: '삭제'
+          title: t('녹화 파일 삭제'),
+          message: message(
+            'recordingDeleteConfirm',
+            { fileName: recording.name },
+            `${recording.name}\n\n${t('이 파일을 휴지통으로 이동할까요?')}`
+          ),
+          confirmLabel: t('삭제')
         });
         if (!confirmed) return;
 
         const result = await window.rp4.deleteRecording(recording.filePath);
         if (!result?.deleted) {
-          RP4.ui.showToast('녹화 파일을 삭제하지 못했습니다.');
+          RP4.ui.showToast(t('녹화 파일을 삭제하지 못했습니다.'));
           return;
         }
-        RP4.ui.showToast('녹화 파일을 휴지통으로 이동했습니다.');
+        RP4.ui.showToast(t('녹화 파일을 휴지통으로 이동했습니다.'));
         await render();
       }
     });
@@ -182,7 +191,7 @@
       if (!recordings.length) {
         const empty = document.createElement('div');
         empty.className = 'empty-state';
-        empty.textContent = '아직 녹화 파일이 없습니다.';
+        empty.textContent = t('아직 녹화 파일이 없습니다.');
         els.recordingList.append(empty);
         return;
       }
@@ -200,7 +209,7 @@
       window.requestAnimationFrame(layoutRecentFiles);
     } catch (error) {
       console.error(error);
-      RP4.ui.showToast('녹화 파일 목록을 불러오지 못했습니다.');
+      RP4.ui.showToast(t('녹화 파일 목록을 불러오지 못했습니다.'));
     }
   }
 
@@ -211,7 +220,7 @@
   async function performTakeScreenshot() {
     if (state.shuttingDown || state.sourceSelectionPending) return;
     if (!state.selectedSource) {
-      RP4.ui.showToast('먼저 캡처 소스를 선택해 주세요.');
+      RP4.ui.showToast(t('먼저 캡처 소스를 선택해 주세요.'));
       return;
     }
 
@@ -232,7 +241,11 @@
           format: configuredFormat,
           quality: state.appSettings.screenshotQuality
         });
-        RP4.ui.showToast(`스크린샷 저장: ${saved.fileName} (${saved.width}x${saved.height})`);
+        RP4.ui.showToast(message(
+          'screenshotSaved',
+          { fileName: saved.fileName, width: saved.width, height: saved.height },
+          `스크린샷 저장: ${saved.fileName} (${saved.width}x${saved.height})`
+        ));
         return;
       }
 
@@ -259,10 +272,14 @@
         width: canvas.width,
         height: canvas.height
       });
-      RP4.ui.showToast(`스크린샷 저장: ${saved.fileName} (${canvas.width}x${canvas.height})`);
+      RP4.ui.showToast(message(
+        'screenshotSaved',
+        { fileName: saved.fileName, width: canvas.width, height: canvas.height },
+        `스크린샷 저장: ${saved.fileName} (${canvas.width}x${canvas.height})`
+      ));
     } catch (error) {
       console.error(error);
-      RP4.ui.showToast('스크린샷 저장에 실패했습니다.');
+      RP4.ui.showToast(t('스크린샷 저장에 실패했습니다.'));
     }
   }
 

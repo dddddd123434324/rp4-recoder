@@ -1,6 +1,6 @@
 {
   "name": "rp4-recorder",
-  "version": "0.2.21",
+  "version": "0.2.22",
   "productName": "RP4 Recorder",
   "description": "RP4 desktop screen recorder",
   "author": "RP4",
@@ -13,7 +13,8 @@
     "smoke": "node scripts/smoke-test.js",
     "test:integration": "node scripts/run-electron.js scripts/integration-test.js",
     "test": "npm run lint && npm run smoke && npm run test:integration",
-    "dist": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false ELECTRON_BUILDER_DISABLE_BUILD_CACHE=true electron-builder --win --x64"
+    "dist": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false ELECTRON_BUILDER_DISABLE_BUILD_CACHE=true electron-builder --win --x64 && node scripts/write-checksums.js",
+    "checksums": "node scripts/write-checksums.js"
   },
   "build": {
     "appId": "com.rp4.recorder",

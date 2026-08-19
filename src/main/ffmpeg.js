@@ -236,18 +236,27 @@ async function createThumbnail(inputPath, outputPath, { jobId } = {}) {
  * Stream-copy remux. No re-encoding, so this is I/O bound (measured ~75 ms for 11.5 MB)
  * rather than the minutes a libx264 pass costs.
  */
-async function remux(inputPath, outputPath, { jobId, onProgress, totalDurationMs } = {}) {
-  await fs.rm(outputPath, { force: true });
-  await run([
+function remuxArguments(inputPath, outputPath) {
+  const args = [
     '-y',
     '-fflags', '+genpts',
     '-i', inputPath,
     '-map', '0:v:0',
     '-map', '0:a?',
-    '-c', 'copy',
-    '-movflags', '+faststart',
-    outputPath
-  ], { jobId, onProgress, totalDurationMs });
+    '-c', 'copy'
+  ];
+  // `faststart` rewrites the MP4/MOV moov atom. It is not a Matroska/WebM
+  // option and can make otherwise recoverable non-MP4 recordings fail remuxing.
+  if (path.extname(outputPath).toLowerCase() === '.mp4') {
+    args.push('-movflags', '+faststart');
+  }
+  args.push(outputPath);
+  return args;
+}
+
+async function remux(inputPath, outputPath, { jobId, onProgress, totalDurationMs } = {}) {
+  await fs.rm(outputPath, { force: true });
+  await run(remuxArguments(inputPath, outputPath), { jobId, onProgress, totalDurationMs });
 }
 
 /** Joins complete rolling MediaRecorder epochs without re-encoding. */
@@ -463,6 +472,7 @@ module.exports = {
   hasActiveJobs,
   validateMedia,
   createThumbnail,
+  remuxArguments,
   remux,
   concatSegments,
   remuxH264ToMp4,

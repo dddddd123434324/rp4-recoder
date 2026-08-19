@@ -152,6 +152,7 @@ async function run() {
     replaceFileSafely,
     openOwnedRegularFile,
     commitStagedFileToUnique,
+    recordingWorkKey,
     MAX_INDEX_BYTES
   } = require('../src/main/recording');
 
@@ -174,16 +175,37 @@ async function run() {
   const stagedCommitTarget = path.join(settings.tempDir, `rp4-${crypto.randomUUID()}.part.mp4`);
   await fsp.writeFile(existingCommitTarget, Buffer.from('keep-existing'));
   await fsp.writeFile(stagedCommitTarget, Buffer.from('new-recording'));
+  const stagedCommitStats = await fsp.stat(stagedCommitTarget);
+  const originalCopyFile = fsp.copyFile;
+  let commitCopyCalls = 0;
+  fsp.copyFile = (...args) => {
+    commitCopyCalls += 1;
+    return originalCopyFile(...args);
+  };
   const committedRacePath = await commitStagedFileToUnique(
     stagedCommitTarget,
     RECORDINGS,
     'commit-race',
     'mp4'
   );
+  fsp.copyFile = originalCopyFile;
+  const committedRaceStats = await fsp.stat(committedRacePath);
   check('final recording commit never overwrites a newly occupied target name',
     (await fsp.readFile(existingCommitTarget, 'utf8')) === 'keep-existing'
       && (await fsp.readFile(committedRacePath, 'utf8')) === 'new-recording'
       && path.basename(committedRacePath) === 'commit-race (2).mp4');
+  check('normal recording commit is an O(1) hard-link handoff',
+    commitCopyCalls === 0
+      && (stagedCommitStats.ino === 0 || committedRaceStats.ino === stagedCommitStats.ino),
+    `copyCalls=${commitCopyCalls} inode=${stagedCommitStats.ino}->${committedRaceStats.ino}`);
+
+  const remuxMp4Args = ffmpeg.remuxArguments('input.mp4', 'output.mp4');
+  const remuxWebmArgs = ffmpeg.remuxArguments('input.webm', 'output.webm');
+  const remuxMkvArgs = ffmpeg.remuxArguments('input.mkv', 'output.mkv');
+  check('remux applies faststart only to MP4 output',
+    remuxMp4Args.includes('-movflags')
+      && !remuxWebmArgs.includes('-movflags')
+      && !remuxMkvArgs.includes('-movflags'));
 
   check('settings persist to sandbox userData', fs.existsSync(paths.settingsFile()), paths.settingsFile());
   check('recordings dir is the configured one', settings.recordingsDir === RECORDINGS);
@@ -555,6 +577,29 @@ async function run() {
   check('window crop pipe failure resolves safely', pipeFailureResult === null && pipeChild.killed);
 
   // Main waits for an explicit renderer ACK even before a recording session exists.
+  const windowHelpers = require('../src/main/windows');
+  const electron = require('electron');
+  const originalShowMessageBox = electron.dialog.showMessageBox;
+  const unresponsivePrompts = [];
+  electron.dialog.showMessageBox = async (_window, options) => {
+    unresponsivePrompts.push(options);
+    return { response: unresponsivePrompts.length === 1 ? 0 : 1 };
+  };
+  const unresponsiveWait = await windowHelpers.confirmRendererUnresponsive(
+    { isDestroyed: () => false },
+    { language: 'en', recordingActive: true }
+  );
+  const unresponsiveExit = await windowHelpers.confirmRendererUnresponsive(
+    { isDestroyed: () => false },
+    { language: 'ko', recordingActive: false }
+  );
+  electron.dialog.showMessageBox = originalShowMessageBox;
+  check('renderer unresponsive policy waits for user choice and grants recordings more time',
+    unresponsiveWait === 'wait'
+      && unresponsiveExit === 'exit'
+      && unresponsivePrompts[0]?.buttons?.[0] === 'Keep Waiting'
+      && windowHelpers.UNRESPONSIVE_RECORDING_GRACE_MS > windowHelpers.UNRESPONSIVE_GRACE_MS);
+
   const fakeContents = new EventEmitter();
   let requestedClipShutdownMode = null;
   fakeContents.send = (channel, payload) => {
@@ -580,7 +625,7 @@ async function run() {
     }
   };
   const shutdownStartedAt = Date.now();
-  const drained = await require('../src/main/windows').drainRecordings(
+  const drained = await windowHelpers.drainRecordings(
     fakeWindow,
     fakeRecordings,
     { timeoutMs: 50, clipShutdownMode: 'wait-current-save' }
@@ -611,7 +656,7 @@ async function run() {
     }, 15);
   };
   const hardLimitStartedAt = Date.now();
-  const hardLimited = await require('../src/main/windows').drainRecordings(
+  const hardLimited = await windowHelpers.drainRecordings(
     { isDestroyed: () => false, webContents: hardLimitContents },
     fakeRecordings,
     { timeoutMs: 40, maxTotalMs: 80 }
@@ -630,7 +675,7 @@ async function run() {
     ));
   };
   let failedFinalizeCalls = 0;
-  const failedDrain = await require('../src/main/windows').drainRecordings(
+  const failedDrain = await windowHelpers.drainRecordings(
     { isDestroyed: () => false, webContents: failedContents },
     {
       hasActiveSessions: () => false,
@@ -686,9 +731,17 @@ async function run() {
         count: 2,
         tempDir: 'D:\\\\safe-temp'
       });
+      const dynamic = {
+        screenshot: window.RP4.i18n.formatMessage('screenshotSaved', {
+          fileName: 'capture.png', width: 1920, height: 1080
+        }),
+        deletion: window.RP4.i18n.formatMessage('recordingDeleteConfirm', {
+          fileName: 'capture.mp4'
+        })
+      };
       window.RP4.i18n.setLanguage('ko');
       const korean = { text: button.textContent, label: button.getAttribute('aria-label') };
-      return JSON.stringify({ english, unknown, korean, notice });
+      return JSON.stringify({ english, unknown, korean, notice, dynamic });
     })()
   `));
   check('UI language switches to English and back to Korean',
@@ -697,6 +750,8 @@ async function run() {
       && i18nResult.unknown.text === '번역 목록에 없는 문장'
       && i18nResult.unknown.title === '번역 목록에 없는 속성'
       && i18nResult.notice === 'Could not recover 2 previous recording(s). Originals were preserved in D:\\safe-temp.'
+      && i18nResult.dynamic.screenshot === 'Screenshot saved: capture.png (1920x1080)'
+      && i18nResult.dynamic.deletion === 'capture.mp4\n\nMove this file to the Recycle Bin?'
       && i18nResult.korean.text === '스크린샷'
       && i18nResult.korean.label === '닫기');
 
@@ -1522,6 +1577,48 @@ async function run() {
   junctionLikeManager.metadata.set('C:\\RP4-recordings-link\\managed.mp4', { durationMs: 1 });
   check('metadata resolves a real junction target to its configured recording path',
     junctionLikeManager.metadata.get('D:\\real-recordings\\managed.mp4')?.durationMs === 1);
+  check('junction aliases share one background-work key',
+    recordingWorkKey('C:\\RP4-recordings-link\\managed.mp4')
+      === recordingWorkKey('D:\\real-recordings\\managed.mp4'));
+
+  const junctionJobManager = new RecordingManager({
+    settings: {
+      recordingsDir: 'C:\\RP4-recordings-link',
+      value: { optimizeMp4: false }
+    },
+    emit: () => {}
+  });
+  const originalJunctionValidate = ffmpeg.validateMedia;
+  const originalJunctionCancel = ffmpeg.cancel;
+  let junctionJobId = null;
+  let rejectJunctionValidation = null;
+  ffmpeg.validateMedia = (_filePath, options = {}) => new Promise((_resolve, reject) => {
+    junctionJobId = options.jobId;
+    rejectJunctionValidation = reject;
+  });
+  ffmpeg.cancel = async (jobId) => {
+    if (jobId !== junctionJobId || !rejectJunctionValidation) return false;
+    const error = new Error('cancelled through junction alias');
+    error.code = 'CANCELLED';
+    rejectJunctionValidation(error);
+    return true;
+  };
+  const junctionVerification = junctionJobManager.enqueueVerification(
+    'C:\\RP4-recordings-link\\managed.mp4',
+    1
+  );
+  const junctionJobDeadline = Date.now() + 1000;
+  while (!junctionJobId && Date.now() < junctionJobDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const junctionCancelled = await junctionJobManager.cancelVerification(
+    'D:\\real-recordings\\managed.mp4'
+  );
+  await junctionVerification;
+  ffmpeg.validateMedia = originalJunctionValidate;
+  ffmpeg.cancel = originalJunctionCancel;
+  check('deleting through a junction alias cancels the matching verification job',
+    Boolean(junctionJobId) && junctionCancelled && junctionJobManager.verificationJobs.size === 0);
 
   const { resolveRecordingMediaFile } = require('../src/main/ipc');
   check('owned top-level media file passes IPC validation',
