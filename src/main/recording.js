@@ -828,6 +828,7 @@ class RecordingManager {
 
     return {
       sessionId,
+      maxQueuedBytes: this.maxSessionQueuedBytes,
       // The recording streams straight into its final container when the codec already
       // matches the target, which is what makes stopping instant.
       directToTarget: recordedContainer === targetFormat,

@@ -166,6 +166,9 @@ async function run() {
   check('recordings dir is the configured one', settings.recordingsDir === RECORDINGS);
   check('temp + screenshot dirs created',
     fs.existsSync(settings.tempDir) && fs.existsSync(settings.screenshotsDir));
+  check('legacy recordings require both the old settings and recordings paths',
+    await paths.hasLegacyInstall(async (target) => target === paths.LEGACY_RECORDINGS_DIR) === false
+      && await paths.hasLegacyInstall(async () => true) === true);
 
   const outsideRaw = path.join(SANDBOX, 'outside-lossless.raw');
   const linkedRaw = path.join(settings.tempDir, 'linked-lossless.raw');
@@ -206,6 +209,21 @@ async function run() {
   await settings.update({ language: 'en' });
   check('English language preference persists', settings.value.language === 'en');
   await settings.update({ language: 'ko' });
+  const { normalizeOptionsPatch } = require('../src/main/ipc');
+  const boundedOptions = normalizeOptionsPatch({
+    screenshotFormat: 'not-an-image',
+    screenshotQuality: 87,
+    clipBufferLimitMb: 9999
+  });
+  check('settings IPC normalizes screenshot and clip limits at the boundary',
+    boundedOptions.screenshotFormat === 'png'
+      && boundedOptions.screenshotQuality === 90
+      && boundedOptions.clipBufferLimitMb === 512);
+  check('settings IPC ignores non-finite numeric values',
+    !Object.hasOwn(normalizeOptionsPatch({
+      screenshotQuality: 'not-a-number', clipBufferLimitMb: Infinity
+    }), 'screenshotQuality')
+      && !Object.hasOwn(normalizeOptionsPatch({ clipBufferLimitMb: Infinity }), 'clipBufferLimitMb'));
   await settings.update({ gameFpsOverlay: false, gameFpsIntervalMs: 1000 });
   check('game capture settings persist',
     settings.value.gameFpsOverlay === false && settings.value.gameFpsIntervalMs === 1000);
@@ -646,6 +664,10 @@ async function run() {
     `${bgraCopy.bytes} bytes`);
 
   const preloadSource = await fsp.readFile(path.join(__dirname, '..', 'src', 'preload.js'), 'utf8');
+  const ipcSource = await fsp.readFile(path.join(__dirname, '..', 'src', 'main', 'ipc.js'), 'utf8');
+  const rendererAppSourceForScreenshot = await fsp.readFile(
+    path.join(__dirname, '..', 'src', 'renderer', 'app.js'), 'utf8'
+  );
   const recorderSource = await fsp.readFile(
     path.join(__dirname, '..', 'src', 'renderer', 'recorder.js'),
     'utf8'
@@ -655,6 +677,12 @@ async function run() {
       && recorderSource.includes("type: 'rp4:lossless-writer-port'")
       && recorderSource.includes("writer.port.postMessage(['write'")
       && !preloadSource.includes("invokeWithBoundedBuffer('lossless:write-frame'"));
+  check('legacy lossless buffer IPC handlers are no longer registered',
+    !ipcSource.includes("handleMain('lossless:write-frame'")
+      && !ipcSource.includes("handleMain('lossless:write-audio'"));
+  check('screenshot encoding uses one quality policy and exposes the WebP limit',
+    ipcSource.includes('normalizeScreenshotQuality(payload.quality)')
+      && rendererAppSourceForScreenshot.includes('최대 4096×2160 영역까지'));
   check('renderer lossless frame queue is explicitly bounded',
     /LOSSLESS_FRAME_QUEUE_SIZE\s*=\s*3/.test(recorderSource)
       && recorderSource.includes('losslessDroppedFrames'));
@@ -731,6 +759,9 @@ async function run() {
   const session = await recordings.start(meta, { webContentsId: win.webContents.id });
   check('recording writes straight to the target container', session.directToTarget === true,
     `container=${session.recordedContainer} codec=${session.recordedCodec}`);
+  check('renderer receives the authoritative main-process write queue limit',
+    session.maxQueuedBytes === recordings.maxSessionQueuedBytes
+      && recorderSource.includes('session.maxQueuedBytes'));
 
   let written = 0;
   for (const buffer of recorded.buffers) {

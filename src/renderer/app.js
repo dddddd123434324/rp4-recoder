@@ -668,11 +668,14 @@
   }
 
   function updateScreenshotQualityUi() {
-    const lossless = els.screenshotFormatSelect.value === 'png';
+    const format = els.screenshotFormatSelect.value;
+    const lossless = format === 'png';
     els.screenshotQualitySelect.disabled = lossless;
     els.screenshotQualityNote.textContent = lossless
       ? 'PNG는 원본 해상도를 무손실로 저장하므로 품질이 최고로 고정됩니다.'
-      : 'JPG와 WebP는 선택한 품질이 높을수록 파일 용량도 커집니다.';
+      : format === 'webp'
+        ? 'WebP는 원본 화질을 낮추지 않으며 최대 4096×2160 영역까지 저장할 수 있습니다.'
+        : 'JPG는 선택한 품질이 높을수록 파일 용량도 커집니다.';
   }
 
   async function saveScreenshotSettings() {

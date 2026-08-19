@@ -196,6 +196,10 @@ async function migrateLegacySettings() {
   }
 }
 
+async function hasLegacyInstall(exists = pathExists) {
+  return await exists(LEGACY_CONFIG_FILE) && await exists(LEGACY_RECORDINGS_DIR);
+}
+
 /**
  * Picks the recordings directory to actually use: the configured one when writable,
  * otherwise the legacy folder if it still exists, otherwise an OS-appropriate default,
@@ -212,7 +216,9 @@ async function resolveRecordingsDir(configuredDir) {
   if (requestedResolved) {
     candidates.push(requestedResolved);
   }
-  if (await pathExists(LEGACY_RECORDINGS_DIR)) {
+  // A recordings folder alone is not proof of an RP4 installation. Requiring the
+  // legacy settings file prevents a fresh install from adopting an unrelated D:\RP4.
+  if (await hasLegacyInstall()) {
     candidates.push(LEGACY_RECORDINGS_DIR);
   }
   candidates.push(defaultRecordingsDir());
@@ -272,6 +278,7 @@ module.exports = {
   isDirectoryWritable,
   ensureOwnedTempDir,
   ensureSafeChildDirectory,
+  hasLegacyInstall,
   isPlausibleRecordingsDir,
   normalizeRecordingsDir,
   isInside,

@@ -6,6 +6,8 @@
     '생성한 프리셋이 없습니다.\n설정에서 프리셋을 만들어 주세요.': 'No custom presets.\nCreate one in Settings.',
     '저장 후 백그라운드에서 파일 구조를 정리합니다. 녹화 저장을 지연시키지 않습니다.': 'Optimizes the file structure in the background after saving.',
     'PNG는 원본 해상도를 무손실로 저장하므로 품질이 최고로 고정됩니다.': 'PNG is saved losslessly at the original resolution.',
+    'WebP는 원본 화질을 낮추지 않으며 최대 4096×2160 영역까지 저장할 수 있습니다.': 'WebP preserves the original resolution and supports areas up to 4096×2160.',
+    'JPG는 선택한 품질이 높을수록 파일 용량도 커집니다.': 'Higher JPG quality produces a larger file.',
     '스크린샷 설정은 녹화 해상도와 녹화 프리셋에 영향을 받지 않습니다.': 'Screenshot settings are independent of recording presets.',
     '최소화되었거나 숨겨진 창을 복원하고 있습니다.': 'Restoring the minimized or hidden window.',
     '이 창을 복원하거나 캡처할 수 없습니다.': 'This window cannot be restored or captured.',

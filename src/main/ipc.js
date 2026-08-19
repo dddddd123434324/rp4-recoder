@@ -24,7 +24,31 @@ const { parseWindowHandle } = require('./window-crop');
 const MEDIA_FILE_PATTERN = /\.(mp4|webm|mkv|avi)$/i;
 const MAX_SCREENSHOT_BYTES = 256 * 1024 * 1024;
 const MAX_SCREENSHOT_PIXELS = 7680 * 4320;
-const MAX_WEBP_RENDERER_PIXELS = 4096 * 2160;
+const MAX_RENDERER_SCREENSHOT_PIXELS = 4096 * 2160;
+
+function normalizeOptionsPatch(options = {}) {
+  const patch = {};
+  if (options.language === 'ko' || options.language === 'en') patch.language = options.language;
+  if (typeof options.optimizeMp4 === 'boolean') patch.optimizeMp4 = options.optimizeMp4;
+  if (typeof options.gameFpsOverlay === 'boolean') patch.gameFpsOverlay = options.gameFpsOverlay;
+  if (settingsModule.GAME_FPS_INTERVALS.includes(Number(options.gameFpsIntervalMs))) {
+    patch.gameFpsIntervalMs = Number(options.gameFpsIntervalMs);
+  }
+  if (typeof options.screenshotFormat === 'string') {
+    patch.screenshotFormat = settingsModule.normalizeScreenshotFormat(options.screenshotFormat);
+  }
+  if (Number.isFinite(Number(options.screenshotQuality))) {
+    patch.screenshotQuality = settingsModule.normalizeScreenshotQuality(options.screenshotQuality);
+  }
+  if (Number.isFinite(Number(options.clipBufferLimitMb))) {
+    patch.clipBufferLimitMb = settingsModule.clampNumber(
+      Number(options.clipBufferLimitMb),
+      settingsModule.MIN_CLIP_BUFFER_LIMIT_MB,
+      settingsModule.MAX_CLIP_BUFFER_LIMIT_MB
+    );
+  }
+  return patch;
+}
 
 function clampCropRect(rect, width, height) {
   const x = Math.max(0, Math.min(width - 1, Math.round(Number(rect.x) || 0)));
@@ -436,7 +460,7 @@ function registerIpcHandlers(context) {
 
   handleMain('screenshot:capture-source', async (_event, payload = {}) => {
     const captured = await captureScreenshotImage(payload.sourceId, payload);
-    if (captured.width * captured.height > MAX_WEBP_RENDERER_PIXELS) {
+    if (captured.width * captured.height > MAX_RENDERER_SCREENSHOT_PIXELS) {
       throw new Error('WebP 스크린샷의 원본 영역이 안전한 처리 한도를 초과했습니다. 화질을 낮추지 않고 저장을 중단합니다.');
     }
     const buffer = captured.image.toPNG();
@@ -457,7 +481,7 @@ function registerIpcHandlers(context) {
     }
     const format = payload.format === 'jpeg' ? 'jpeg' : 'png';
     const captured = await captureScreenshotImage(payload.sourceId, payload);
-    const quality = Math.max(10, Math.min(100, Math.round(Number(payload.quality) || 100)));
+    const quality = settingsModule.normalizeScreenshotQuality(payload.quality);
     // PNG is lossless and never resized. JPEG is encoded once at the explicitly selected quality.
     const buffer = format === 'jpeg'
       ? captured.image.toJPEG(quality)
@@ -506,14 +530,6 @@ function registerIpcHandlers(context) {
       return { ok: false, error: serializeError(error, 'LOSSLESS_START_FAILED') };
     }
   });
-
-  handleMain('lossless:write-frame', async (event, payload = {}) => (
-    recordings.writeLosslessFrame(payload, { webContentsId: event.sender.id })
-  ));
-
-  handleMain('lossless:write-audio', async (event, payload = {}) => (
-    recordings.writeLosslessAudio(payload, { webContentsId: event.sender.id })
-  ));
 
   handleMain('lossless:stop', async (event, payload = {}) => (
     recordings.stopLossless(payload, { webContentsId: event.sender.id })
@@ -652,25 +668,7 @@ function registerIpcHandlers(context) {
   });
 
   handleMain('settings:options', async (_event, options = {}) => {
-    const patch = {};
-    if (options.language === 'ko' || options.language === 'en') patch.language = options.language;
-    if (typeof options.optimizeMp4 === 'boolean') patch.optimizeMp4 = options.optimizeMp4;
-    if (typeof options.gameFpsOverlay === 'boolean') {
-      patch.gameFpsOverlay = options.gameFpsOverlay;
-    }
-    if (settingsModule.GAME_FPS_INTERVALS.includes(Number(options.gameFpsIntervalMs))) {
-      patch.gameFpsIntervalMs = Number(options.gameFpsIntervalMs);
-    }
-    if (typeof options.screenshotFormat === 'string') {
-      patch.screenshotFormat = options.screenshotFormat;
-    }
-    if (Number.isFinite(Number(options.screenshotQuality))) {
-      patch.screenshotQuality = Number(options.screenshotQuality);
-    }
-    if (Number.isFinite(Number(options.clipBufferLimitMb))) {
-      patch.clipBufferLimitMb = Number(options.clipBufferLimitMb);
-    }
-    await settings.update(patch);
+    await settings.update(normalizeOptionsPatch(options));
     return settingsDto();
   });
 
@@ -751,6 +749,7 @@ function registerIpcHandlers(context) {
 
 module.exports = {
   registerIpcHandlers,
+  normalizeOptionsPatch,
   resolveRecordingMediaFile,
   isTopLevelWindowSender,
   isTrustedFileSender

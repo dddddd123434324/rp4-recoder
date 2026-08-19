@@ -55,10 +55,11 @@ if (!app.requestSingleInstanceLock()) {
 function finishSmoke(code, message) {
   if (smokeFinished) return;
   smokeFinished = true;
-  if (message) {
-    process.stdout.write(`${message}\n`);
+  if (!message) {
+    app.exit(code);
+    return;
   }
-  app.exit(code);
+  process.stdout.write(`${message}\n`, () => app.exit(code));
 }
 
 /**

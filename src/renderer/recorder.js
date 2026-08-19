@@ -7,7 +7,7 @@
   const { state, els, util } = RP4;
 
   const CHUNK_INTERVAL_MS = 2000;
-  const MAX_QUEUED_BYTES = 256 * 1024 * 1024;
+  const FALLBACK_MAX_QUEUED_BYTES = 128 * 1024 * 1024;
   const MAX_LOSSLESS_FRAME_BYTES = 64 * 1024 * 1024;
   const LOSSLESS_FRAME_QUEUE_SIZE = 3;
 
@@ -588,6 +588,7 @@
         profile,
         sourceSnapshot,
         actualMimeType,
+        maxQueuedBytes: Math.max(1, Number(session.maxQueuedBytes) || FALLBACK_MAX_QUEUED_BYTES),
         writeQueue: Promise.resolve(),
         queuedBytes: 0,
         failure: null,
@@ -713,8 +714,9 @@
 
   function enqueueChunk(context, blob, { terminal = false } = {}) {
     if (!context || context.finalized) return;
-    if (!context.failure && context.queuedBytes + blob.size > MAX_QUEUED_BYTES) {
-      failRecording(context, new Error('디스크 쓰기 대기열이 256MB를 초과했습니다.'));
+    if (!context.failure && context.queuedBytes + blob.size > context.maxQueuedBytes) {
+      const limitMb = Math.round(context.maxQueuedBytes / 1024 / 1024);
+      failRecording(context, new Error(`디스크 쓰기 대기열이 ${limitMb}MB를 초과했습니다.`));
       terminal = true;
     }
 
