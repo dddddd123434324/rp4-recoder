@@ -237,6 +237,9 @@
       });
     });
     try {
+      // Electron 41 delivers a detached zero-byte payload to the main process when this
+      // renderer-owned buffer is placed in the transfer list. Keep the bounded
+      // three-buffer structured-clone path: adding `[buffer]` here corrupts recordings.
       writer.port.postMessage(['write', id, kind, timestampUs, buffer]);
     } catch (error) {
       writer.pending.delete(id);

@@ -150,6 +150,7 @@ async function run() {
     toBoundedBuffer,
     normalizeRecordingMeta,
     replaceFileSafely,
+    openOwnedRegularFile,
     MAX_INDEX_BYTES
   } = require('../src/main/recording');
 
@@ -165,6 +166,29 @@ async function run() {
   check('recordings dir is the configured one', settings.recordingsDir === RECORDINGS);
   check('temp + screenshot dirs created',
     fs.existsSync(settings.tempDir) && fs.existsSync(settings.screenshotsDir));
+
+  const outsideRaw = path.join(SANDBOX, 'outside-lossless.raw');
+  const linkedRaw = path.join(settings.tempDir, 'linked-lossless.raw');
+  await fsp.writeFile(outsideRaw, Buffer.alloc(32, 7));
+  let symlinkCheckSupported = true;
+  try {
+    await fsp.symlink(outsideRaw, linkedRaw, 'file');
+  } catch (error) {
+    if (error?.code === 'EPERM' || error?.code === 'EACCES') symlinkCheckSupported = false;
+    else throw error;
+  }
+  let linkedRawRejected = false;
+  if (symlinkCheckSupported) {
+    try {
+      await openOwnedRegularFile(settings.tempDir, linkedRaw, 'r+');
+    } catch {
+      linkedRawRejected = true;
+    }
+  }
+  check('lossless recovery refuses symbolic-link input files',
+    !symlinkCheckSupported || linkedRawRejected);
+  check('symbolic-link check leaves the external file untouched',
+    (await fsp.stat(outsideRaw)).size === 32);
 
   // A settings file from an older version has no saved profile. Defaults must not be
   // substituted there, or the user's chosen preset would be overridden on first launch.
@@ -315,6 +339,101 @@ async function run() {
   const oversizedIndex = await recordings.loadIndex();
   check('oversized recording index is backed up without parsing',
     oversizedIndex.recovered && Boolean(oversizedIndex.backupPath));
+
+  const verificationEvents = [];
+  const verificationManager = new RecordingManager({
+    settings,
+    emit: (channel, payload) => verificationEvents.push({ channel, payload })
+  });
+  const originalValidateMedia = ffmpeg.validateMedia;
+  const originalCancelFfmpeg = ffmpeg.cancel;
+  let activeVerifications = 0;
+  let maxActiveVerifications = 0;
+  const verificationCalls = [];
+  ffmpeg.validateMedia = (filePath, options) => new Promise((resolve, reject) => {
+    activeVerifications += 1;
+    maxActiveVerifications = Math.max(maxActiveVerifications, activeVerifications);
+    verificationCalls.push({
+      filePath,
+      options,
+      resolve: (value) => { activeVerifications -= 1; resolve(value); },
+      reject: (error) => { activeVerifications -= 1; reject(error); }
+    });
+  });
+  const verifyA = path.join(RECORDINGS, 'verify-a.mp4');
+  const verifyB = path.join(RECORDINGS, 'verify-b.mp4');
+  verificationManager.metadata.set(verifyA, { status: 'verifying', durationMs: 4321 });
+  verificationManager.metadata.set(verifyB, { status: 'verifying', durationMs: 8765 });
+  const verifyPromiseA = verificationManager.enqueueVerification(verifyA, 4321);
+  const verifyPromiseB = verificationManager.enqueueVerification(verifyB, 8765);
+  await new Promise((resolve) => setImmediate(resolve));
+  check('media validation queue limits decoding concurrency to one',
+    verificationCalls.length === 1 && maxActiveVerifications === 1);
+  check('media validation receives expected duration and a cancellable job id',
+    verificationCalls[0]?.options?.expectedDurationMs === 4321
+      && /^verify:/.test(verificationCalls[0]?.options?.jobId || ''));
+  verificationCalls[0].resolve({});
+  await verifyPromiseA;
+  await new Promise((resolve) => setImmediate(resolve));
+  check('queued media validation starts after the previous decode',
+    verificationCalls.length === 2 && maxActiveVerifications === 1);
+  verificationCalls[1].resolve({});
+  await verifyPromiseB;
+
+  const cancelPath = path.join(RECORDINGS, 'verify-cancelled.mp4');
+  verificationManager.metadata.set(cancelPath, { status: 'verifying', durationMs: 3000 });
+  const cancelPromise = verificationManager.enqueueVerification(cancelPath, 3000);
+  await new Promise((resolve) => setImmediate(resolve));
+  const closeWithVerificationStartedAt = Date.now();
+  await verificationManager.closeAllSessions();
+  check('session handle shutdown does not wait for a full background decode',
+    Date.now() - closeWithVerificationStartedAt < 100);
+  ffmpeg.cancel = async (jobId) => {
+    const call = verificationCalls.find((entry) => entry.options?.jobId === jobId);
+    const error = new Error('cancelled for shutdown');
+    error.code = 'CANCELLED';
+    call?.reject(error);
+    return Boolean(call);
+  };
+  await verificationManager.cancelAndDrainVerifications({ timeoutMs: 250 });
+  await cancelPromise;
+  check('shutdown cancellation preserves verification state for next startup',
+    verificationManager.metadata.get(cancelPath)?.status === 'verifying'
+      && verificationEvents.some((entry) => entry.payload?.state === 'cancelled')
+      && !verificationEvents.some((entry) => (
+        entry.payload?.filePath === cancelPath && entry.payload?.state === 'failed'
+      )));
+  ffmpeg.validateMedia = originalValidateMedia;
+  ffmpeg.cancel = originalCancelFfmpeg;
+
+  const optimizeWakeupManager = new RecordingManager({ settings, emit: () => {} });
+  let optimizeDrains = 0;
+  optimizeWakeupManager.drainOptimizeQueue = async () => {
+    optimizeDrains += 1;
+    optimizeWakeupManager.optimizeQueue.shift();
+    if (optimizeDrains === 1) {
+      queueMicrotask(() => optimizeWakeupManager.optimizeQueue.push({
+        filePath: path.join(RECORDINGS, 'late-optimize.mp4'), durationMs: 1
+      }));
+    }
+  };
+  optimizeWakeupManager.enqueueOptimize(path.join(RECORDINGS, 'first-optimize.mp4'), 1);
+  const optimizeWakeupDeadline = Date.now() + 1000;
+  while (optimizeDrains < 2 && Date.now() < optimizeWakeupDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  check('optimization drain restarts when work arrives during completion',
+    optimizeDrains === 2 && optimizeWakeupManager.optimizeQueue.length === 0);
+
+  const rendererCoreSource = await fsp.readFile(
+    path.join(__dirname, '..', 'src', 'renderer', 'core.js'), 'utf8'
+  );
+  const rendererAppSource = await fsp.readFile(
+    path.join(__dirname, '..', 'src', 'renderer', 'app.js'), 'utf8'
+  );
+  check('failed shutdown restores the renderer capture lifecycle',
+    /abortCaptureShutdown[\s\S]*captureLifecycle = 'idle'/.test(rendererCoreSource)
+      && /RP4\.lifecycle\.abortShutdown\(\)/.test(rendererAppSource));
 
   // A stale crop host must never satisfy or clear a request belonging to its successor.
   const { WindowCropService } = require('../src/main/window-crop');
@@ -1051,6 +1170,37 @@ async function run() {
   check('ordinary backup-like recording name is preserved', fs.existsSync(userBackupName));
   check('only UUID-suffixed optimization backup is restored',
     reconciliation.restored === 1 && fs.existsSync(restoredTarget) && !fs.existsSync(trueBackup));
+
+  const rollbackOriginal = path.join(RECORDINGS, 'rollback-restored.mp4');
+  const rollbackArtifact = `${rollbackOriginal}.backup-${crypto.randomUUID()}`;
+  const corruptOriginalBytes = Buffer.alloc(1024, 0x5a);
+  await fsp.writeFile(rollbackOriginal, corruptOriginalBytes);
+  await fsp.copyFile(saved.filePath, rollbackArtifact);
+  const rollbackManager = new RecordingManager({
+    settings,
+    emit: () => {},
+    move: async (from, to) => {
+      if (from === rollbackArtifact && to === rollbackOriginal) {
+        const error = new Error('simulated second move failure');
+        error.code = 'EACCES';
+        throw error;
+      }
+      await fsp.rename(from, to);
+    }
+  });
+  const rollbackReconciliation = await rollbackManager.reconcileRecordingsDir();
+  check('recovery replacement rolls the original name back after second move failure',
+    rollbackReconciliation.failed.some((entry) => entry.filePath === rollbackArtifact)
+      && fs.existsSync(rollbackOriginal)
+      && fs.existsSync(rollbackArtifact)
+      && (await fsp.readFile(rollbackOriginal)).equals(corruptOriginalBytes));
+  check('failed recovery replacement leaves no hidden corrupt-name orphan',
+    !(await fsp.readdir(RECORDINGS)).some((name) => (
+      name.startsWith('rollback-restored.mp4.corrupt-')
+    )));
+  await fsp.rm(rollbackOriginal, { force: true });
+  await fsp.rm(rollbackArtifact, { force: true });
+
   const ordinaryOptimizingName = path.join(RECORDINGS, 'user-video.mp4.optimizing.mp4');
   await fsp.copyFile(saved.filePath, ordinaryOptimizingName);
   const reconciliation2 = await recordings.reconcileRecordingsDir();

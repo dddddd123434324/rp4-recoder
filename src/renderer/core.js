@@ -211,6 +211,12 @@ window.RP4 = window.RP4 || {};
     state.captureLifecycle = 'shutting-down';
   }
 
+  function abortCaptureShutdown() {
+    state.shuttingDown = false;
+    state.captureOperationId += 1;
+    state.captureLifecycle = 'idle';
+  }
+
   const IPC_SLICE_BYTES = 8 * 1024 * 1024;
 
   function reportShutdownProgress(progress = {}) {
@@ -263,7 +269,8 @@ window.RP4 = window.RP4 || {};
     transition: transitionCapture,
     finish: finishCapture,
     isBusy: captureBusy,
-    prepareShutdown: prepareCaptureShutdown
+    prepareShutdown: prepareCaptureShutdown,
+    abortShutdown: abortCaptureShutdown
   };
   RP4.ui = { showToast, setStatus };
 }(window.RP4));

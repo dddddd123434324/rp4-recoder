@@ -124,10 +124,11 @@ async function shutdown({
       }
     }
     await cleanup('session handles', () => recordings.closeAllSessions());
+    await cleanup('verifications', () => recordings.cancelAndDrainVerifications());
     await cleanup('optimizations', () => recordings.cancelAndDrainOptimizations());
   }
   // Also covers an FFmpeg job that was started outside RecordingManager.
-  await cleanup('ffmpeg', () => ffmpeg.cancelAll());
+  await cleanup('ffmpeg', () => ffmpeg.cancelAll({ timeoutMs: 5000 }));
   await cleanup('window crop', () => windowCrop.dispose());
 
   if (mainWindow && !mainWindow.isDestroyed()) {

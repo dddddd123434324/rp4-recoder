@@ -22,6 +22,8 @@ const MAX_SESSION_QUEUED_BYTES = 128 * 1024 * 1024;
 const MAX_SCREENSHOT_BYTES = 256 * 1024 * 1024;
 const MIN_LOSSLESS_FREE_BYTES_TO_START = 2 * 1024 * 1024 * 1024;
 const MAX_LOSSLESS_FRAME_BYTES = 64 * 1024 * 1024;
+const VERIFICATION_CONCURRENCY = 1;
+const VERIFICATION_SHUTDOWN_TIMEOUT_MS = 5000;
 const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 const OPTIMIZING_FILE_PATTERN = new RegExp(
   `^(.*\\.mp4)\\.optimizing-(${UUID_PATTERN})\\.mp4$`,
@@ -221,6 +223,44 @@ async function moveFile(from, to) {
   }
 }
 
+/** Opens only a direct regular-file child of an app-owned directory. */
+async function openOwnedRegularFile(ownedDir, filePath, flags, { optional = false } = {}) {
+  const item = await fs.lstat(filePath).catch((error) => {
+    if (optional && error?.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (!item) return null;
+  if (!item.isFile() || item.isSymbolicLink()) {
+    throw new Error('임시 녹화 파일이 안전한 일반 파일이 아닙니다.');
+  }
+
+  const [realDir, realFile] = await Promise.all([
+    fs.realpath(ownedDir),
+    fs.realpath(filePath)
+  ]);
+  if (path.dirname(realFile).toLowerCase() !== realDir.toLowerCase()
+    || path.basename(realFile).toLowerCase() !== path.basename(filePath).toLowerCase()) {
+    throw new Error('임시 녹화 파일이 앱 소유 폴더를 벗어났습니다.');
+  }
+
+  const handle = await fs.open(realFile, flags);
+  try {
+    const stats = await handle.stat();
+    const current = await fs.lstat(filePath);
+    if (!stats.isFile() || !current.isFile() || current.isSymbolicLink()
+      || (item.dev && current.dev && item.dev !== current.dev)
+      || (item.ino && current.ino && item.ino !== current.ino)
+      || (stats.dev && current.dev && stats.dev !== current.dev)
+      || (stats.ino && current.ino && stats.ino !== current.ino)) {
+      throw new Error('임시 녹화 파일이 검사 중 변경되었습니다.');
+    }
+    return { handle, stats, filePath: realFile };
+  } catch (error) {
+    await handle.close().catch(() => {});
+    throw error;
+  }
+}
+
 /**
  * Replaces a saved recording without ever deleting the only good copy first.
  * The backup path is included on failures so recovery remains possible even when a
@@ -351,7 +391,10 @@ class RecordingManager {
     this.thumbnailQueue = Promise.resolve();
     this.thumbnailInflight = new Map();
     this.screenshotJobs = new Set();
+    this.verificationQueue = [];
     this.verificationJobs = new Map();
+    this.verificationRunning = new Map();
+    this.verificationCancelled = false;
     this.startingWebContentsIds = new Set();
     this.moveFile = move;
     this.maxSessionQueuedBytes = Math.max(1, Number(maxSessionQueuedBytes) || MAX_SESSION_QUEUED_BYTES);
@@ -618,11 +661,17 @@ class RecordingManager {
       const rawPath = path.join(tempDir, `rp4-${match[1]}.lossless.raw`);
       const audioPath = path.join(tempDir, `rp4-${match[1]}.lossless.pcm`);
       try {
-        const manifestStats = await statFile(manifestPath);
-        if (!manifestStats || manifestStats.size > 64 * 1024) {
-          throw new Error('무압축 복구 정보 크기가 올바르지 않습니다.');
+        const manifestFile = await openOwnedRegularFile(tempDir, manifestPath, 'r');
+        let manifestText;
+        try {
+          if (manifestFile.stats.size > 64 * 1024) {
+            throw new Error('무압축 복구 정보 크기가 올바르지 않습니다.');
+          }
+          manifestText = await manifestFile.handle.readFile('utf8');
+        } finally {
+          await manifestFile.handle.close().catch(() => {});
         }
-        const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+        const manifest = JSON.parse(manifestText);
         const width = boundedNumber(manifest.width, 2, 7680, { integer: true });
         const height = boundedNumber(manifest.height, 2, 4320, { integer: true });
         const fps = boundedNumber(manifest.fps, 1, 240) || 60;
@@ -631,13 +680,26 @@ class RecordingManager {
         }) || 48000;
         const audioChannels = boundedNumber(manifest.audioChannels, 1, 8, { integer: true }) || 2;
         const frameBytes = Number(width) * Number(height) * 4;
-        const rawStats = await statFile(rawPath);
-        const frameCount = Math.floor(Number(rawStats?.size || 0) / frameBytes);
-        if (!width || !height || width % 2 || height % 2
-          || frameBytes <= 0 || frameBytes > MAX_LOSSLESS_FRAME_BYTES || frameCount < 1) {
-          throw new Error('복구할 수 있는 완전한 무압축 프레임이 없습니다.');
-        }
-        await fs.truncate(rawPath, frameCount * frameBytes);
+        const { frameCount, audioBytes } = await (async () => {
+          let rawFile = null;
+          let audioFile = null;
+          try {
+            rawFile = await openOwnedRegularFile(tempDir, rawPath, 'r+');
+            audioFile = await openOwnedRegularFile(tempDir, audioPath, 'r', { optional: true });
+            const completeFrames = Math.floor(Number(rawFile.stats.size || 0) / frameBytes);
+            if (!width || !height || width % 2 || height % 2
+              || frameBytes <= 0 || frameBytes > MAX_LOSSLESS_FRAME_BYTES
+              || completeFrames < 1) {
+              throw new Error('복구할 수 있는 완전한 무압축 프레임이 없습니다.');
+            }
+            // Truncate the already-validated descriptor, not a path that could be swapped.
+            await rawFile.handle.truncate(completeFrames * frameBytes);
+            return { frameCount: completeFrames, audioBytes: audioFile?.stats.size || 0 };
+          } finally {
+            await rawFile?.handle.close().catch(() => {});
+            await audioFile?.handle.close().catch(() => {});
+          }
+        })();
         const recoverySession = {
           sessionId: match[1],
           recordingsDir: this.settings.recordingsDir,
@@ -656,7 +718,7 @@ class RecordingManager {
           firstFrameTimestampUs: null,
           lastFrameTimestampUs: null,
           rawBytes: frameCount * frameBytes,
-          audioBytes: (await statFile(audioPath))?.size || 0,
+          audioBytes,
           rawWriteChain: Promise.resolve(),
           audioWriteChain: Promise.resolve(),
           handlesClosed: true,
@@ -1652,8 +1714,20 @@ class RecordingManager {
           if (originalExists) {
             const corrupt = `${original}.corrupt-${crypto.randomUUID()}`;
             await this.moveFile(original, corrupt);
+            try {
+              await this.moveFile(fullPath, original);
+            } catch (error) {
+              try {
+                await this.moveFile(corrupt, original);
+              } catch (restoreError) {
+                error.restoreError = restoreError;
+                error.backupPath = corrupt;
+              }
+              throw error;
+            }
+          } else {
+            await this.moveFile(fullPath, original);
           }
-          await this.moveFile(fullPath, original);
           result.restored += 1;
         } else {
           result.failed.push({ filePath: fullPath, error: '원본과 복구 파일을 모두 검증하지 못해 보존했습니다.' });
@@ -1669,54 +1743,124 @@ class RecordingManager {
   enqueueOptimize(filePath, durationMs) {
     if (this.optimizationCancelled) return;
     this.optimizeQueue.push({ filePath, durationMs });
-    if (!this.optimizeDrainPromise) {
-      this.optimizeDrainPromise = this.drainOptimizeQueue()
-        .finally(() => { this.optimizeDrainPromise = null; });
-    }
+    this.ensureOptimizeDrain();
+  }
+
+  ensureOptimizeDrain() {
+    if (this.optimizationCancelled || this.optimizeDrainPromise) return;
+    this.optimizeDrainPromise = this.drainOptimizeQueue()
+      .finally(() => {
+        this.optimizeDrainPromise = null;
+        if (!this.optimizationCancelled && this.optimizeQueue.length > 0) {
+          this.ensureOptimizeDrain();
+        }
+      });
   }
 
   enqueueVerification(filePath, durationMs, optimizable = false) {
+    if (this.verificationCancelled) return Promise.resolve(false);
     if (this.verificationJobs.has(filePath)) return this.verificationJobs.get(filePath);
-    const job = Promise.resolve().then(async () => {
-      this.emit('recording:verify', { filePath, state: 'start' });
-      try {
-        await ffmpeg.validateMedia(filePath);
-        const meta = this.metadata.get(filePath);
-        if (meta) {
-          await this.setMetadata(filePath, {
-            ...meta,
-            status: 'complete',
-            partial: false,
-            outcome: meta.outcome === 'exact' ? 'exact' : meta.outcome,
-            failureReason: null
-          });
+
+    let resolveJob;
+    const promise = new Promise((resolve) => { resolveJob = resolve; });
+    const job = {
+      filePath,
+      durationMs,
+      optimizable,
+      jobId: `verify:${crypto.randomUUID()}`,
+      promise,
+      resolve: resolveJob
+    };
+    this.verificationJobs.set(filePath, promise);
+    this.verificationQueue.push(job);
+    this.ensureVerificationDrain();
+    return promise;
+  }
+
+  ensureVerificationDrain() {
+    if (this.verificationCancelled) return;
+    while (this.verificationRunning.size < VERIFICATION_CONCURRENCY
+      && this.verificationQueue.length > 0) {
+      const job = this.verificationQueue.shift();
+      this.verificationRunning.set(job.filePath, job);
+      void this.runVerification(job).then(job.resolve, () => job.resolve(false)).finally(() => {
+        this.verificationRunning.delete(job.filePath);
+        if (this.verificationJobs.get(job.filePath) === job.promise) {
+          this.verificationJobs.delete(job.filePath);
         }
-        this.emit('recording:verify', { filePath, state: 'done' });
-        if (optimizable && this.settings.value.optimizeMp4) {
-          this.enqueueOptimize(filePath, durationMs);
-        }
-        return true;
-      } catch (error) {
-        const meta = this.metadata.get(filePath);
-        if (meta) {
-          await this.setMetadata(filePath, {
-            ...meta,
-            status: 'invalid',
-            partial: true,
-            outcome: 'invalid',
-            failureReason: `저장된 미디어를 검증하지 못했습니다. ${error?.message || error}`.slice(0, 500)
-          });
-        }
-        this.emit('recording:verify', {
-          filePath,
-          state: 'failed',
-          error: error?.message || String(error)
+        this.ensureVerificationDrain();
+      });
+    }
+  }
+
+  async runVerification(job) {
+    const { filePath, durationMs, optimizable } = job;
+    this.emit('recording:verify', { filePath, state: 'start' });
+    try {
+      await ffmpeg.validateMedia(filePath, {
+        expectedDurationMs: durationMs,
+        jobId: job.jobId
+      });
+      const meta = this.metadata.get(filePath);
+      if (meta) {
+        await this.setMetadata(filePath, {
+          ...meta,
+          status: 'complete',
+          partial: false,
+          outcome: meta.outcome === 'exact' ? 'exact' : meta.outcome,
+          failureReason: null
         });
+      }
+      this.emit('recording:verify', { filePath, state: 'done' });
+      if (optimizable && this.settings.value.optimizeMp4) {
+        this.enqueueOptimize(filePath, durationMs);
+      }
+      return true;
+    } catch (error) {
+      if (error?.code === 'CANCELLED') {
+        // Preserve `verifying`; startup will resume an interrupted background decode.
+        this.emit('recording:verify', { filePath, state: 'cancelled' });
         return false;
       }
-    }).finally(() => this.verificationJobs.delete(filePath));
-    this.verificationJobs.set(filePath, job);
-    return job;
+      const meta = this.metadata.get(filePath);
+      if (meta) {
+        await this.setMetadata(filePath, {
+          ...meta,
+          status: 'invalid',
+          partial: true,
+          outcome: 'invalid',
+          failureReason: `저장된 미디어를 검증하지 못했습니다. ${error?.message || error}`.slice(0, 500)
+        });
+      }
+      this.emit('recording:verify', {
+        filePath,
+        state: 'failed',
+        error: error?.message || String(error)
+      });
+      return false;
+    }
+  }
+
+  async cancelAndDrainVerifications({ timeoutMs = VERIFICATION_SHUTDOWN_TIMEOUT_MS } = {}) {
+    this.verificationCancelled = true;
+    for (const job of this.verificationQueue.splice(0)) {
+      if (this.verificationJobs.get(job.filePath) === job.promise) {
+        this.verificationJobs.delete(job.filePath);
+      }
+      job.resolve(false);
+    }
+
+    const running = [...this.verificationRunning.values()];
+    if (running.length === 0) return;
+    let timer;
+    await Promise.race([
+      Promise.allSettled([
+        ...running.map((job) => ffmpeg.cancel(job.jobId, { timeoutMs })),
+        ...running.map((job) => job.promise)
+      ]),
+      new Promise((resolve) => { timer = setTimeout(resolve, Math.max(0, timeoutMs)); })
+    ]);
+    clearTimeout(timer);
   }
 
   /** Restarts direct-save validation that was interrupted by a previous app exit. */
@@ -1797,11 +1941,17 @@ class RecordingManager {
     }
   }
 
-  async cancelAndDrainOptimizations() {
+  async cancelAndDrainOptimizations({ timeoutMs = VERIFICATION_SHUTDOWN_TIMEOUT_MS } = {}) {
     this.optimizationCancelled = true;
     this.optimizeQueue.length = 0;
-    await ffmpeg.cancelAll();
-    await this.optimizeDrainPromise?.catch(() => {});
+    await ffmpeg.cancelAll({ timeoutMs });
+    if (!this.optimizeDrainPromise) return;
+    let timer;
+    await Promise.race([
+      this.optimizeDrainPromise.catch(() => {}),
+      new Promise((resolve) => { timer = setTimeout(resolve, Math.max(0, timeoutMs)); })
+    ]);
+    clearTimeout(timer);
   }
 
   toDto(filePath, stats, meta = {}) {
@@ -2003,7 +2153,6 @@ class RecordingManager {
 
     await Promise.allSettled([...this.finalizing.values()].map((entry) => entry.promise));
     await Promise.allSettled([...this.screenshotJobs]);
-    await Promise.allSettled([...this.verificationJobs.values()]);
     await this.flushIndex().catch((error) => {
       this.emit('app:notice', {
         level: 'warn',
@@ -2060,6 +2209,7 @@ module.exports = {
   uniquePath,
   moveFile,
   replaceFileSafely,
+  openOwnedRegularFile,
   writeUniqueFile,
   writeAtomicScreenshot,
   toBoundedBuffer,

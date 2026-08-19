@@ -1008,9 +1008,10 @@
         window.rp4.reportFinalizeComplete(requestId, { ok: true });
       } catch (error) {
         window.rp4.reportFinalizeFailed(requestId, error?.message || error);
-        state.shuttingDown = false;
+        RP4.lifecycle.abortShutdown();
         document.body.classList.remove('shutdown-pending');
         RP4.app.updateClipUi();
+        if (!state.recording && !state.clip) void RP4.recorder.startPreview();
       } finally {
         window.clearInterval(heartbeat);
         state.shutdownRequestId = null;

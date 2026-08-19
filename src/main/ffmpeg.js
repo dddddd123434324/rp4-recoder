@@ -125,19 +125,28 @@ function run(args, {
   });
 }
 
-function cancel(jobId) {
+function waitForClose(promise, timeoutMs = 0) {
+  if (!(timeoutMs > 0)) return promise;
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); })
+  ]).finally(() => clearTimeout(timer));
+}
+
+function cancel(jobId, { timeoutMs = 0 } = {}) {
   const job = activeJobs.get(jobId);
   if (!job) return Promise.resolve(false);
   job.cancel();
-  return job.closed.then(() => true);
+  return waitForClose(job.closed.then(() => true), timeoutMs);
 }
 
-async function cancelAll() {
+async function cancelAll({ timeoutMs = 0 } = {}) {
   const jobs = [...activeJobs.values()];
   for (const job of jobs) {
     job.cancel();
   }
-  await Promise.allSettled(jobs.map((job) => job.closed));
+  await waitForClose(Promise.allSettled(jobs.map((job) => job.closed)), timeoutMs);
 }
 
 function hasActiveJobs() {
@@ -153,7 +162,8 @@ async function validateMedia(inputPath, {
   expectedFrames = 0,
   requireAudio = false,
   minDurationRatio = 0.95,
-  minFrameRatio = 0.95
+  minFrameRatio = 0.95,
+  jobId
 } = {}) {
   const result = await run([
     '-v', 'error',
@@ -162,7 +172,7 @@ async function validateMedia(inputPath, {
     '-map', requireAudio ? '0:a:0' : '0:a?',
     '-f', 'null',
     '-'
-  ], { captureProgress: true });
+  ], { captureProgress: true, jobId });
 
   const progress = result?.progress || {};
   const frameCount = Number(progress.frame);
