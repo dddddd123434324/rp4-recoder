@@ -1,8 +1,8 @@
 {
   "name": "rp4-recorder",
-  "version": "0.2.20",
+  "version": "0.2.21",
   "productName": "RP4 Recorder",
-  "description": "RP4 desktop game recorder",
+  "description": "RP4 desktop screen recorder",
   "author": "RP4",
   "license": "MIT",
   "main": "src/main.js",

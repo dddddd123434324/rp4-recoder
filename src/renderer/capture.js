@@ -95,7 +95,7 @@
   }) {
     // Crop modes discard part of the frame, so the source is requested at full detail and
     // the requested resolution is applied to the cropped output instead.
-    const highDetail = source?.type === 'window' || mode === 'area' || mode === 'game';
+    const highDetail = source?.type === 'window' || mode === 'area';
     const video = {
       mandatory: {
         chromeMediaSource: 'desktop',
@@ -231,44 +231,7 @@
    * The output size is fixed for the lifetime of the track: changing resolution mid-stream
    * would force the H.264 encoder to re-initialise.
    */
-  function createFpsOverlay(enabled, intervalMs = 500) {
-    let startedAt = performance.now();
-    let frames = 0;
-    let displayedFps = 0;
-
-    return {
-      enabled: Boolean(enabled),
-      draw(context, width, height) {
-        if (!enabled) return;
-        const now = performance.now();
-        frames += 1;
-        const elapsed = now - startedAt;
-        if (elapsed >= intervalMs) {
-          displayedFps = Math.max(0, Math.round(frames * 1000 / elapsed));
-          frames = 0;
-          startedAt = now;
-        }
-
-        const fontSize = Math.max(18, Math.round(height * 0.028));
-        const label = `${displayedFps || '--'} FPS`;
-        context.save();
-        context.font = `900 ${fontSize}px PyeojinGothic, sans-serif`;
-        context.textBaseline = 'top';
-        const paddingX = Math.max(8, Math.round(fontSize * 0.45));
-        const paddingY = Math.max(5, Math.round(fontSize * 0.28));
-        const boxWidth = Math.ceil(context.measureText(label).width + paddingX * 2);
-        const boxHeight = fontSize + paddingY * 2;
-        const offset = Math.max(10, Math.round(height * 0.018));
-        context.fillStyle = 'rgba(0, 0, 0, 0.72)';
-        context.fillRect(offset, offset, boxWidth, boxHeight);
-        context.fillStyle = state.isRecording || state.clip ? '#ff3b13' : '#ffd34d';
-        context.fillText(label, offset + paddingX, offset + paddingY);
-        context.restore();
-      }
-    };
-  }
-
-  function createProcessedTrack(videoTrack, { getCrop, output, fpsOverlay = null }) {
+  function createProcessedTrack(videoTrack, { getCrop, output }) {
     const processor = new window.MediaStreamTrackProcessor({ track: videoTrack });
     const generator = new window.MediaStreamTrackGenerator({ kind: 'video' });
 
@@ -296,7 +259,7 @@
           const frameHeight = frame.displayHeight || frame.codedHeight;
           const crop = getCrop(frameWidth, frameHeight);
 
-          if (crop.width === output.width && crop.height === output.height && !fpsOverlay?.enabled) {
+          if (crop.width === output.width && crop.height === output.height) {
             // Zero-copy: no pixels are read back or re-drawn.
             controller.enqueue(new window.VideoFrame(frame, {
               visibleRect: crop,
@@ -320,8 +283,6 @@
               crop.x, crop.y, crop.width, crop.height,
               offsetX, offsetY, drawWidth, drawHeight
             );
-            fpsOverlay?.draw(ctx, output.width, output.height);
-
             controller.enqueue(new window.VideoFrame(canvas, {
               timestamp: frame.timestamp,
               duration: frame.duration ?? undefined
@@ -360,7 +321,7 @@
    * requestVideoFrameCallback with a timer backstop; `backgroundThrottling` is disabled on
    * the window so neither is throttled when the app is not visible.
    */
-  async function createCanvasCroppedTrack(videoTrack, { getCrop, output, fps, fpsOverlay = null }) {
+  async function createCanvasCroppedTrack(videoTrack, { getCrop, output, fps }) {
     const video = document.createElement('video');
     video.muted = true;
     video.playsInline = true;
@@ -396,7 +357,6 @@
           crop.x, crop.y, crop.width, crop.height,
           offsetX, offsetY, drawWidth, drawHeight
         );
-        fpsOverlay?.draw(context, output.width, output.height);
       }
       schedule();
     };
@@ -500,19 +460,9 @@
 
         const initialRect = getCrop(frameWidth, frameHeight);
         output = computeOutputSize(initialRect.width, initialRect.height, profile);
-        const fpsOverlay = createFpsOverlay(
-          mode === 'game' && state.appSettings.gameFpsOverlay,
-          state.appSettings.gameFpsIntervalMs
-        );
-
         videoOut = supportsZeroCopyCrop()
-          ? createProcessedTrack(videoTrack, { getCrop, output, fpsOverlay })
-          : await createCanvasCroppedTrack(videoTrack, {
-              getCrop,
-              output,
-              fps: profile.fps,
-              fpsOverlay
-            });
+          ? createProcessedTrack(videoTrack, { getCrop, output })
+          : await createCanvasCroppedTrack(videoTrack, { getCrop, output, fps: profile.fps });
         disposers.push(() => videoOut.stop?.());
       }
 
@@ -575,7 +525,6 @@
       return {
         stream: outputStream,
         output,
-        captureBackend: mode === 'game' ? 'windows-graphics-capture' : 'desktop-capture',
         requestedSystemAudio: Boolean(desktop.requestedSystemAudio),
         hasSystemAudio: Boolean(desktop.hasSystemAudio),
         requestedMic: Boolean(includeMic),
@@ -625,37 +574,6 @@
     }
   }
 
-  async function detectEncodingAcceleration(profile, mimeType) {
-    if (!navigator.mediaCapabilities?.encodingInfo || !mimeType) {
-      return { supported: Boolean(mimeType), powerEfficient: null, smooth: null };
-    }
-    const lower = String(mimeType).toLowerCase();
-    const codec = lower.includes('avc1') || lower.includes('h264')
-      ? 'avc1.640028'
-      : lower.includes('vp9') ? 'vp9' : lower.includes('vp8') ? 'vp8' : null;
-    const container = lower.includes('mp4') ? 'video/mp4' : 'video/webm';
-    const contentType = codec ? `${container};codecs="${codec}"` : container;
-    try {
-      const result = await navigator.mediaCapabilities.encodingInfo({
-        type: 'record',
-        video: {
-          contentType,
-          width: Math.max(2, Number(profile.width) || 1920),
-          height: Math.max(2, Number(profile.height) || 1080),
-          bitrate: Math.max(100000, Number(profile.bitrateMbps) * 1000 * 1000 || 10000000),
-          framerate: Math.max(1, Number(profile.fps) || 60)
-        }
-      });
-      return {
-        supported: result.supported === true,
-        powerEfficient: typeof result.powerEfficient === 'boolean' ? result.powerEfficient : null,
-        smooth: typeof result.smooth === 'boolean' ? result.smooth : null
-      };
-    } catch {
-      return { supported: true, powerEfficient: null, smooth: null };
-    }
-  }
-
   /**
    * Grabs a single full-resolution frame from a fresh capture.
    *
@@ -695,7 +613,6 @@
     pickRecorderMime,
     supportsZeroCopyCrop,
     createCaptureStream,
-    detectEncodingAcceleration,
     notifyAudioStatus,
     captureStill,
     computeOutputSize

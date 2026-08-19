@@ -30,10 +30,6 @@ function normalizeOptionsPatch(options = {}) {
   const patch = {};
   if (options.language === 'ko' || options.language === 'en') patch.language = options.language;
   if (typeof options.optimizeMp4 === 'boolean') patch.optimizeMp4 = options.optimizeMp4;
-  if (typeof options.gameFpsOverlay === 'boolean') patch.gameFpsOverlay = options.gameFpsOverlay;
-  if (settingsModule.GAME_FPS_INTERVALS.includes(Number(options.gameFpsIntervalMs))) {
-    patch.gameFpsIntervalMs = Number(options.gameFpsIntervalMs);
-  }
   if (typeof options.screenshotFormat === 'string') {
     patch.screenshotFormat = settingsModule.normalizeScreenshotFormat(options.screenshotFormat);
   }
@@ -147,8 +143,6 @@ function registerIpcHandlers(context) {
       defaultRecordingsDir: paths.defaultRecordingsDir(),
       settingsFile: paths.settingsFile(),
       optimizeMp4: value.optimizeMp4,
-      gameFpsOverlay: value.gameFpsOverlay,
-      gameFpsIntervalMs: value.gameFpsIntervalMs,
       screenshotFormat: value.screenshotFormat,
       screenshotQuality: value.screenshotQuality,
       clipBufferLimitMb: value.clipBufferLimitMb,

@@ -57,7 +57,7 @@ function createMainWindow({ isSmoke, onRendererGone, onRendererUnresponsive }) {
       nodeIntegration: false,
       // Area and window capture crop frames inside the renderer. Chromium throttles
       // timers and rendering for hidden windows, which would stall capture the moment the
-      // user alt-tabs away - exactly when a game recorder is expected to be working.
+      // user alt-tabs away, which would break background window and area recording.
       backgroundThrottling: false
     }
   });

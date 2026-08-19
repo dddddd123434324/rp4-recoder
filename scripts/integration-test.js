@@ -242,11 +242,6 @@ async function run() {
       screenshotQuality: 'not-a-number', clipBufferLimitMb: Infinity
     }), 'screenshotQuality')
       && !Object.hasOwn(normalizeOptionsPatch({ clipBufferLimitMb: Infinity }), 'clipBufferLimitMb'));
-  await settings.update({ gameFpsOverlay: false, gameFpsIntervalMs: 1000 });
-  check('game capture settings persist',
-    settings.value.gameFpsOverlay === false && settings.value.gameFpsIntervalMs === 1000);
-  await settings.update({ gameFpsOverlay: true, gameFpsIntervalMs: 500 });
-
   const losslessProfile = require('../src/main/settings').normalize({
     profile: { format: 'avi', resolution: 'lossless', fps: '60' }
   }).profile;
@@ -900,8 +895,8 @@ async function run() {
 
   // ---- native-frame uncompressed recording ------------------------------------
   const losslessMeta = {
-    mode: 'game',
-    modeLabel: '게임 녹화',
+    mode: 'window',
+    modeLabel: '창 지정',
     sourceName: '무압축 테스트',
     format: 'avi',
     width: 64,
@@ -1461,7 +1456,7 @@ async function run() {
     fps: 10,
     audioSampleRate: 48000,
     audioChannels: 2,
-    meta: { mode: 'game', sourceName: 'recovery test', lossless: true }
+    meta: { mode: 'window', sourceName: 'recovery test', lossless: true }
   }));
   const losslessSweep = await recordings.sweepTempDir();
   const recoveredLossless = losslessSweep.recovered.find((filePath) => filePath.endsWith('.avi'));

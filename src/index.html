@@ -113,10 +113,6 @@
                   <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="11" rx="1.5"/><path d="M8 20h8M12 16v4"/></svg>
                   <span>특정 모니터</span>
                 </button>
-                <button class="mode-card" type="button" data-mode="game">
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 8h10a4 4 0 0 1 3.7 5.5l-1.1 3A2.2 2.2 0 0 1 16 17.4L13.8 16h-3.6L8 17.4a2.2 2.2 0 0 1-3.6-.9l-1.1-3A4 4 0 0 1 7 8z"/><path d="M8 11v4M6 13h4M16.5 12h.01M18 14h.01"/></svg>
-                  <span>게임 녹화</span>
-                </button>
                 <button class="mode-card" type="button" data-mode="window">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="1.6"/><path d="M4 9h16"/></svg>
                   <span>창 선택</span>
@@ -284,37 +280,6 @@
           </div>
 
           <div class="advanced-settings">
-            <div class="advanced-section-title">
-              <strong>게임 녹화</strong>
-              <small>Windows Graphics Capture를 사용하고, MP4 선택 시 H.264 하드웨어 인코더를 우선 사용합니다.</small>
-            </div>
-            <div class="advanced-row">
-              <div>
-                <strong>녹화 FPS 표시</strong>
-                <small>게임 미리보기와 저장 영상의 왼쪽 위에 실제 캡처 FPS를 표시합니다.</small>
-              </div>
-              <label class="switch">
-                <input id="gameFpsOverlayToggle" type="checkbox" checked>
-                <span></span>
-              </label>
-            </div>
-            <div class="advanced-row">
-              <div>
-                <strong>FPS 표시 갱신</strong>
-                <small>표시되는 캡처 FPS의 계산 주기입니다.</small>
-              </div>
-              <select id="gameFpsIntervalSelect" class="compact-select">
-                <option value="250">0.25초</option>
-                <option value="500" selected>0.5초</option>
-                <option value="1000">1초</option>
-              </select>
-            </div>
-            <div class="advanced-row">
-              <div>
-                <strong>게임 인코더</strong>
-                <small id="gameEncoderStatus">하드웨어 가속 지원 여부 확인 중</small>
-              </div>
-            </div>
             <div class="advanced-row">
               <div>
                 <strong>MP4 최적화</strong>

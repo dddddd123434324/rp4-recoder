@@ -36,9 +36,6 @@
       audioBitrateSelect: RP4.$('#audioBitrateSelect'),
       optimizeMp4Toggle: RP4.$('#optimizeMp4Toggle'),
       clipBufferInput: RP4.$('#clipBufferInput'),
-      gameFpsOverlayToggle: RP4.$('#gameFpsOverlayToggle'),
-      gameFpsIntervalSelect: RP4.$('#gameFpsIntervalSelect'),
-      gameEncoderStatus: RP4.$('#gameEncoderStatus'),
       pipelineNote: RP4.$('#pipelineNote'),
       screenshotFormatSelect: RP4.$('#screenshotFormatSelect'),
       screenshotQualitySelect: RP4.$('#screenshotQualitySelect'),
@@ -104,7 +101,6 @@
   }
 
   function getModeLabel(mode) {
-    if (mode === 'game') return RP4.i18n.translate('게임 녹화');
     if (mode === 'window') return RP4.i18n.translate('창 지정');
     if (mode === 'monitor') return RP4.i18n.translate('특정 모니터');
     if (mode === 'area') return RP4.i18n.translate('영역 녹화');
@@ -116,7 +112,7 @@
   }
 
   function getSourcesForMode(mode) {
-    if (mode === 'window' || mode === 'game') {
+    if (mode === 'window') {
       return state.sources.filter((source) => source.type === 'window');
     }
     return getScreenSources();
@@ -215,8 +211,6 @@
       els.audioBitrateSelect,
       els.micToggle,
       els.systemAudioToggle,
-      els.gameFpsOverlayToggle,
-      els.gameFpsIntervalSelect,
       els.clipDurationInput,
       els.clipDurationUp,
       els.clipDurationDown,
@@ -305,10 +299,6 @@
       profile: settings.profile || null,
       recordingsDir: settings.recordingsDir || state.appInfo?.recordingsDir || '',
       optimizeMp4: settings.optimizeMp4 !== false,
-      gameFpsOverlay: settings.gameFpsOverlay !== false,
-      gameFpsIntervalMs: [250, 500, 1000].includes(Number(settings.gameFpsIntervalMs))
-        ? Number(settings.gameFpsIntervalMs)
-        : 500,
       screenshotFormat: ['png', 'jpeg', 'webp'].includes(settings.screenshotFormat)
         ? settings.screenshotFormat
         : 'png',
@@ -321,8 +311,6 @@
     els.languageSelect.value = state.appSettings.language;
     RP4.i18n.setLanguage(state.appSettings.language);
     els.optimizeMp4Toggle.checked = state.appSettings.optimizeMp4;
-    els.gameFpsOverlayToggle.checked = state.appSettings.gameFpsOverlay;
-    els.gameFpsIntervalSelect.value = String(state.appSettings.gameFpsIntervalMs);
     els.clipBufferInput.value = String(state.appSettings.clipBufferLimitMb);
     els.screenshotFormatSelect.value = state.appSettings.screenshotFormat;
     els.screenshotQualitySelect.value = String(state.appSettings.screenshotQuality);
@@ -576,13 +564,6 @@
         card.append(stateBadge);
       }
 
-      if (mode === 'game') {
-        const captureBadge = document.createElement('span');
-        captureBadge.className = 'source-state-badge game-capture-badge';
-        captureBadge.textContent = 'WGC';
-        card.append(captureBadge);
-      }
-
       const title = document.createElement('strong');
       title.textContent = getSourceTitle(source);
       card.append(title);
@@ -605,9 +586,8 @@
       return;
     }
 
-    els.sourceModalTitle.textContent = mode === 'game'
-      ? '게임 선택'
-      : mode === 'window' ? '창 선택'
+    els.sourceModalTitle.textContent = mode === 'window'
+      ? '창 선택'
       : mode === 'area' ? '영역 녹화 화면 선택' : '모니터 선택';
 
     renderSourceCards(mode);
@@ -639,32 +619,6 @@
 
     for (const button of RP4.$$('[data-settings-popup]')) {
       button.setAttribute('aria-expanded', String(button.dataset.settingsPopup === type));
-    }
-    if (type === 'record') void updateGameEncoderStatus();
-  }
-
-  async function updateGameEncoderStatus() {
-    const profile = RP4.profile.get();
-    if (profile.lossless) {
-      els.gameEncoderStatus.textContent = '무압축 AVI는 하드웨어 영상 인코더를 사용하지 않습니다.';
-      return;
-    }
-    const codec = RP4.capture.pickRecorderMime(profile.format);
-    if (!codec) {
-      els.gameEncoderStatus.textContent = '사용 가능한 영상 인코더를 찾지 못했습니다.';
-      return;
-    }
-    els.gameEncoderStatus.textContent = '하드웨어 가속 지원 여부 확인 중';
-    const result = await RP4.capture.detectEncodingAcceleration(profile, codec.mimeType);
-    if (!result?.supported) {
-      els.gameEncoderStatus.textContent = '현재 설정을 지원하는 인코더가 없습니다.';
-    } else if (result.powerEfficient === true) {
-      const encoder = codec.codec === 'h264' ? 'H.264' : codec.codec.toUpperCase();
-      els.gameEncoderStatus.textContent = `${encoder} 하드웨어 인코딩 사용 가능`;
-    } else if (result.powerEfficient === false) {
-      els.gameEncoderStatus.textContent = '소프트웨어 인코딩으로 대체될 수 있습니다.';
-    } else {
-      els.gameEncoderStatus.textContent = 'Chromium이 최적 인코더를 자동 선택합니다.';
     }
   }
 
@@ -832,17 +786,11 @@
       element.addEventListener('change', async () => {
         RP4.profile.markChanged();
         updateLosslessUi();
-        void updateGameEncoderStatus();
         await RP4.recorder.restartPreview();
       });
     }
     for (const element of [els.formatSelect, els.bitrateSelect, els.encoderPresetSelect, els.audioBitrateSelect]) {
-      element.addEventListener('change', () => {
-        RP4.profile.markChanged();
-        if (element === els.formatSelect || element === els.bitrateSelect) {
-          void updateGameEncoderStatus();
-        }
-      });
+      element.addEventListener('change', () => RP4.profile.markChanged());
     }
 
     els.clipDurationInput.addEventListener('input', () => {
@@ -874,23 +822,6 @@
         RP4.ui.showToast('설정을 저장하지 못했습니다.');
       }
     });
-
-    const saveGameCaptureSettings = async () => {
-      const gameFpsOverlay = els.gameFpsOverlayToggle.checked;
-      const gameFpsIntervalMs = Number(els.gameFpsIntervalSelect.value) || 500;
-      state.appSettings.gameFpsOverlay = gameFpsOverlay;
-      state.appSettings.gameFpsIntervalMs = gameFpsIntervalMs;
-      try {
-        await window.rp4.setOptions({ gameFpsOverlay, gameFpsIntervalMs });
-        if (state.selectedMode === 'game' && !RP4.lifecycle.isBusy()) {
-          await RP4.recorder.restartPreview();
-        }
-      } catch {
-        RP4.ui.showToast('게임 녹화 설정을 저장하지 못했습니다.');
-      }
-    };
-    els.gameFpsOverlayToggle.addEventListener('change', () => void saveGameCaptureSettings());
-    els.gameFpsIntervalSelect.addEventListener('change', () => void saveGameCaptureSettings());
 
     els.clipBufferInput.addEventListener('change', async () => {
       const value = util.clamp(Number(els.clipBufferInput.value) || 256, 64, 512);
@@ -1137,7 +1068,6 @@
       updateClipUi();
       updateLosslessUi();
       updatePreviewMeta();
-      void updateGameEncoderStatus();
       stopTimer();
 
       if (state.appInfo.isSmoke) {

@@ -26,8 +26,6 @@ const DEFAULT_SCREENSHOT_FORMAT = 'png';
 const DEFAULT_SCREENSHOT_QUALITY = 100;
 const SCREENSHOT_QUALITIES = [70, 80, 90, 95, 100];
 const LANGUAGES = new Set(['ko', 'en']);
-const GAME_FPS_INTERVALS = [250, 500, 1000];
-const DEFAULT_GAME_FPS_INTERVAL_MS = 500;
 
 // Clip mode keeps recent footage buffered. Without a byte ceiling a 7200s buffer at
 // 35 Mbps would try to hold ~31 GB, so the buffer is bounded in megabytes as well as
@@ -180,10 +178,6 @@ function normalize(value = {}, { recordingsDirFallback } = {}) {
     // Recording writes a ready-to-play MP4 directly. This optional pass re-muxes it in
     // the background (never blocking the user) so the moov atom sits at the front.
     optimizeMp4: source.optimizeMp4 !== false,
-    gameFpsOverlay: source.gameFpsOverlay !== false,
-    gameFpsIntervalMs: GAME_FPS_INTERVALS.includes(Number(source.gameFpsIntervalMs))
-      ? Number(source.gameFpsIntervalMs)
-      : DEFAULT_GAME_FPS_INTERVAL_MS,
     screenshotFormat: normalizeScreenshotFormat(source.screenshotFormat),
     screenshotQuality: normalizeScreenshotQuality(source.screenshotQuality),
     clipBufferLimitMb: clampNumber(
@@ -344,8 +338,6 @@ module.exports = {
   SCREENSHOT_FORMATS,
   SCREENSHOT_QUALITIES,
   LANGUAGES,
-  GAME_FPS_INTERVALS,
-  DEFAULT_GAME_FPS_INTERVAL_MS,
   MIN_CLIP_BUFFER_LIMIT_MB,
   MAX_CLIP_BUFFER_LIMIT_MB,
   MAX_SETTINGS_BYTES,

@@ -4,7 +4,7 @@
 
 ## 한국어
 
-Windows용 화면·게임 녹화 프로그램입니다. H.264 영상을 MP4로 바로 기록해 녹화 중지 후 저장합니다.
+Windows용 화면 녹화 프로그램입니다. H.264 영상을 MP4로 바로 기록해 녹화 중지 후 저장합니다.
 
 ### 주요 기능
 
@@ -27,7 +27,7 @@ Windows 코드 서명 인증서는 포함되어 있지 않습니다.
 
 ## English
 
-RP4 Recorder is a Windows screen and game recorder. It writes H.264 video directly to MP4 for fast finalization when recording stops.
+RP4 Recorder is a Windows screen recorder. It writes H.264 video directly to MP4 for fast finalization when recording stops.
 
 ### Features
 
