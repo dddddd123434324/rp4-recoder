@@ -614,7 +614,8 @@
     els.sourceModal.classList.remove('hidden');
   }
 
-  function closeSourceModal() {
+  function closeSourceModal({ invalidate = true } = {}) {
+    if (invalidate) state.sourceSelectionGeneration += 1;
     els.sourceModal.classList.add('hidden');
     state.sourceSelectionPending = false;
   }
@@ -813,6 +814,7 @@
         RP4.ui.showToast('최소화되었거나 숨겨진 창을 복원하고 있습니다.');
         const prepared = await window.rp4.prepareWindowSource(source.id).catch(() => null);
         card.disabled = false;
+        if (generation !== state.sourceSelectionGeneration || RP4.lifecycle.isBusy()) return;
         if (!prepared) {
           RP4.ui.showToast('이 창을 복원하거나 캡처할 수 없습니다.');
           return;
@@ -820,7 +822,7 @@
         state.sources = state.sources.map((item) => item.id === source.id ? prepared : item);
         source = prepared;
       }
-      closeSourceModal();
+      closeSourceModal({ invalidate: false });
       await chooseSource(source, state.modalMode, { generation });
     });
 
@@ -923,7 +925,10 @@
     window.rp4.onHotkey((action) => void RP4.hotkeys.dispatch(action));
 
     window.rp4.onNotice((notice) => {
-      RP4.ui.showToast(notice.message, { durationMs: 6000 });
+      const message = notice.messageKey
+        ? RP4.i18n.formatMessage(notice.messageKey, notice.params)
+        : notice.message;
+      if (message) RP4.ui.showToast(message, { durationMs: 6000 });
     });
 
     window.rp4.onConvertProgress(({ phase, ratio }) => {

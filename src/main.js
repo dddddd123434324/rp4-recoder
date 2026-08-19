@@ -276,50 +276,59 @@ async function bootstrap() {
       if (loaded.settingsRecovered) {
         send('app:notice', {
           level: 'warn',
-          message: loaded.settingsBackupPath
-            ? `손상된 설정 파일을 ${loaded.settingsBackupPath}에 백업하고 기본 설정으로 복구했습니다.`
-            : '설정 파일이 손상되어 기본 설정으로 복구했지만 원본 백업을 만들지 못했습니다.'
+          messageKey: loaded.settingsBackupPath
+            ? 'settingsRecoveredWithBackup'
+            : 'settingsRecoveredWithoutBackup',
+          params: loaded.settingsBackupPath ? { backupPath: loaded.settingsBackupPath } : {}
         });
       }
       if (indexRecovery.recovered) {
         send('app:notice', {
           level: 'warn',
-          message: indexRecovery.backupPath
-            ? `손상된 녹화 인덱스를 ${indexRecovery.backupPath}에 백업하고 새 인덱스로 복구했습니다.`
-            : '녹화 인덱스를 읽지 못해 빈 인덱스로 시작했습니다. 원본 파일은 보존했습니다.'
+          messageKey: indexRecovery.backupPath
+            ? 'indexRecoveredWithBackup'
+            : 'indexRecoveredWithoutBackup',
+          params: indexRecovery.backupPath ? { backupPath: indexRecovery.backupPath } : {}
         });
       }
       if (loaded.recordingsDirFellBack) {
-        const reason = loaded.recordingsDirFallbackReason === 'invalid'
-          ? '올바른 절대 경로가 아닙니다.'
-          : '폴더를 만들거나 쓸 수 없습니다.';
         send('app:notice', {
           level: 'warn',
-          message: `설정된 저장 폴더(${loaded.requestedRecordingsDir})를 사용할 수 없습니다: ${reason} 저장 경로를 ${settings.recordingsDir}(으)로 영구 변경했습니다.`
+          messageKey: loaded.recordingsDirFallbackReason === 'invalid'
+            ? 'recordingsDirFallbackInvalid'
+            : 'recordingsDirFallbackUnwritable',
+          params: {
+            requestedDir: loaded.requestedRecordingsDir,
+            recordingsDir: settings.recordingsDir
+          }
         });
       }
       if (sweep.recovered.length > 0) {
         send('app:notice', {
           level: 'info',
-          message: `이전에 완료되지 못한 녹화 ${sweep.recovered.length}개를 복구했습니다.`
+          messageKey: 'recordingsRecovered',
+          params: { count: sweep.recovered.length }
         });
       }
       if (sweep.failed.length > 0) {
         send('app:notice', {
           level: 'warn',
-          message: `이전 녹화 ${sweep.failed.length}개를 복구하지 못했습니다. 원본은 ${settings.tempDir}에 보존했습니다.`
+          messageKey: 'recordingsRecoveryFailed',
+          params: { count: sweep.failed.length, tempDir: settings.tempDir }
         });
       }
       if (reconciliation.restored > 0) {
         send('app:notice', {
           level: 'info',
-          message: `중단된 MP4 최적화에서 녹화 ${reconciliation.restored}개를 복구했습니다.`
+          messageKey: 'optimizationRecovered',
+          params: { count: reconciliation.restored }
         });
       }
       if (reconciliation.failed.length > 0) {
         send('app:notice', {
           level: 'warn',
-          message: `최적화 잔여 파일 ${reconciliation.failed.length}개를 자동 복구하지 못했습니다.`
+          messageKey: 'optimizationRecoveryFailed',
+          params: { count: reconciliation.failed.length }
         });
       }
     }

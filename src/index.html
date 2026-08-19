@@ -174,7 +174,7 @@
     </main>
   </div>
 
-  <div id="sourceModal" class="modal hidden">
+  <div id="sourceModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="sourceModalTitle">
     <div class="modal-card">
       <div class="panel-header">
         <h2 id="sourceModalTitle">소스 선택</h2>
@@ -264,21 +264,21 @@
             <div class="audio-row">
               <span>마이크</span>
               <label class="switch">
-                <input id="micToggle" type="checkbox" checked>
+                <input id="micToggle" type="checkbox" aria-label="마이크 녹음" checked>
                 <span></span>
               </label>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V7a3 3 0 0 0-3-3z"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M9 21h6"/></svg>
-              <input id="micVolume" type="range" min="0" max="100" value="70">
+              <input id="micVolume" type="range" min="0" max="100" value="70" aria-label="마이크 음량">
               <strong id="micVolumeLabel">70%</strong>
             </div>
             <div class="audio-row">
               <span>시스템 오디오</span>
               <label class="switch">
-                <input id="systemAudioToggle" type="checkbox" checked>
+                <input id="systemAudioToggle" type="checkbox" aria-label="시스템 오디오 녹음" checked>
                 <span></span>
               </label>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9z"/><path d="M17 9.5a4 4 0 0 1 0 5"/></svg>
-              <input id="systemVolume" type="range" min="0" max="100" value="80">
+              <input id="systemVolume" type="range" min="0" max="100" value="80" aria-label="시스템 오디오 음량">
               <strong id="systemVolumeLabel">80%</strong>
             </div>
           </div>

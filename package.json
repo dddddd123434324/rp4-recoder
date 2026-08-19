@@ -7,13 +7,13 @@
   "license": "MIT",
   "main": "src/main.js",
   "scripts": {
-    "start": "set ELECTRON_RUN_AS_NODE=&& electron .",
+    "start": "node scripts/run-electron.js .",
     "lint": "eslint src scripts",
     "lint:syntax": "node scripts/check-syntax.js",
     "smoke": "node scripts/smoke-test.js",
-    "test:integration": "set ELECTRON_RUN_AS_NODE=&& electron scripts/integration-test.js",
+    "test:integration": "node scripts/run-electron.js scripts/integration-test.js",
     "test": "npm run lint && npm run smoke && npm run test:integration",
-    "dist": "set CSC_IDENTITY_AUTO_DISCOVERY=false&& set ELECTRON_BUILDER_DISABLE_BUILD_CACHE=true&& electron-builder --win --x64"
+    "dist": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false ELECTRON_BUILDER_DISABLE_BUILD_CACHE=true electron-builder --win --x64"
   },
   "build": {
     "appId": "com.rp4.recorder",
@@ -75,6 +75,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "cross-env": "^7.0.3",
     "electron": "^41.4.0",
     "electron-builder": "^26.8.1",
     "eslint": "^10.8.0",

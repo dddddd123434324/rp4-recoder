@@ -5,6 +5,7 @@
  */
 (function initCapture(RP4) {
   const { state, els, util } = RP4;
+  const MAX_RENDERER_SCREENSHOT_PIXELS = 4096 * 2160;
 
   // Recording used to always produce VP8/WebM and then pay a full libx264 re-encode to
   // reach MP4. Chromium can emit H.264 straight into an MP4 container, so the preferred
@@ -675,6 +676,9 @@
     });
     const bitmap = await createImageBitmap(new Blob([frame.buffer], { type: 'image/png' }));
     try {
+      if (bitmap.width * bitmap.height > MAX_RENDERER_SCREENSHOT_PIXELS) {
+        throw new Error('WebP 스크린샷의 원본 영역이 안전한 처리 한도를 초과했습니다. 화질을 낮추지 않고 저장을 중단합니다.');
+      }
       const canvas = document.createElement('canvas');
       canvas.width = bitmap.width;
       canvas.height = bitmap.height;

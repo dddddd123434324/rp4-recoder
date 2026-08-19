@@ -156,6 +156,10 @@
     '균형': 'Balanced',
     '고화질 우선': 'Higher Quality',
     '최고화질 우선': 'Best Quality',
+    '마이크 녹음': 'Record microphone',
+    '마이크 음량': 'Microphone volume',
+    '시스템 오디오 녹음': 'Record system audio',
+    '시스템 오디오 음량': 'System audio volume',
     '마이크': 'Microphone',
     '시스템 오디오': 'System Audio',
     'MP4 최적화': 'Optimize MP4',
@@ -224,6 +228,81 @@
     '사용자 프리셋': 'Custom Preset',
     '주 화면': 'Primary',
     '모니터': 'Monitor'
+  };
+
+  const NOTICE_MESSAGES = {
+    settingsRecoveredWithBackup: {
+      ko: '손상된 설정 파일을 {backupPath}에 백업하고 기본 설정으로 복구했습니다.',
+      en: 'The damaged settings file was backed up to {backupPath} and default settings were restored.'
+    },
+    settingsRecoveredWithoutBackup: {
+      ko: '설정 파일이 손상되어 기본 설정으로 복구했지만 원본 백업을 만들지 못했습니다.',
+      en: 'The settings file was damaged. Default settings were restored, but the original could not be backed up.'
+    },
+    indexRecoveredWithBackup: {
+      ko: '손상된 녹화 인덱스를 {backupPath}에 백업하고 새 인덱스로 복구했습니다.',
+      en: 'The damaged recording index was backed up to {backupPath} and rebuilt.'
+    },
+    indexRecoveredWithoutBackup: {
+      ko: '녹화 인덱스를 읽지 못해 빈 인덱스로 시작했습니다. 원본 파일은 보존했습니다.',
+      en: 'The recording index could not be read, so a new index was created. Original recordings were preserved.'
+    },
+    recordingsDirFallbackInvalid: {
+      ko: '설정된 저장 폴더({requestedDir})는 올바른 절대 경로가 아닙니다. 저장 경로를 {recordingsDir}(으)로 영구 변경했습니다.',
+      en: 'The configured folder ({requestedDir}) is not a valid absolute path. The save folder was changed permanently to {recordingsDir}.'
+    },
+    recordingsDirFallbackUnwritable: {
+      ko: '설정된 저장 폴더({requestedDir})를 만들거나 쓸 수 없습니다. 저장 경로를 {recordingsDir}(으)로 영구 변경했습니다.',
+      en: 'The configured folder ({requestedDir}) cannot be created or written. The save folder was changed permanently to {recordingsDir}.'
+    },
+    recordingsRecovered: {
+      ko: '이전에 완료되지 못한 녹화 {count}개를 복구했습니다.',
+      en: 'Recovered {count} unfinished recording(s).'
+    },
+    recordingsRecoveryFailed: {
+      ko: '이전 녹화 {count}개를 복구하지 못했습니다. 원본은 {tempDir}에 보존했습니다.',
+      en: 'Could not recover {count} previous recording(s). Originals were preserved in {tempDir}.'
+    },
+    optimizationRecovered: {
+      ko: '중단된 MP4 최적화에서 녹화 {count}개를 복구했습니다.',
+      en: 'Recovered {count} recording(s) from interrupted MP4 optimization.'
+    },
+    optimizationRecoveryFailed: {
+      ko: '최적화 잔여 파일 {count}개를 자동 복구하지 못했습니다.',
+      en: 'Could not automatically recover {count} leftover optimization file(s).'
+    },
+    metadataSaveRetry: {
+      ko: '녹화 메타데이터를 저장하지 못했습니다. 종료 전에 다시 시도합니다. ({error})',
+      en: 'Could not save recording metadata. It will be retried before exit. ({error})'
+    },
+    diskSpaceUnknown: {
+      ko: '저장 장치의 여유 공간을 확인할 수 없습니다. 녹화를 계속하지만 디스크 공간을 확인해 주세요.',
+      en: 'Free storage space could not be checked. Recording will continue; please verify disk space.'
+    },
+    losslessDiskSpaceUnknown: {
+      ko: '무압축 녹화 중 저장 장치 여유 공간을 확인할 수 없습니다.',
+      en: 'Free storage space could not be checked during uncompressed recording.'
+    },
+    recordingDiskSpaceUnknown: {
+      ko: '녹화 중 저장 장치의 여유 공간을 확인할 수 없습니다. 디스크 공간을 확인해 주세요.',
+      en: 'Free storage space could not be checked during recording. Please verify disk space.'
+    },
+    losslessPerformanceDropped: {
+      ko: '저장 장치 처리 속도로 인해 {frames}개 프레임이 누락되었고 실제 FPS는 {fps}입니다.',
+      en: 'Storage throughput dropped {frames} frame(s); the effective frame rate is {fps} FPS.'
+    },
+    losslessPerformanceFps: {
+      ko: '저장 장치 처리 속도로 인해 실제 FPS가 {fps}로 낮아졌습니다.',
+      en: 'Storage throughput reduced the effective frame rate to {fps} FPS.'
+    },
+    deletedMetadataCleanupFailed: {
+      ko: '삭제된 녹화의 메타데이터를 정리하지 못했습니다. ({error})',
+      en: 'Could not remove metadata for the deleted recording. ({error})'
+    },
+    metadataFlushFailed: {
+      ko: '녹화 메타데이터 저장을 완료하지 못했습니다. ({error})',
+      en: 'Could not finish saving recording metadata. ({error})'
+    }
   };
 
   const replacements = Object.entries(ENGLISH).sort((a, b) => b[0].length - a[0].length);
@@ -313,6 +392,14 @@
     if (language === 'ko' && originals) originalAttributes.delete(element);
   }
 
+  function formatMessage(key, params = {}) {
+    const template = NOTICE_MESSAGES[String(key || '')]?.[language];
+    if (!template) return String(params.fallback || key || '');
+    return template.replace(/\{([a-zA-Z0-9_]+)\}/g, (_match, name) => (
+      Object.hasOwn(params, name) ? String(params[name]) : `{${name}}`
+    ));
+  }
+
   function apply(root = document.body) {
     if (!root) return;
     if (root.nodeType === Node.TEXT_NODE) translateTextNode(root);
@@ -346,5 +433,5 @@
     attributeFilter: ['title', 'aria-label', 'placeholder']
   });
 
-  RP4.i18n = { apply, setLanguage, translate, get language() { return language; } };
+  RP4.i18n = { apply, setLanguage, translate, formatMessage, get language() { return language; } };
 }(window.RP4));

@@ -502,7 +502,8 @@ class RecordingManager {
       this.indexDirty = true;
       this.emit('app:notice', {
         level: 'warn',
-        message: `녹화 메타데이터를 저장하지 못했습니다. 종료 전에 다시 시도합니다. (${error?.message || error})`
+        messageKey: 'metadataSaveRetry',
+        params: { error: error?.message || String(error) }
       });
     }
   }
@@ -772,7 +773,7 @@ class RecordingManager {
     if (available == null) {
       this.emit('app:notice', {
         level: 'warn',
-        message: '저장 장치의 여유 공간을 확인할 수 없습니다. 녹화를 계속하지만 디스크 공간을 확인해 주세요.'
+        messageKey: 'diskSpaceUnknown'
       });
     } else if (available < MIN_FREE_BYTES_TO_START) {
       throw new Error('저장 공간이 부족합니다. 최소 512MB 이상의 여유 공간이 필요합니다.');
@@ -1056,7 +1057,7 @@ class RecordingManager {
           session.diskCheckUnavailableWarned = true;
           this.emit('app:notice', {
             level: 'warn',
-            message: '무압축 녹화 중 저장 장치 여유 공간을 확인할 수 없습니다.'
+            messageKey: 'losslessDiskSpaceUnknown'
           });
         } else if (available != null && available < Math.max(
           MIN_FREE_BYTES_TO_CONTINUE,
@@ -1253,7 +1254,11 @@ class RecordingManager {
     };
     await this.setMetadata(target, meta);
     if (performanceWarning) {
-      this.emit('app:notice', { level: 'warn', message: performanceWarning });
+      this.emit('app:notice', {
+        level: 'warn',
+        messageKey: droppedFrames > 0 ? 'losslessPerformanceDropped' : 'losslessPerformanceFps',
+        params: { frames: droppedFrames, fps: effectiveFps.toFixed(1) }
+      });
     }
     return {
       ...this.toDto(target, stats, meta),
@@ -1345,7 +1350,7 @@ class RecordingManager {
           session.diskCheckUnavailableWarned = true;
           this.emit('app:notice', {
             level: 'warn',
-            message: '녹화 중 저장 장치의 여유 공간을 확인할 수 없습니다. 디스크 공간을 확인해 주세요.'
+            messageKey: 'recordingDiskSpaceUnknown'
           });
         } else if (available != null && available < MIN_FREE_BYTES_TO_CONTINUE) {
           session.failed = '저장 공간이 거의 없어 녹화를 중지해야 합니다.';
@@ -2193,7 +2198,8 @@ class RecordingManager {
         this.indexDirty = true;
         this.emit('app:notice', {
           level: 'warn',
-          message: `삭제된 녹화의 메타데이터를 정리하지 못했습니다. (${error?.message || error})`
+          messageKey: 'deletedMetadataCleanupFailed',
+          params: { error: error?.message || String(error) }
         });
       }
       return true;
@@ -2262,7 +2268,8 @@ class RecordingManager {
     await this.flushIndex().catch((error) => {
       this.emit('app:notice', {
         level: 'warn',
-        message: `녹화 메타데이터 저장을 완료하지 못했습니다. (${error?.message || error})`
+        messageKey: 'metadataFlushFailed',
+        params: { error: error?.message || String(error) }
       });
     });
 

@@ -212,6 +212,17 @@ async function run() {
   check('legacy hotkeys survive normalization', legacyShaped.hotkeys.recordToggle === 'Alt+F9');
   check('missing hotkeys fall back to defaults',
     legacyShaped.hotkeys.clipSave === 'CommandOrControl+Shift+V');
+  const { HotkeyManager, getAcceleratorCandidates } = require('../src/main/hotkeys');
+  const hotkeyManager = new HotkeyManager({ onTrigger: () => {} });
+  const disabledHotkeys = Object.fromEntries(
+    require('../src/main/settings').HOTKEY_ACTIONS.map((action) => [action, ''])
+  );
+  const disabledRegistrations = hotkeyManager.register(disabledHotkeys);
+  check('hotkey manager registers disabled bindings safely and normalizes candidates',
+    Object.values(disabledRegistrations).every((entry) => entry.reason === 'disabled')
+      && getAcceleratorCandidates('CommandOrControl+Esc').includes('Control+Esc')
+      && getAcceleratorCandidates('CommandOrControl+Esc').includes('CommandOrControl+Escape'));
+  hotkeyManager.unregisterAll();
 
   await settings.update({ language: 'en' });
   check('English language preference persists', settings.value.language === 'en');
@@ -364,6 +375,38 @@ async function run() {
   const oversizedIndex = await recordings.loadIndex();
   check('oversized recording index is backed up without parsing',
     oversizedIndex.recovered && Boolean(oversizedIndex.backupPath));
+
+  require('../src/main/ipc').registerIpcHandlers({
+    settings,
+    recordings,
+    windowCrop: { query: async () => null },
+    hotkeys: {
+      dto: () => ({ hotkeys: {}, defaults: {}, registrations: {} }),
+      register: () => ({}),
+      unregisterAll: () => {}
+    },
+    isSmoke: true,
+    setCaptureState: () => {}
+  });
+  const untrustedPage = path.join(SANDBOX, 'untrusted.html');
+  await fsp.writeFile(untrustedPage, '<!doctype html><html><body>untrusted</body></html>');
+  const untrustedWindow = new BrowserWindow({
+    show: false,
+    webPreferences: {
+      contextIsolation: false,
+      nodeIntegration: true,
+      sandbox: false
+    }
+  });
+  await untrustedWindow.loadFile(untrustedPage);
+  const untrustedIpcResult = await untrustedWindow.webContents.executeJavaScript(`
+    require('electron').ipcRenderer.invoke('app:info').then(
+      () => 'unexpectedly-allowed',
+      (error) => String(error && error.message || error)
+    )
+  `);
+  check('registered IPC rejects an untrusted top-level webContents at runtime',
+    /허용되지 않은 IPC 송신자/.test(untrustedIpcResult), untrustedIpcResult);
 
   const verificationEvents = [];
   const verificationManager = new RecordingManager({
@@ -609,6 +652,7 @@ async function run() {
   const page = path.join(SANDBOX, 'page.html');
   fs.writeFileSync(page, '<!doctype html><html><body>itest</body></html>', 'utf8');
   await win.loadFile(page);
+  untrustedWindow.destroy();
 
   const i18nSource = await fsp.readFile(path.join(__dirname, '..', 'src', 'renderer', 'i18n.js'), 'utf8');
   const i18nResult = JSON.parse(await win.webContents.executeJavaScript(`
@@ -627,9 +671,13 @@ async function run() {
       const untranslated = document.getElementById('untranslated');
       const english = { text: button.textContent, label: button.getAttribute('aria-label') };
       const unknown = { text: untranslated.textContent, title: untranslated.title };
+      const notice = window.RP4.i18n.formatMessage('recordingsRecoveryFailed', {
+        count: 2,
+        tempDir: 'D:\\\\safe-temp'
+      });
       window.RP4.i18n.setLanguage('ko');
       const korean = { text: button.textContent, label: button.getAttribute('aria-label') };
-      return JSON.stringify({ english, unknown, korean });
+      return JSON.stringify({ english, unknown, korean, notice });
     })()
   `));
   check('UI language switches to English and back to Korean',
@@ -637,6 +685,7 @@ async function run() {
       && i18nResult.english.label === 'Close'
       && i18nResult.unknown.text === '번역 목록에 없는 문장'
       && i18nResult.unknown.title === '번역 목록에 없는 속성'
+      && i18nResult.notice === 'Could not recover 2 previous recording(s). Originals were preserved in D:\\safe-temp.'
       && i18nResult.korean.text === '스크린샷'
       && i18nResult.korean.label === '닫기');
 
@@ -708,6 +757,21 @@ async function run() {
   check('lossless performance excludes paused time and capture failures close audio context',
     recorderSource.includes('Math.max(1, elapsedMs(context))')
       && captureSource.includes('await audioContext?.close().catch(() => {})'));
+  const rendererAppSourceForPicker = await fsp.readFile(
+    path.join(__dirname, '..', 'src', 'renderer', 'app.js'), 'utf8'
+  );
+  const indexSource = await fsp.readFile(path.join(__dirname, '..', 'src', 'index.html'), 'utf8');
+  check('closing the source picker invalidates an in-flight restore',
+    /function closeSourceModal[\s\S]*sourceSelectionGeneration \+= 1/.test(rendererAppSourceForPicker)
+      && /prepareWindowSource[\s\S]*generation !== state\.sourceSelectionGeneration/.test(rendererAppSourceForPicker)
+      && /closeSourceModal\(\{ invalidate: false \}\)[\s\S]*chooseSource/.test(rendererAppSourceForPicker));
+  check('renderer checks the WebP cap before allocating its canvas',
+    /bitmap\.width \* bitmap\.height > MAX_RENDERER_SCREENSHOT_PIXELS[\s\S]*createElement\('canvas'\)/
+      .test(captureSource));
+  check('source and audio controls expose dialog and accessible names',
+    /id="sourceModal"[^>]*role="dialog"[^>]*aria-modal="true"/.test(indexSource)
+      && /id="micToggle"[^>]*aria-label="마이크 녹음"/.test(indexSource)
+      && /id="systemVolume"[^>]*aria-label="시스템 오디오 음량"/.test(indexSource));
 
   const clipsSource = await fsp.readFile(path.join(__dirname, '..', 'src', 'renderer', 'clips.js'), 'utf8');
   const clipPolicyResult = JSON.parse(await win.webContents.executeJavaScript(`
