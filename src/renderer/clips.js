@@ -141,6 +141,25 @@
     }
   }
 
+  function releasePendingSnapshotBytes(session, snapshotBytes) {
+    if (!session) return;
+    session.pendingSnapshotBytes = Math.max(0, (
+      Number(session.pendingSnapshotBytes) || 0
+    ) - Math.max(0, Number(snapshotBytes) || 0));
+  }
+
+  function restoreFailedSnapshot(session, snapshot, snapshotBytes) {
+    // Release the temporary snapshot reservation before pruning. Otherwise the restored
+    // blobs count both as active epochs and as a pending snapshot, so a failed save can
+    // immediately discard the very clip the user should be able to retry.
+    releasePendingSnapshotBytes(session, snapshotBytes);
+    if (!snapshot?.epochs?.length || state.clip !== session || session.stopping) return;
+    session.completedEpochs = [...snapshot.epochs, ...session.completedEpochs]
+      .sort((a, b) => a.startedAt - b.startedAt);
+    snapshot.epochs = [];
+    pruneCompletedEpochs(session);
+  }
+
   async function stopEpoch(epoch) {
     if (!epoch || epoch.recorder.state === 'inactive') return;
     let timer;
@@ -500,15 +519,13 @@
           epoch.chunks.length = 0;
         }
         snapshot.epochs.length = 0;
-      } else if (snapshot?.epochs?.length && state.clip === session && !session.stopping) {
+      } else if (snapshot?.epochs?.length) {
         // A failed save must not consume the pre-click rolling window. Ownership of the
         // intact blobs returns to the active buffer so the user can retry immediately.
-        session.completedEpochs = [...snapshot.epochs, ...session.completedEpochs]
-          .sort((a, b) => a.startedAt - b.startedAt);
-        snapshot.epochs = [];
-        pruneCompletedEpochs(session);
+        restoreFailedSnapshot(session, snapshot, snapshotRemainingBytes);
+        snapshotRemainingBytes = 0;
       }
-      session.pendingSnapshotBytes = Math.max(0, session.pendingSnapshotBytes - snapshotRemainingBytes);
+      releasePendingSnapshotBytes(session, snapshotRemainingBytes);
       if (pausedForSnapshot && session.currentEpoch?.recorder?.state === 'paused') {
         try {
           session.currentEpoch.recorder.resume();
@@ -599,6 +616,6 @@
     finalizeForShutdown,
     pruneActiveBuffer,
     bufferStatus,
-    policy: { activeBufferLimit, segmentDurationMs }
+    policy: { activeBufferLimit, segmentDurationMs, restoreFailedSnapshot }
   };
 }(window.RP4));

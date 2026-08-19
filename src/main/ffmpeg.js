@@ -21,6 +21,35 @@ function resolveExecutable() {
 
 const activeJobs = new Map();
 const DEFAULT_CANCEL_TIMEOUT_MS = 5000;
+const MIN_JOB_TIMEOUT_MS = 60 * 1000;
+const DEFAULT_JOB_TIMEOUT_MS = 10 * 60 * 1000;
+const MAX_JOB_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const MIN_PROCESSING_BYTES_PER_SECOND = 2 * 1024 * 1024;
+
+function resolveTimeoutMs(totalDurationMs = 0, timeoutMs, inputBytes = 0) {
+  const explicit = Number(timeoutMs);
+  if (Number.isFinite(explicit) && explicit > 0) {
+    return Math.min(MAX_JOB_TIMEOUT_MS, Math.max(1, Math.round(explicit)));
+  }
+  const expected = Number(totalDurationMs);
+  const bytes = Number(inputBytes);
+  const durationBudget = Number.isFinite(expected) && expected > 0
+    ? Math.round(expected * 4 + 2 * 60 * 1000)
+    : DEFAULT_JOB_TIMEOUT_MS;
+  const sizeBudget = Number.isFinite(bytes) && bytes > 0
+    ? Math.round(bytes / MIN_PROCESSING_BYTES_PER_SECOND * 1000 + 30 * 1000)
+    : 0;
+  return Math.min(
+    MAX_JOB_TIMEOUT_MS,
+    Math.max(MIN_JOB_TIMEOUT_MS, durationBudget, sizeBudget)
+  );
+}
+
+function timeoutError(timeoutMs) {
+  const error = new Error(`FFmpeg 작업이 시간 제한(${Math.ceil(timeoutMs / 1000)}초)을 초과했습니다.`);
+  error.code = 'TIMEOUT';
+  return error;
+}
 
 function parseProgress(text) {
   const result = {};
@@ -41,7 +70,9 @@ function run(args, {
   onProgress,
   totalDurationMs = 0,
   jobId,
-  captureProgress = false
+  captureProgress = false,
+  timeoutMs,
+  inputBytes = 0
 } = {}) {
   const executable = resolveExecutable();
   if (!executable) {
@@ -50,6 +81,7 @@ function run(args, {
 
   const id = jobId || crypto.randomUUID();
   const fullArgs = ['-hide_banner', '-nostdin', '-nostats', '-progress', 'pipe:1', ...args];
+  const effectiveTimeoutMs = resolveTimeoutMs(totalDurationMs, timeoutMs, inputBytes);
 
   return new Promise((resolve, reject) => {
     const child = spawn(executable, fullArgs, {
@@ -58,10 +90,13 @@ function run(args, {
     });
 
     let cancelled = false;
+    let timedOut = false;
+    let timeout = null;
     let resolveClosed;
     const closed = new Promise((done) => { resolveClosed = done; });
     activeJobs.set(id, {
       cancel: () => {
+        if (timedOut) return;
         cancelled = true;
         child.kill('SIGKILL');
       },
@@ -97,18 +132,29 @@ function run(args, {
       if (stderr.length > 8000) stderr = stderr.slice(-8000);
     });
 
+    timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, effectiveTimeoutMs);
+
     child.on('error', (error) => {
+      clearTimeout(timeout);
       activeJobs.delete(id);
       resolveClosed();
-      reject(error);
+      reject(timedOut ? timeoutError(effectiveTimeoutMs) : error);
     });
 
     child.on('close', (code) => {
+      clearTimeout(timeout);
       activeJobs.delete(id);
       resolveClosed();
       if (captureProgress && stdoutBuffer.trim()) {
         finalProgress = { ...finalProgress, ...parseProgress(stdoutBuffer) };
         stdoutBuffer = '';
+      }
+      if (timedOut) {
+        reject(timeoutError(effectiveTimeoutMs));
+        return;
       }
       if (cancelled) {
         const error = new Error('작업이 취소되었습니다.');
@@ -166,8 +212,10 @@ async function validateMedia(inputPath, {
   minDurationRatio = 0.95,
   maxDurationRatio = 0,
   minFrameRatio = 0.95,
-  jobId
+  jobId,
+  timeoutMs
 } = {}) {
+  const inputBytes = await fs.stat(inputPath).then((stats) => stats.size, () => 0);
   const result = await run([
     '-v', 'error',
     '-i', inputPath,
@@ -175,7 +223,13 @@ async function validateMedia(inputPath, {
     '-map', requireAudio ? '0:a:0' : '0:a?',
     '-f', 'null',
     '-'
-  ], { captureProgress: true, jobId });
+  ], {
+    captureProgress: true,
+    jobId,
+    totalDurationMs: expectedDurationMs,
+    timeoutMs,
+    inputBytes
+  });
 
   const progress = result?.progress || {};
   const frameCount = Number(progress.frame);
@@ -211,12 +265,12 @@ async function validateMedia(inputPath, {
   return { durationMs, frameCount: Number.isFinite(frameCount) ? frameCount : 0 };
 }
 
-async function createThumbnail(inputPath, outputPath, { jobId } = {}) {
+async function createThumbnail(inputPath, outputPath, { jobId, timeoutMs } = {}) {
   const extract = (seek) => run([
     '-y', '-ss', seek, '-i', inputPath, '-frames:v', '1',
     '-vf', 'scale=112:64:force_original_aspect_ratio=decrease,pad=112:64:(ow-iw)/2:(oh-ih)/2',
     '-q:v', '4', outputPath
-  ], { jobId });
+  ], { jobId, timeoutMs });
   await fs.rm(outputPath, { force: true });
   try {
     await extract('0.2');
@@ -254,9 +308,14 @@ function remuxArguments(inputPath, outputPath) {
   return args;
 }
 
-async function remux(inputPath, outputPath, { jobId, onProgress, totalDurationMs } = {}) {
+async function remux(inputPath, outputPath, {
+  jobId, onProgress, totalDurationMs, timeoutMs
+} = {}) {
   await fs.rm(outputPath, { force: true });
-  await run(remuxArguments(inputPath, outputPath), { jobId, onProgress, totalDurationMs });
+  const inputBytes = await fs.stat(inputPath).then((stats) => stats.size, () => 0);
+  await run(remuxArguments(inputPath, outputPath), {
+    jobId, onProgress, totalDurationMs, timeoutMs, inputBytes
+  });
 }
 
 /** Joins complete rolling MediaRecorder epochs without re-encoding. */
@@ -287,7 +346,8 @@ async function concatSegments(inputPaths, outputPath, options = {}) {
     await run(args, {
       jobId: options.jobId,
       onProgress: options.onProgress,
-      totalDurationMs: options.totalDurationMs
+      totalDurationMs: options.totalDurationMs,
+      timeoutMs: options.timeoutMs
     });
   } finally {
     await fs.rm(listPath, { force: true }).catch(() => {});
@@ -312,7 +372,8 @@ async function remuxH264ToMp4(inputPath, outputPath, options = {}) {
   ], {
     jobId: options.jobId,
     onProgress: options.onProgress,
-    totalDurationMs: options.totalDurationMs
+    totalDurationMs: options.totalDurationMs,
+    timeoutMs: options.timeoutMs
   });
 }
 
@@ -321,7 +382,8 @@ async function trimRecent(inputPath, outputPath, {
   durationMs,
   endOffsetMs = 0,
   jobId,
-  onProgress
+  onProgress,
+  timeoutMs
 } = {}) {
   const seconds = Math.max(0.1, Number(durationMs) / 1000 || 0.1);
   const seekSeconds = seconds + Math.max(0, Number(endOffsetMs) || 0) / 1000;
@@ -341,7 +403,9 @@ async function trimRecent(inputPath, outputPath, {
   }
   args.push(outputPath);
   await fs.rm(outputPath, { force: true });
-  await run(args, { jobId, onProgress, totalDurationMs: durationMs });
+  await run(args, {
+    jobId, onProgress, totalDurationMs: durationMs, timeoutMs
+  });
 }
 
 /**
@@ -373,7 +437,8 @@ async function trimRecentToMp4(inputPath, outputPath, options = {}) {
   ], {
     jobId: options.jobId,
     onProgress: options.onProgress,
-    totalDurationMs: durationMs
+    totalDurationMs: durationMs,
+    timeoutMs: options.timeoutMs
   });
 }
 
@@ -416,7 +481,8 @@ async function trimRecentPrecisely(inputPath, outputPath, options = {}) {
   ], {
     jobId: options.jobId,
     onProgress: options.onProgress,
-    totalDurationMs: durationMs
+    totalDurationMs: durationMs,
+    timeoutMs: options.timeoutMs
   });
 }
 
@@ -458,13 +524,19 @@ async function transcodeToMp4(inputPath, outputPath, options = {}) {
   ], {
     jobId: options.jobId,
     onProgress: options.onProgress,
-    totalDurationMs: recentDurationMs > 0 ? recentDurationMs : options.totalDurationMs
+    totalDurationMs: recentDurationMs > 0 ? recentDurationMs : options.totalDurationMs,
+    timeoutMs: options.timeoutMs
   });
 }
 
 module.exports = {
   resolveExecutable,
   DEFAULT_CANCEL_TIMEOUT_MS,
+  MIN_JOB_TIMEOUT_MS,
+  DEFAULT_JOB_TIMEOUT_MS,
+  MAX_JOB_TIMEOUT_MS,
+  MIN_PROCESSING_BYTES_PER_SECOND,
+  resolveTimeoutMs,
   waitForClose,
   run,
   cancel,

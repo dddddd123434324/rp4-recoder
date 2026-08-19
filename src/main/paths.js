@@ -60,21 +60,37 @@ async function pathExists(target) {
  * up front lets us fall back to a guaranteed-writable location instead of dying during
  * the first recording.
  */
-async function isDirectoryWritable(target) {
+async function probeDirectoryWritable(target) {
   let probe = null;
   let handle = null;
+  let ownsProbe = false;
   try {
-    await fs.mkdir(target, { recursive: true });
     probe = path.join(target, `.rp4-write-probe-${crypto.randomUUID()}`);
     handle = await fs.open(probe, 'wx');
+    ownsProbe = true;
     await handle.writeFile('ok', 'utf8');
+    await handle.sync();
     await handle.close();
     handle = null;
+    // Once closed, prefer a harmless stale probe over a second delete attempt against a
+    // path another process might have reused after a failed unlink.
+    ownsProbe = false;
     await fs.rm(probe, { force: true });
     return true;
-  } catch {
+  } finally {
     await handle?.close().catch(() => {});
-    if (probe) await fs.rm(probe, { force: true }).catch(() => {});
+    // An exclusive open can fail because another process already owns this random name.
+    // Only unlink a probe this invocation actually created.
+    if (ownsProbe && probe) await fs.rm(probe, { force: true }).catch(() => {});
+  }
+}
+
+async function isDirectoryWritable(target) {
+  try {
+    await fs.mkdir(target, { recursive: true });
+    await probeDirectoryWritable(target);
+    return true;
+  } catch {
     return false;
   }
 }
@@ -258,8 +274,18 @@ async function resolveRecordingsDir(configuredDir) {
 async function ensureRecordingDirs(recordingsDir) {
   await fs.mkdir(configDir(), { recursive: true });
   await fs.mkdir(recordingsDir, { recursive: true });
-  await ensureOwnedTempDir(recordingsDir);
-  await ensureSafeChildDirectory(recordingsDir, SCREENSHOTS_DIR_NAME);
+  await probeDirectoryWritable(recordingsDir);
+  const [tempDir, screenshotsDir] = await Promise.all([
+    ensureOwnedTempDir(recordingsDir),
+    ensureSafeChildDirectory(recordingsDir, SCREENSHOTS_DIR_NAME)
+  ]);
+  // The root being writable is not enough: recordings, screenshots and staging all write
+  // inside direct children. Probe the actual resolved children before accepting a folder.
+  await Promise.all([
+    probeDirectoryWritable(tempDir),
+    probeDirectoryWritable(screenshotsDir)
+  ]);
+  return { recordingsDir: path.resolve(recordingsDir), tempDir, screenshotsDir };
 }
 
 module.exports = {
@@ -275,6 +301,7 @@ module.exports = {
   tempDirFor,
   screenshotsDirFor,
   pathExists,
+  probeDirectoryWritable,
   isDirectoryWritable,
   ensureOwnedTempDir,
   ensureSafeChildDirectory,

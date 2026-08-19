@@ -144,7 +144,13 @@ async function recordChunks(win, { seconds = 5, timeslice = 1000 }) {
 
 async function run() {
   const paths = require('../src/main/paths');
-  const { SettingsStore, readJson, MAX_SETTINGS_BYTES } = require('../src/main/settings');
+  const {
+    SettingsStore,
+    readJson,
+    MAX_SETTINGS_BYTES,
+    MAX_PRESET_ID_LENGTH,
+    MAX_ACCELERATOR_LENGTH
+  } = require('../src/main/settings');
   const {
     RecordingManager,
     toBoundedBuffer,
@@ -152,6 +158,7 @@ async function run() {
     replaceFileSafely,
     openOwnedRegularFile,
     commitStagedFileToUnique,
+    moveFile,
     recordingWorkKey,
     MAX_INDEX_BYTES
   } = require('../src/main/recording');
@@ -162,6 +169,20 @@ async function run() {
     ffmpeg.DEFAULT_CANCEL_TIMEOUT_MS === 5000
       && cancelTimeoutResult === false
       && Date.now() - cancelTimeoutStartedAt < 500);
+
+  const timeoutStartedAt = Date.now();
+  let ffmpegTimeoutCode = null;
+  try {
+    await ffmpeg.run([
+      '-re', '-f', 'lavfi', '-i', 'testsrc2=size=64x48:rate=10',
+      '-t', '2', '-f', 'null', '-'
+    ], { timeoutMs: 100 });
+  } catch (error) {
+    ffmpegTimeoutCode = error?.code;
+  }
+  check('FFmpeg has an app-level execution deadline',
+    ffmpegTimeoutCode === 'TIMEOUT' && Date.now() - timeoutStartedAt < 5000,
+    `code=${ffmpegTimeoutCode}`);
 
   // ---- settings + path handling -------------------------------------------------
   const settings = new SettingsStore();
@@ -250,6 +271,13 @@ async function run() {
   check('legacy hotkeys survive normalization', legacyShaped.hotkeys.recordToggle === 'Alt+F9');
   check('missing hotkeys fall back to defaults',
     legacyShaped.hotkeys.clipSave === 'CommandOrControl+Shift+V');
+  const boundedSettings = require('../src/main/settings').normalize({
+    customPresets: [{ id: 'p'.repeat(MAX_PRESET_ID_LENGTH + 100), name: 'test', profile: {} }],
+    hotkeys: { recordToggle: `Alt+${'K'.repeat(MAX_ACCELERATOR_LENGTH + 100)}` }
+  });
+  check('preset IDs and hotkeys have serialized-size bounds',
+    boundedSettings.customPresets[0].id.length === MAX_PRESET_ID_LENGTH
+      && boundedSettings.hotkeys.recordToggle.length === MAX_ACCELERATOR_LENGTH);
   const { HotkeyManager, getAcceleratorCandidates } = require('../src/main/hotkeys');
   const hotkeyManager = new HotkeyManager({ onTrigger: () => {} });
   const disabledHotkeys = Object.fromEntries(
@@ -335,6 +363,32 @@ async function run() {
   check('failed replacement validation restores the original',
     replacementRejected && await fsp.readFile(replaceOriginal, 'utf8') === 'known-good');
 
+  const raceOriginal = path.join(SANDBOX, 'replace-race-original.bin');
+  const raceCandidate = path.join(SANDBOX, 'replace-race-candidate.bin');
+  await fsp.writeFile(raceOriginal, 'known-good');
+  await fsp.writeFile(raceCandidate, 'candidate');
+  let raceBackupPath = null;
+  try {
+    await replaceFileSafely(raceOriginal, raceCandidate, {
+      move: async (from, to) => {
+        if (from === raceCandidate && to === raceOriginal) {
+          await fsp.writeFile(raceOriginal, 'new-unrelated-file');
+        }
+        return moveFile(from, to);
+      }
+    });
+  } catch (error) {
+    raceBackupPath = error.backupPath;
+  }
+  check('replacement rollback never deletes a concurrently created file',
+    (await fsp.readFile(raceOriginal, 'utf8')) === 'new-unrelated-file'
+      && Boolean(raceBackupPath) && fs.existsSync(raceBackupPath));
+  await Promise.allSettled([
+    fsp.rm(raceOriginal, { force: true }),
+    fsp.rm(raceCandidate, { force: true }),
+    raceBackupPath ? fsp.rm(raceBackupPath, { force: true }) : Promise.resolve()
+  ]);
+
   // A drive root must never be accepted as a recordings folder.
   check('drive root rejected as recordings dir', paths.isPlausibleRecordingsDir('D:\\') === false);
   check('relative path rejected as recordings dir', paths.isPlausibleRecordingsDir('recordings') === false);
@@ -358,6 +412,14 @@ async function run() {
   check('oversized settings file is backed up without parsing',
     oversizedSettings.value === null && Boolean(oversizedSettings.recovery?.backupPath));
   await fsp.writeFile(paths.settingsFile(), settingsSnapshot);
+  let oversizedSettingsWriteRejected = false;
+  try {
+    await settings.writeSnapshot({ payload: 'x'.repeat(MAX_SETTINGS_BYTES + 1) });
+  } catch {
+    oversizedSettingsWriteRejected = true;
+  }
+  check('settings writer refuses to create an unreadably large settings file',
+    oversizedSettingsWriteRejected);
 
   for (const conflict of ['foreign-temp', 'temp-file', 'screenshots-file']) {
     const root = path.join(SANDBOX, conflict);
@@ -506,6 +568,26 @@ async function run() {
       )));
   ffmpeg.validateMedia = originalValidateMedia;
   ffmpeg.cancel = originalCancelFfmpeg;
+
+  const timeoutVerificationEvents = [];
+  const timeoutVerificationManager = new RecordingManager({
+    settings,
+    emit: (channel, payload) => timeoutVerificationEvents.push({ channel, payload })
+  });
+  const timeoutVerificationPath = path.join(RECORDINGS, 'verify-timeout.mp4');
+  timeoutVerificationManager.metadata.set(timeoutVerificationPath, {
+    status: 'verifying', durationMs: 3000, format: 'mp4'
+  });
+  ffmpeg.validateMedia = async () => {
+    const error = new Error('simulated timeout');
+    error.code = 'TIMEOUT';
+    throw error;
+  };
+  await timeoutVerificationManager.enqueueVerification(timeoutVerificationPath, 3000);
+  check('verification timeout keeps media unverified instead of marking it invalid',
+    timeoutVerificationManager.metadata.get(timeoutVerificationPath)?.status === 'unverified'
+      && timeoutVerificationEvents.some((entry) => entry.payload?.state === 'timed-out'));
+  ffmpeg.validateMedia = originalValidateMedia;
 
   const optimizeWakeupManager = new RecordingManager({ settings, emit: () => {} });
   let optimizeDrains = 0;
@@ -930,11 +1012,36 @@ async function run() {
         audioBitrateKbps: 320,
         clipDurationSeconds: 300
       });
+      const restoredSession = {
+        profile: { clipDurationSeconds: 300 },
+        segmentMs: 1000,
+        pendingSnapshotBytes: 190 * 1024 * 1024,
+        completedEpochs: [],
+        currentEpoch: { startedAt: Date.now() - 1000, chunks: [] },
+        stopping: false
+      };
+      const failedSnapshot = {
+        epochs: [{
+          startedAt: Date.now() - 2000,
+          endedAt: Date.now() - 1000,
+          initChunk: { size: 190 * 1024 * 1024 },
+          chunks: []
+        }]
+      };
+      window.RP4.state.clip = restoredSession;
+      window.RP4.clips.policy.restoreFailedSnapshot(
+        restoredSession,
+        failedSnapshot,
+        190 * 1024 * 1024
+      );
       return JSON.stringify({
         completedMarker: completed.marker,
         runningMarker: running.marker,
         activeLimit,
         highBitrateSegmentMs,
+        restoredEpochs: restoredSession.completedEpochs.length,
+        restoredPendingBytes: restoredSession.pendingSnapshotBytes,
+        restoredActiveBytes: restoredSession.completedEpochs[0]?.initChunk?.size || 0,
         clipSaving: window.RP4.state.clipSaving
       });
     })()
@@ -949,6 +1056,10 @@ async function run() {
   check('high bitrate shortens rolling clip epochs',
     clipPolicyResult.highBitrateSegmentMs === 1000,
     `${clipPolicyResult.highBitrateSegmentMs} ms`);
+  check('failed clip save restores its snapshot before memory pruning',
+    clipPolicyResult.restoredEpochs === 1
+      && clipPolicyResult.restoredPendingBytes === 0
+      && clipPolicyResult.restoredActiveBytes === 190 * 1024 * 1024);
 
   const recorded = await recordChunks(win, { seconds: 5, timeslice: 1000 });
   check('renderer produced MP4 chunks', recorded.buffers.length >= 2,
@@ -1127,6 +1238,41 @@ async function run() {
       && recordings.metadata.get(recoveredFinalizing)?.status === 'unverified'
       && !fs.existsSync(staleFinalizingPath),
     recoveredFinalizing ? path.basename(recoveredFinalizing) : 'none');
+
+  const journalCollisionId = crypto.randomUUID();
+  const journalCollisionTarget = path.join(RECORDINGS, `lossless-journal-${journalCollisionId}.avi`);
+  const journalCollisionFinalizing = path.join(
+    settings.tempDir,
+    `rp4-${journalCollisionId}.lossless-finalizing.avi`
+  );
+  const journalCollisionManifest = path.join(
+    settings.tempDir,
+    `rp4-${journalCollisionId}.lossless.json`
+  );
+  await fsp.copyFile(losslessSaved.filePath, journalCollisionTarget);
+  await fsp.copyFile(losslessSaved.filePath, journalCollisionFinalizing);
+  const journalCollisionStats = await fsp.stat(journalCollisionFinalizing);
+  await fsp.writeFile(journalCollisionManifest, JSON.stringify({
+    version: 3,
+    state: 'ready-to-commit',
+    targetName: path.basename(journalCollisionTarget),
+    durationMs: 1000,
+    frameCount: 10,
+    meta: losslessMeta,
+    stagedIdentity: {
+      size: journalCollisionStats.size,
+      dev: String(journalCollisionStats.dev),
+      ino: String(journalCollisionStats.ino)
+    }
+  }));
+  const journalCollisionSweep = await recordings.sweepTempDir();
+  const journalCollisionRecovered = journalCollisionSweep.recovered.find((filePath) => (
+    path.basename(filePath) === `lossless-journal-${journalCollisionId} (2).avi`
+  ));
+  check('lossless journal preserves a mismatched existing target and commits a numbered copy',
+    fs.existsSync(journalCollisionTarget)
+      && Boolean(journalCollisionRecovered)
+      && !fs.existsSync(journalCollisionManifest));
 
   const invalidSession = await recordings.start(meta, { webContentsId: win.webContents.id });
   await recordings.write({
@@ -1633,6 +1779,48 @@ async function run() {
   await fsp.copyFile(saved.filePath, nestedMedia);
   check('nested media file is rejected by IPC validation',
     await resolveRecordingMediaFile(RECORDINGS, nestedMedia) === null);
+
+  // A startup sweep can perform validation/remuxing asynchronously. It must hold the
+  // original folder lease until every resulting file mutation has completed.
+  const recoverySnapshotSource = path.join(SANDBOX, 'recovery-snapshot-source');
+  const recoverySnapshotDestination = path.join(SANDBOX, 'recovery-snapshot-destination');
+  await Promise.all([
+    paths.ensureRecordingDirs(recoverySnapshotSource),
+    paths.ensureRecordingDirs(recoverySnapshotDestination)
+  ]);
+  const recoverySnapshotSettings = {
+    recordingsDir: recoverySnapshotSource,
+    value: { optimizeMp4: false },
+    get tempDir() { return paths.tempDirFor(this.recordingsDir); }
+  };
+  const recoverySnapshotManager = new RecordingManager({
+    settings: recoverySnapshotSettings,
+    emit: () => {}
+  });
+  const recoverySnapshotOrphan = path.join(
+    paths.tempDirFor(recoverySnapshotSource),
+    `rp4-${crypto.randomUUID()}.part.mp4`
+  );
+  await fsp.copyFile(saved.filePath, recoverySnapshotOrphan);
+  const originalSnapshotValidate = ffmpeg.validateMedia;
+  let releaseSnapshotValidation;
+  ffmpeg.validateMedia = () => new Promise((resolve) => { releaseSnapshotValidation = resolve; });
+  const snapshotSweepPromise = recoverySnapshotManager.sweepTempDir();
+  const snapshotDeadline = Date.now() + 1000;
+  while (!releaseSnapshotValidation && Date.now() < snapshotDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  if (!releaseSnapshotValidation) throw new Error('recovery validation did not start');
+  const folderMutationBlockedByRecovery = recoverySnapshotManager.hasPendingFileMutations();
+  recoverySnapshotSettings.recordingsDir = recoverySnapshotDestination;
+  releaseSnapshotValidation({ durationMs: 5000, frameCount: 1 });
+  const snapshotSweep = await snapshotSweepPromise;
+  ffmpeg.validateMedia = originalSnapshotValidate;
+  check('recovery holds the original folder and blocks path changes until completion',
+    folderMutationBlockedByRecovery
+      && snapshotSweep.recovered.length === 1
+      && path.dirname(snapshotSweep.recovered[0]) === recoverySnapshotSource
+      && !fs.existsSync(recoverySnapshotOrphan));
 
   // ---- orphaned temp files are recovered, not lost ------------------------------
   const orphan = path.join(settings.tempDir, `rp4-${crypto.randomUUID()}.part.mp4`);

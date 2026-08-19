@@ -34,6 +34,8 @@ const DEFAULT_CLIP_BUFFER_LIMIT_MB = 256;
 const MIN_CLIP_BUFFER_LIMIT_MB = 64;
 const MAX_CLIP_BUFFER_LIMIT_MB = 512;
 const MAX_SETTINGS_BYTES = 1024 * 1024;
+const MAX_PRESET_ID_LENGTH = 96;
+const MAX_ACCELERATOR_LENGTH = 128;
 
 const DEFAULT_PROFILE = {
   format: 'mp4',
@@ -61,6 +63,17 @@ function sanitizePresetName(value) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 40) || '사용자 프리셋';
+}
+
+function sanitizePresetId(value) {
+  if (typeof value !== 'string') return '';
+  return value
+    // IDs are persisted and reflected into renderer state; keep their total serialized
+    // size bounded even when settings were manually edited.
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001F\u007F]/g, '')
+    .trim()
+    .slice(0, MAX_PRESET_ID_LENGTH);
 }
 
 function normalizeEncoderPreset(preset) {
@@ -119,9 +132,7 @@ function normalizeCustomPresets(value) {
     .slice(0, MAX_CUSTOM_PRESETS)
     .map((item, index) => {
       const source = item && typeof item === 'object' ? item : {};
-      const rawId = typeof source.id === 'string' && source.id.trim()
-        ? source.id.trim()
-        : crypto.randomUUID();
+      const rawId = sanitizePresetId(source.id) || crypto.randomUUID();
       const id = seen.has(rawId) ? crypto.randomUUID() : rawId;
       seen.add(id);
 
@@ -136,7 +147,9 @@ function normalizeCustomPresets(value) {
 function normalizeSelectedPreset(value, customPresets = []) {
   // null explicitly means the live profile was adjusted and no preset is active.
   if (value === null) return null;
-  const key = typeof value === 'string' ? value : DEFAULT_SELECTED_PRESET;
+  const key = typeof value === 'string'
+    ? value.trim().slice(0, MAX_PRESET_ID_LENGTH + 7)
+    : DEFAULT_SELECTED_PRESET;
   if (BUILTIN_PRESET_KEYS.has(key)) return key;
 
   const customId = key.startsWith('custom:') ? key.slice(7) : null;
@@ -150,7 +163,14 @@ function normalizeHotkeys(value) {
   const input = value && typeof value === 'object' ? value : {};
   const hotkeys = {};
   for (const action of HOTKEY_ACTIONS) {
-    hotkeys[action] = typeof input[action] === 'string' ? input[action] : DEFAULT_HOTKEYS[action];
+    hotkeys[action] = typeof input[action] === 'string'
+      // Empty strings intentionally disable a binding.
+      ? input[action]
+        // eslint-disable-next-line no-control-regex
+        .replace(/[\u0000-\u001F\u007F]/g, '')
+        .trim()
+        .slice(0, MAX_ACCELERATOR_LENGTH)
+      : DEFAULT_HOTKEYS[action];
   }
   return hotkeys;
 }
@@ -300,8 +320,12 @@ class SettingsStore {
     const target = paths.settingsFile();
     const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
     await fs.mkdir(path.dirname(target), { recursive: true });
+    const serialized = JSON.stringify(snapshot, null, 2);
+    if (Buffer.byteLength(serialized, 'utf8') > MAX_SETTINGS_BYTES) {
+      throw new Error('설정 크기가 허용 범위를 초과했습니다.');
+    }
     try {
-      await fs.writeFile(temporary, JSON.stringify(snapshot, null, 2), 'utf8');
+      await fs.writeFile(temporary, serialized, 'utf8');
       await fs.rename(temporary, target);
     } finally {
       await fs.rm(temporary, { force: true }).catch(() => {});
@@ -345,6 +369,8 @@ module.exports = {
   MIN_CLIP_BUFFER_LIMIT_MB,
   MAX_CLIP_BUFFER_LIMIT_MB,
   MAX_SETTINGS_BYTES,
+  MAX_PRESET_ID_LENGTH,
+  MAX_ACCELERATOR_LENGTH,
   clampNumber,
   normalize,
   normalizeProfile,
@@ -354,6 +380,7 @@ module.exports = {
   normalizeResolution,
   normalizeEncoderPreset,
   normalizeCustomPresets,
+  sanitizePresetId,
   normalizeSelectedPreset,
   sanitizePresetName,
   readJson
