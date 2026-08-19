@@ -390,11 +390,13 @@ class RecordingManager {
     this.indexDirty = false;
     this.thumbnailQueue = Promise.resolve();
     this.thumbnailInflight = new Map();
+    this.thumbnailJobs = new Map();
     this.screenshotJobs = new Set();
     this.verificationQueue = [];
     this.verificationJobs = new Map();
     this.verificationRunning = new Map();
     this.verificationCancelled = false;
+    this.deletingFiles = new Set();
     this.startingWebContentsIds = new Set();
     this.moveFile = move;
     this.maxSessionQueuedBytes = Math.max(1, Number(maxSessionQueuedBytes) || MAX_SESSION_QUEUED_BYTES);
@@ -1688,7 +1690,7 @@ class RecordingManager {
     const recordingsDir = this.settings.recordingsDir;
     await paths.ensureRecordingDirs(recordingsDir);
     const entries = await fs.readdir(recordingsDir, { withFileTypes: true }).catch(() => []);
-    const result = { restored: 0, removed: 0, failed: [] };
+    const result = { restored: 0, removed: 0, preservedCorrupt: 0, failed: [] };
 
     for (const entry of entries) {
       if (!entry.isFile()) continue;
@@ -1712,8 +1714,14 @@ class RecordingManager {
           await fs.rm(fullPath, { force: true });
           result.removed += 1;
         } else if (artifactValid) {
+          let corrupt = null;
           if (originalExists) {
-            const corrupt = `${original}.corrupt-${crypto.randomUUID()}`;
+            const originalExtension = path.extname(original);
+            corrupt = await uniquePath(
+              recordingsDir,
+              `${path.basename(original, originalExtension)}_corrupt_${crypto.randomUUID().slice(0, 8)}`,
+              originalExtension.slice(1).toLowerCase()
+            );
             await this.moveFile(original, corrupt);
             try {
               await this.moveFile(fullPath, original);
@@ -1728,6 +1736,19 @@ class RecordingManager {
             }
           } else {
             await this.moveFile(fullPath, original);
+          }
+          if (corrupt) {
+            const corruptStats = await statFile(corrupt);
+            await this.setMetadata(corrupt, {
+              status: 'partial',
+              partial: true,
+              outcome: 'recovered-corrupt-original',
+              recovered: true,
+              failureReason: '복구 파일로 교체하기 전의 손상된 원본입니다.',
+              recoveredAt: new Date().toISOString(),
+              bytes: corruptStats?.size || 0
+            });
+            result.preservedCorrupt += 1;
           }
           result.restored += 1;
         } else {
@@ -1796,12 +1817,14 @@ class RecordingManager {
 
   async runVerification(job) {
     const { filePath, durationMs, optimizable } = job;
+    if (this.deletingFiles.has(filePath)) return false;
     this.emit('recording:verify', { filePath, state: 'start' });
     try {
       await ffmpeg.validateMedia(filePath, {
         expectedDurationMs: durationMs,
         jobId: job.jobId
       });
+      if (this.deletingFiles.has(filePath)) return false;
       const meta = this.metadata.get(filePath);
       if (meta) {
         await this.setMetadata(filePath, {
@@ -1818,6 +1841,7 @@ class RecordingManager {
       }
       return true;
     } catch (error) {
+      if (this.deletingFiles.has(filePath)) return false;
       if (error?.code === 'CANCELLED') {
         // Preserve `verifying`; startup will resume an interrupted background decode.
         this.emit('recording:verify', { filePath, state: 'cancelled' });
@@ -1862,6 +1886,29 @@ class RecordingManager {
       new Promise((resolve) => { timer = setTimeout(resolve, Math.max(0, timeoutMs)); })
     ]);
     clearTimeout(timer);
+  }
+
+  async cancelVerification(filePath, { timeoutMs = VERIFICATION_SHUTDOWN_TIMEOUT_MS } = {}) {
+    const remaining = [];
+    for (const job of this.verificationQueue) {
+      if (job.filePath !== filePath) {
+        remaining.push(job);
+        continue;
+      }
+      if (this.verificationJobs.get(job.filePath) === job.promise) {
+        this.verificationJobs.delete(job.filePath);
+      }
+      job.resolve(false);
+    }
+    this.verificationQueue = remaining;
+
+    const running = this.verificationRunning.get(filePath);
+    if (!running) return true;
+    const [, drained] = await Promise.all([
+      ffmpeg.cancel(running.jobId, { timeoutMs }),
+      ffmpeg.waitForClose(running.promise.then(() => true), timeoutMs)
+    ]);
+    return drained !== false;
   }
 
   /** Restarts direct-save validation that was interrupted by a previous app exit. */
@@ -2036,7 +2083,21 @@ class RecordingManager {
     await fs.mkdir(cacheDir, { recursive: true });
     if (this.thumbnailInflight.has(key)) return this.thumbnailInflight.get(key);
 
+    const job = {
+      filePath,
+      jobId: `thumbnail:${crypto.randomUUID()}`,
+      cancelled: false,
+      started: false,
+      settled: false,
+      promise: null
+    };
+    if (!this.thumbnailJobs.has(filePath)) this.thumbnailJobs.set(filePath, new Set());
+    this.thumbnailJobs.get(filePath).add(job);
     const task = this.thumbnailQueue.then(async () => {
+      job.started = true;
+      if (job.cancelled || this.deletingFiles.has(filePath)) {
+        throw codedError('CANCELLED', '썸네일 생성을 취소했습니다.');
+      }
       let buffer = await fs.readFile(output).catch(() => null);
       const valid = buffer && buffer.length >= 4 && buffer.length <= 2 * 1024 * 1024
         && buffer[0] === 0xff && buffer[1] === 0xd8
@@ -2045,7 +2106,10 @@ class RecordingManager {
         await fs.rm(output, { force: true });
         const temporary = `${output}.tmp-${crypto.randomUUID()}.jpg`;
         try {
-          await ffmpeg.createThumbnail(filePath, temporary);
+          await ffmpeg.createThumbnail(filePath, temporary, { jobId: job.jobId });
+          if (job.cancelled || this.deletingFiles.has(filePath)) {
+            throw codedError('CANCELLED', '썸네일 생성을 취소했습니다.');
+          }
           buffer = await fs.readFile(temporary);
           const generatedValid = buffer.length >= 4 && buffer.length <= 2 * 1024 * 1024
             && buffer[0] === 0xff && buffer[1] === 0xd8
@@ -2060,13 +2124,33 @@ class RecordingManager {
       await pruneThumbnailCache(cacheDir);
       return `data:image/jpeg;base64,${buffer.toString('base64')}`;
     });
+    job.promise = task;
     this.thumbnailInflight.set(key, task);
     this.thumbnailQueue = task.catch(() => {});
     try {
       return await task;
     } finally {
+      job.settled = true;
       this.thumbnailInflight.delete(key);
+      const jobs = this.thumbnailJobs.get(filePath);
+      jobs?.delete(job);
+      if (jobs?.size === 0) this.thumbnailJobs.delete(filePath);
     }
+  }
+
+  async cancelThumbnail(filePath, { timeoutMs = VERIFICATION_SHUTDOWN_TIMEOUT_MS } = {}) {
+    const jobs = [...(this.thumbnailJobs.get(filePath) || [])];
+    for (const job of jobs) job.cancelled = true;
+    const running = jobs.filter((job) => job.started && !job.settled);
+    if (running.length === 0) return true;
+    const results = await Promise.all(running.map(async (job) => {
+      const [, drained] = await Promise.all([
+        ffmpeg.cancel(job.jobId, { timeoutMs }),
+        ffmpeg.waitForClose(job.promise.then(() => true, () => true), timeoutMs)
+      ]);
+      return drained !== false;
+    }));
+    return results.every(Boolean);
   }
 
   /** Moves a completed top-level recording to the OS recycle bin and prunes its metadata. */
@@ -2079,29 +2163,50 @@ class RecordingManager {
       || !RECORDING_EXTENSIONS.test(target)) return false;
     if (!(await paths.pathExists(target))) return false;
 
-    this.optimizeQueue = this.optimizeQueue.filter((job) => job.filePath !== target);
-    if (this.optimizingFilePath === target) {
-      await ffmpeg.cancel(`optimize:${target}`);
-      const deadline = Date.now() + 10000;
-      while (this.optimizingFilePath === target && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-      if (this.optimizingFilePath === target) return false;
-    }
-
-    if (!(await paths.pathExists(target))) return false;
-    await trash(target);
-    this.metadata.delete(target);
+    const previousMeta = this.metadata.get(target);
+    let deleted = false;
+    this.deletingFiles.add(target);
     try {
-      await this.saveIndex();
-    } catch (error) {
-      this.indexDirty = true;
-      this.emit('app:notice', {
-        level: 'warn',
-        message: `삭제된 녹화의 메타데이터를 정리하지 못했습니다. (${error?.message || error})`
-      });
+      this.optimizeQueue = this.optimizeQueue.filter((job) => job.filePath !== target);
+      const [verificationStopped, thumbnailStopped] = await Promise.all([
+        this.cancelVerification(target),
+        this.cancelThumbnail(target)
+      ]);
+      if (!verificationStopped || !thumbnailStopped) return false;
+
+      if (this.optimizingFilePath === target) {
+        await ffmpeg.cancel(`optimize:${target}`, { timeoutMs: 5000 });
+        const deadline = Date.now() + 5000;
+        while (this.optimizingFilePath === target && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        if (this.optimizingFilePath === target) return false;
+      }
+
+      if (!(await paths.pathExists(target))) return false;
+      await trash(target);
+      deleted = true;
+      this.metadata.delete(target);
+      try {
+        await this.saveIndex();
+      } catch (error) {
+        this.indexDirty = true;
+        this.emit('app:notice', {
+          level: 'warn',
+          message: `삭제된 녹화의 메타데이터를 정리하지 못했습니다. (${error?.message || error})`
+        });
+      }
+      return true;
+    } finally {
+      this.deletingFiles.delete(target);
+      if (!deleted && previousMeta?.status === 'verifying' && await paths.pathExists(target)) {
+        this.enqueueVerification(
+          target,
+          Number(previousMeta.durationMs) || 0,
+          String(previousMeta.format || '').toLowerCase() === 'mp4'
+        );
+      }
     }
-    return true;
   }
 
   saveScreenshot(payload = {}) {

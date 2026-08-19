@@ -10,6 +10,9 @@
   const FALLBACK_MAX_QUEUED_BYTES = 128 * 1024 * 1024;
   const MAX_LOSSLESS_FRAME_BYTES = 64 * 1024 * 1024;
   const LOSSLESS_FRAME_QUEUE_SIZE = 3;
+  const LOSSLESS_ACK_TIMEOUT_MS = 15000;
+  const LOSSLESS_DRAIN_TIMEOUT_MS = 15000;
+  const MAX_LOSSLESS_AUDIO_QUEUE_BYTES = 8 * 1024 * 1024;
 
   function cleanupPreview() {
     if (state.preview) {
@@ -140,10 +143,14 @@
   }
 
   function failLosslessWriter(writer, error) {
-    writer.failure = error;
+    if (!writer.failure) writer.failure = error;
     clearTimeout(writer.readyTimeout);
-    writer.rejectReady(error);
-    for (const pending of writer.pending.values()) pending.reject(error);
+    writer.rejectReady(writer.failure);
+    for (const pending of writer.pending.values()) {
+      window.clearTimeout(pending.timer);
+      if (pending.frameBuffer) writer.framePool.push(pending.frameBuffer);
+      pending.reject(writer.failure);
+    }
     writer.pending.clear();
     settleLosslessWriter(writer);
   }
@@ -188,11 +195,19 @@
       const pending = writer.pending.get(Number(message.id));
       if (!pending) return;
       writer.pending.delete(Number(message.id));
+      window.clearTimeout(pending.timer);
       if (pending.frameBuffer) writer.framePool.push(pending.frameBuffer);
       if (message.ok === true) pending.resolve(message.result);
       else pending.reject(losslessTransportError(message.error));
       settleLosslessWriter(writer);
     });
+    writer.port.addEventListener('messageerror', () => failLosslessWriter(
+      writer,
+      losslessTransportError({
+        code: 'MESSAGE_PORT_ERROR',
+        message: '무압축 녹화 전송 채널에서 손상된 메시지를 받았습니다.'
+      })
+    ));
     writer.port.start();
     writer.readyTimeout = window.setTimeout(() => failLosslessWriter(
       writer,
@@ -230,9 +245,17 @@
     }
     const id = writer.nextId++;
     const completion = new Promise((resolve, reject) => {
+      const timer = window.setTimeout(() => failLosslessWriter(
+        writer,
+        losslessTransportError({
+          code: 'MESSAGE_PORT_ACK_TIMEOUT',
+          message: '무압축 녹화 패킷 응답 시간이 초과되었습니다.'
+        })
+      ), LOSSLESS_ACK_TIMEOUT_MS);
       writer.pending.set(id, {
         resolve,
         reject,
+        timer,
         frameBuffer: kind === 'frame' ? buffer : null
       });
     });
@@ -242,7 +265,9 @@
       // three-buffer structured-clone path: adding `[buffer]` here corrupts recordings.
       writer.port.postMessage(['write', id, kind, timestampUs, buffer]);
     } catch (error) {
+      const pending = writer.pending.get(id);
       writer.pending.delete(id);
+      window.clearTimeout(pending?.timer);
       if (kind === 'frame') writer.framePool.push(buffer);
       settleLosslessWriter(writer);
       throw error;
@@ -255,7 +280,20 @@
     if (!writer) return;
     await writer.ready.catch(() => {});
     if (writer.pending.size > 0) {
-      await new Promise((resolve) => writer.drainWaiters.push(resolve));
+      let timer;
+      await Promise.race([
+        new Promise((resolve) => writer.drainWaiters.push(resolve)),
+        new Promise((resolve) => {
+          timer = window.setTimeout(() => {
+            failLosslessWriter(writer, losslessTransportError({
+              code: 'MESSAGE_PORT_DRAIN_TIMEOUT',
+              message: '무압축 녹화 전송 종료 대기 시간이 초과되었습니다.'
+            }));
+            resolve();
+          }, LOSSLESS_DRAIN_TIMEOUT_MS);
+        })
+      ]);
+      window.clearTimeout(timer);
     }
     writer.unsubscribe?.();
     writer.port.close();
@@ -264,7 +302,7 @@
   }
 
   function updateLosslessPerformance(context) {
-    const elapsed = Math.max(1, Date.now() - context.startedAt);
+    const elapsed = Math.max(1, elapsedMs(context));
     context.losslessActualFps = context.losslessWrittenFrames * 1000 / elapsed;
     if (elapsed < 3000 || context.losslessPerformanceWarned) return;
     if (context.losslessDroppedFrames === 0
@@ -288,6 +326,7 @@
     context.losslessTrack = rawTrack;
     context.losslessReader = reader;
     context.losslessAudioWriteQueue = Promise.resolve();
+    context.losslessAudioQueuedBytes = 0;
     context.losslessFrameWrites = new Set();
     context.losslessInputFrames = 0;
     context.losslessWrittenFrames = 0;
@@ -303,24 +342,24 @@
       const audioContext = context.audioContext || new AudioContext({
         sampleRate: context.losslessAudioSampleRate
       });
+      context.losslessAudioStream = audioStream;
+      context.losslessPcmContext = audioContext;
+      context.losslessOwnsPcmContext = audioContext !== context.audioContext;
       if (audioContext.state === 'suspended') await audioContext.resume();
       if (audioContext.state !== 'running') {
         throw new Error('무압축 PCM 오디오 처리기를 시작할 수 없습니다.');
       }
       const channels = context.losslessAudioChannels;
       const source = audioContext.createMediaStreamSource(audioStream);
+      context.losslessPcmSource = source;
       const processor = audioContext.createScriptProcessor(4096, channels, channels);
+      context.losslessPcmProcessor = processor;
       const silentOutput = audioContext.createGain();
+      context.losslessPcmSilentOutput = silentOutput;
       silentOutput.gain.value = 0;
       source.connect(processor);
       processor.connect(silentOutput).connect(audioContext.destination);
 
-      context.losslessAudioStream = audioStream;
-      context.losslessPcmContext = audioContext;
-      context.losslessOwnsPcmContext = audioContext !== context.audioContext;
-      context.losslessPcmSource = source;
-      context.losslessPcmProcessor = processor;
-      context.losslessPcmSilentOutput = silentOutput;
       processor.onaudioprocess = (event) => {
         if (context.stopping || context.isPaused) return;
         const input = event.inputBuffer;
@@ -328,7 +367,12 @@
         const channelData = Array.from({ length: channels }, (_unused, channel) => (
           input.getChannelData(Math.min(channel, input.numberOfChannels - 1))
         ));
-        const buffer = new ArrayBuffer(frameCount * channels * 2);
+        const bytes = frameCount * channels * 2;
+        if (context.losslessAudioQueuedBytes + bytes > MAX_LOSSLESS_AUDIO_QUEUE_BYTES) {
+          failRecording(context, new Error('무압축 오디오 쓰기 대기열이 8MB를 초과했습니다.'));
+          return;
+        }
+        const buffer = new ArrayBuffer(bytes);
         const view = new DataView(buffer);
         let offset = 0;
         for (let frame = 0; frame < frameCount; frame += 1) {
@@ -338,11 +382,17 @@
             offset += 2;
           }
         }
+        context.losslessAudioQueuedBytes += bytes;
         context.losslessAudioWriteQueue = context.losslessAudioWriteQueue.then(async () => {
           const result = await writeLosslessPacket(context, 'audio', buffer);
           if (result?.warning) throw new Error(result.warning);
         }).catch((error) => {
           failRecording(context, error);
+        }).finally(() => {
+          context.losslessAudioQueuedBytes = Math.max(
+            0,
+            context.losslessAudioQueuedBytes - bytes
+          );
         });
       };
     }

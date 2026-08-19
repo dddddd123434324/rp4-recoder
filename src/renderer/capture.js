@@ -464,6 +464,7 @@
     const desktop = await getDesktopStream(source, { audio, mode, profile });
     const inputs = [desktop.stream];
     const disposers = [];
+    let audioContext = null;
 
     try {
       const videoTrack = desktop.stream.getVideoTracks()[0];
@@ -516,7 +517,6 @@
 
       const outputStream = new MediaStream([videoOut.track]);
       const gains = { system: null, mic: null };
-      let audioContext = null;
       let hasMic = false;
 
       const audioSources = [];
@@ -611,6 +611,7 @@
       for (const stream of inputs) {
         util.stopStream(stream);
       }
+      await audioContext?.close().catch(() => {});
       throw error;
     }
   }

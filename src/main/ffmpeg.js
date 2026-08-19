@@ -20,6 +20,7 @@ function resolveExecutable() {
 }
 
 const activeJobs = new Map();
+const DEFAULT_CANCEL_TIMEOUT_MS = 5000;
 
 function parseProgress(text) {
   const result = {};
@@ -125,7 +126,7 @@ function run(args, {
   });
 }
 
-function waitForClose(promise, timeoutMs = 0) {
+function waitForClose(promise, timeoutMs = DEFAULT_CANCEL_TIMEOUT_MS) {
   if (!(timeoutMs > 0)) return promise;
   let timer;
   return Promise.race([
@@ -134,19 +135,20 @@ function waitForClose(promise, timeoutMs = 0) {
   ]).finally(() => clearTimeout(timer));
 }
 
-function cancel(jobId, { timeoutMs = 0 } = {}) {
+function cancel(jobId, { timeoutMs = DEFAULT_CANCEL_TIMEOUT_MS } = {}) {
   const job = activeJobs.get(jobId);
   if (!job) return Promise.resolve(false);
   job.cancel();
   return waitForClose(job.closed.then(() => true), timeoutMs);
 }
 
-async function cancelAll({ timeoutMs = 0 } = {}) {
+async function cancelAll({ timeoutMs = DEFAULT_CANCEL_TIMEOUT_MS } = {}) {
   const jobs = [...activeJobs.values()];
   for (const job of jobs) {
     job.cancel();
   }
-  await waitForClose(Promise.allSettled(jobs.map((job) => job.closed)), timeoutMs);
+  const closed = await waitForClose(Promise.allSettled(jobs.map((job) => job.closed)), timeoutMs);
+  return closed !== false;
 }
 
 function hasActiveJobs() {
@@ -199,12 +201,12 @@ async function validateMedia(inputPath, {
   return { durationMs, frameCount: Number.isFinite(frameCount) ? frameCount : 0 };
 }
 
-async function createThumbnail(inputPath, outputPath) {
+async function createThumbnail(inputPath, outputPath, { jobId } = {}) {
   const extract = (seek) => run([
     '-y', '-ss', seek, '-i', inputPath, '-frames:v', '1',
     '-vf', 'scale=112:64:force_original_aspect_ratio=decrease,pad=112:64:(ow-iw)/2:(oh-ih)/2',
     '-q:v', '4', outputPath
-  ]);
+  ], { jobId });
   await fs.rm(outputPath, { force: true });
   try {
     await extract('0.2');
@@ -400,6 +402,8 @@ async function transcodeToMp4(inputPath, outputPath, options = {}) {
 
 module.exports = {
   resolveExecutable,
+  DEFAULT_CANCEL_TIMEOUT_MS,
+  waitForClose,
   run,
   cancel,
   cancelAll,

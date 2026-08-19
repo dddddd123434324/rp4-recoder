@@ -275,6 +275,15 @@ function registerIpcHandlers(context) {
     }
 
     const senderId = event.sender.id;
+    port.on('close', () => {
+      sendToWriter({
+        type: 'fatal',
+        error: serializeError(
+          new Error('무압축 녹화 전송 채널이 예기치 않게 닫혔습니다.'),
+          'LOSSLESS_PORT_CLOSED'
+        )
+      });
+    });
     port.on('message', async (messageEvent) => {
       const raw = messageEvent.data;
       const message = Array.isArray(raw) ? {

@@ -154,6 +154,13 @@ async function run() {
     MAX_INDEX_BYTES
   } = require('../src/main/recording');
 
+  const cancelTimeoutStartedAt = Date.now();
+  const cancelTimeoutResult = await ffmpeg.waitForClose(new Promise(() => {}), 25);
+  check('FFmpeg cancellation wait has a finite default and reports timeout',
+    ffmpeg.DEFAULT_CANCEL_TIMEOUT_MS === 5000
+      && cancelTimeoutResult === false
+      && Date.now() - cancelTimeoutStartedAt < 500);
+
   // ---- settings + path handling -------------------------------------------------
   const settings = new SettingsStore();
   await settings.load();
@@ -665,6 +672,9 @@ async function run() {
 
   const preloadSource = await fsp.readFile(path.join(__dirname, '..', 'src', 'preload.js'), 'utf8');
   const ipcSource = await fsp.readFile(path.join(__dirname, '..', 'src', 'main', 'ipc.js'), 'utf8');
+  const captureSource = await fsp.readFile(
+    path.join(__dirname, '..', 'src', 'renderer', 'capture.js'), 'utf8'
+  );
   const rendererAppSourceForScreenshot = await fsp.readFile(
     path.join(__dirname, '..', 'src', 'renderer', 'app.js'), 'utf8'
   );
@@ -686,6 +696,18 @@ async function run() {
   check('renderer lossless frame queue is explicitly bounded',
     /LOSSLESS_FRAME_QUEUE_SIZE\s*=\s*3/.test(recorderSource)
       && recorderSource.includes('losslessDroppedFrames'));
+  check('lossless packets and writer drain have bounded ACK waits',
+    recorderSource.includes('LOSSLESS_ACK_TIMEOUT_MS = 15000')
+      && recorderSource.includes('LOSSLESS_DRAIN_TIMEOUT_MS = 15000')
+      && recorderSource.includes('window.clearTimeout(pending.timer)')
+      && recorderSource.includes("addEventListener('messageerror'")
+      && ipcSource.includes("port.on('close'"));
+  check('lossless PCM queue is byte-bounded before allocation',
+    recorderSource.includes('MAX_LOSSLESS_AUDIO_QUEUE_BYTES = 8 * 1024 * 1024')
+      && recorderSource.includes('losslessAudioQueuedBytes + bytes'));
+  check('lossless performance excludes paused time and capture failures close audio context',
+    recorderSource.includes('Math.max(1, elapsedMs(context))')
+      && captureSource.includes('await audioContext?.close().catch(() => {})'));
 
   const clipsSource = await fsp.readFile(path.join(__dirname, '..', 'src', 'renderer', 'clips.js'), 'utf8');
   const clipPolicyResult = JSON.parse(await win.webContents.executeJavaScript(`
@@ -1202,6 +1224,25 @@ async function run() {
   check('only UUID-suffixed optimization backup is restored',
     reconciliation.restored === 1 && fs.existsSync(restoredTarget) && !fs.existsSync(trueBackup));
 
+  const visibleCorruptOriginal = path.join(RECORDINGS, 'visible-corrupt.mp4');
+  const visibleRecoveryArtifact = `${visibleCorruptOriginal}.backup-${crypto.randomUUID()}`;
+  await fsp.writeFile(visibleCorruptOriginal, Buffer.alloc(1024, 0x41));
+  await fsp.copyFile(saved.filePath, visibleRecoveryArtifact);
+  const visibleRecovery = await recordings.reconcileRecordingsDir();
+  const visibleCorruptName = (await fsp.readdir(RECORDINGS)).find((name) => (
+    /^visible-corrupt_corrupt_[0-9a-f]{8}\.mp4$/i.test(name)
+  ));
+  const visibleCorruptPath = visibleCorruptName
+    ? path.join(RECORDINGS, visibleCorruptName)
+    : null;
+  check('successful recovery exposes the damaged original instead of hiding it',
+    visibleRecovery.restored === 1
+      && visibleRecovery.preservedCorrupt === 1
+      && Boolean(visibleCorruptPath)
+      && recordings.metadata.get(visibleCorruptPath)?.outcome === 'recovered-corrupt-original');
+  await fsp.rm(visibleCorruptOriginal, { force: true });
+  if (visibleCorruptPath) await fsp.rm(visibleCorruptPath, { force: true });
+
   const rollbackOriginal = path.join(RECORDINGS, 'rollback-restored.mp4');
   const rollbackArtifact = `${rollbackOriginal}.backup-${crypto.randomUUID()}`;
   const corruptOriginalBytes = Buffer.alloc(1024, 0x5a);
@@ -1264,6 +1305,55 @@ async function run() {
   const thumbnail = await revived.thumbnail(saved.filePath);
   check('recent recording thumbnail is generated',
     typeof thumbnail === 'string' && thumbnail.startsWith('data:image/jpeg;base64,'));
+
+  const deleteTarget = path.join(RECORDINGS, 'delete-with-readers.mp4');
+  await fsp.copyFile(saved.filePath, deleteTarget);
+  const deleteEvents = [];
+  const deleteManager = new RecordingManager({
+    settings,
+    emit: (channel, payload) => deleteEvents.push({ channel, payload })
+  });
+  deleteManager.metadata.set(deleteTarget, {
+    status: 'verifying', durationMs: 5000, format: 'mp4'
+  });
+  const originalDeleteValidate = ffmpeg.validateMedia;
+  const originalDeleteThumbnail = ffmpeg.createThumbnail;
+  const originalDeleteCancel = ffmpeg.cancel;
+  const pendingReaders = new Map();
+  ffmpeg.validateMedia = (_filePath, options = {}) => new Promise((resolve, reject) => {
+    pendingReaders.set(options.jobId, { resolve, reject });
+  });
+  ffmpeg.createThumbnail = (_filePath, _output, options = {}) => new Promise((resolve, reject) => {
+    pendingReaders.set(options.jobId, { resolve, reject });
+  });
+  ffmpeg.cancel = async (jobId) => {
+    const pending = pendingReaders.get(jobId);
+    if (!pending) return false;
+    const error = new Error('cancelled for delete');
+    error.code = 'CANCELLED';
+    pending.reject(error);
+    pendingReaders.delete(jobId);
+    return true;
+  };
+  const deletingVerification = deleteManager.enqueueVerification(deleteTarget, 5000);
+  const deletingThumbnail = deleteManager.thumbnail(deleteTarget).catch(() => null);
+  const deleteReaderDeadline = Date.now() + 1000;
+  while (pendingReaders.size < 2 && Date.now() < deleteReaderDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const deletedWithReaders = await deleteManager.trashRecording(deleteTarget, {
+    trash: (target) => fsp.rm(target, { force: true })
+  });
+  await Promise.allSettled([deletingVerification, deletingThumbnail]);
+  ffmpeg.validateMedia = originalDeleteValidate;
+  ffmpeg.createThumbnail = originalDeleteThumbnail;
+  ffmpeg.cancel = originalDeleteCancel;
+  check('deleting a recording cancels verification and thumbnail readers first',
+    deletedWithReaders
+      && !fs.existsSync(deleteTarget)
+      && !deleteManager.metadata.has(deleteTarget)
+      && !deleteEvents.some((entry) => entry.payload?.state === 'failed'));
+
   const oldFolderMetadata = path.join(`${RECORDINGS}-old`, 'old.mp4');
   recordings.metadata.set(oldFolderMetadata, { durationMs: 1234 });
   await recordings.list();

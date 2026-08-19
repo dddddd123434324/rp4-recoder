@@ -233,7 +233,7 @@ async function drainRecordings(win, recordingManager, {
   // starts it is intentionally not timed out: cancelling ffmpeg here could corrupt the
   // only copy of the recording.
   const timedOut = !rendererReady || recordingManager.hasActiveSessions();
-  if (timedOut) await ffmpeg.cancelAll().catch(() => {});
+  if (timedOut) await ffmpeg.cancelAll({ timeoutMs: 5000 }).catch(() => false);
   const saved = await recordingManager.finalizeAllSessions({
     failureReason: timedOut
       ? timeoutFailureReason || '앱 종료 대기 시간이 지나 부분 저장했습니다.'
