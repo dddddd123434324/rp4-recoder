@@ -41,6 +41,30 @@ const LOSSLESS_FINALIZING_PATTERN = new RegExp(
   `^rp4-(${UUID_PATTERN})\\.lossless-finalizing\\.avi$`,
   'i'
 );
+function canonicalPathKey(filePath) {
+  const resolved = path.resolve(String(filePath || ''));
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+class CanonicalPathMap extends Map {
+  get(key) { return super.get(canonicalPathKey(key)); }
+  set(key, value) { return super.set(canonicalPathKey(key), value); }
+  has(key) { return super.has(canonicalPathKey(key)); }
+  delete(key) { return super.delete(canonicalPathKey(key)); }
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
 
 function codedError(code, message) {
   const error = new Error(message);
@@ -186,6 +210,16 @@ async function statFile(filePath) {
     return await fs.stat(filePath);
   } catch {
     return null;
+  }
+}
+
+async function writeJsonAtomic(filePath, value) {
+  const temporary = `${filePath}.tmp-${crypto.randomUUID()}`;
+  try {
+    await fs.writeFile(temporary, JSON.stringify(value), { encoding: 'utf8', flag: 'wx' });
+    await fs.rename(temporary, filePath);
+  } finally {
+    await fs.rm(temporary, { force: true }).catch(() => {});
   }
 }
 
@@ -380,7 +414,9 @@ class RecordingManager {
     this.sessions = new Map();
     this.losslessSessions = new Map();
     this.finalizing = new Map();
-    this.metadata = new Map();
+    this.metadata = new CanonicalPathMap();
+    this.reconciling = false;
+    this.shutdownAbandoned = false;
     this.optimizeQueue = [];
     this.optimizing = false;
     this.optimizingFilePath = null;
@@ -419,6 +455,7 @@ class RecordingManager {
   hasPendingFileMutations() {
     return this.hasPendingRecordings()
       || this.optimizing
+      || this.reconciling
       || this.optimizeQueue.length > 0
       || this.verificationJobs.size > 0;
   }
@@ -675,6 +712,52 @@ class RecordingManager {
           await manifestFile.handle.close().catch(() => {});
         }
         const manifest = JSON.parse(manifestText);
+        const committedName = typeof manifest.targetName === 'string'
+          && path.basename(manifest.targetName) === manifest.targetName
+          && RECORDING_EXTENSIONS.test(manifest.targetName)
+          ? manifest.targetName
+          : null;
+        if (manifest.state === 'ready-to-commit' && committedName) {
+          const committedTarget = path.join(this.settings.recordingsDir, committedName);
+          const finalizingPath = path.join(tempDir, `rp4-${match[1]}.lossless-finalizing.avi`);
+          let committed = await paths.pathExists(committedTarget);
+          if (!committed && await paths.pathExists(finalizingPath)) {
+            await ffmpeg.validateMedia(finalizingPath, {
+              expectedDurationMs: Number(manifest.durationMs) || 0,
+              expectedFrames: Number(manifest.frameCount) || undefined
+            });
+            await fs.rename(finalizingPath, committedTarget);
+            committed = true;
+          }
+          if (committed) {
+            await ffmpeg.validateMedia(committedTarget, {
+              expectedDurationMs: Number(manifest.durationMs) || 0,
+              expectedFrames: Number(manifest.frameCount) || undefined
+            });
+            const committedStats = await statFile(committedTarget);
+            if (!this.metadata.has(committedTarget)) {
+              await this.setMetadata(committedTarget, {
+                ...normalizeRecordingMeta(manifest.meta),
+                format: 'avi',
+                lossless: true,
+                status: 'complete',
+                outcome: 'recovered-committed',
+                recovered: true,
+                durationMs: Number(manifest.durationMs) || 0,
+                capturedFrames: Number(manifest.frameCount) || 0,
+                bytes: committedStats?.size || 0
+              });
+            }
+            await Promise.allSettled([
+              fs.rm(rawPath, { force: true }),
+              fs.rm(audioPath, { force: true }),
+              fs.rm(finalizingPath, { force: true })
+            ]);
+            await fs.rm(manifestPath, { force: true });
+            recovered.push(committedTarget);
+            continue;
+          }
+        }
         const width = boundedNumber(manifest.width, 2, 7680, { integer: true });
         const height = boundedNumber(manifest.height, 2, 4320, { integer: true });
         const fps = boundedNumber(manifest.fps, 1, 240) || 60;
@@ -710,6 +793,7 @@ class RecordingManager {
           rawPath,
           audioPath,
           manifestPath,
+          manifest,
           finalizingPath: path.join(tempDir, `rp4-${match[1]}.lossless-finalizing.avi`),
           width,
           height,
@@ -744,6 +828,38 @@ class RecordingManager {
       } catch (error) {
         failed.push({ filePath: rawPath, error: error?.message || String(error) });
       }
+    }
+
+    // Old builds could create raw/PCM files before their recovery manifest. Preserve
+    // strict app-named orphans in quarantine instead of silently deleting user data.
+    const orphanIds = new Set(entries.map((entry) => {
+      const match = new RegExp(`^rp4-(${UUID_PATTERN})\\.lossless\\.(?:raw|pcm)$`, 'i').exec(entry.name);
+      return match?.[1] || null;
+    }).filter(Boolean));
+    for (const orphanId of orphanIds) {
+      const orphanManifest = path.join(tempDir, `rp4-${orphanId}.lossless.json`);
+      if (await paths.pathExists(orphanManifest)) continue;
+      const candidates = ['raw', 'pcm'].map((extension) => (
+        path.join(tempDir, `rp4-${orphanId}.lossless.${extension}`)
+      ));
+      const existing = [];
+      for (const candidate of candidates) {
+        const stats = await statFile(candidate);
+        if (stats && !(maxAgeMs > 0 && Date.now() - stats.mtimeMs < maxAgeMs)) existing.push(candidate);
+      }
+      if (!existing.length) continue;
+      const quarantine = path.join(tempDir, 'recovery-quarantine');
+      await fs.mkdir(quarantine, { recursive: true });
+      for (const candidate of existing) {
+        const target = path.join(quarantine, path.basename(candidate));
+        await this.moveFile(candidate, target).catch((error) => {
+          failed.push({ filePath: candidate, error: error?.message || String(error) });
+        });
+      }
+      failed.push({
+        filePath: quarantine,
+        error: '복구 정보가 없는 무압축 원본을 recovery-quarantine 폴더에 보존했습니다.'
+      });
     }
 
     return { removed, recovered, failed };
@@ -899,21 +1015,25 @@ class RecordingManager {
     const finalizingPath = path.join(tempDir, `rp4-${sessionId}.lossless-finalizing.avi`);
     let rawHandle = null;
     let audioHandle = null;
+    const manifest = {
+      version: 2,
+      state: 'recording',
+      sessionId,
+      baseName,
+      targetName: null,
+      width,
+      height,
+      fps,
+      audioSampleRate,
+      audioChannels,
+      startedAt: new Date().toISOString(),
+      meta: safeMeta
+    };
     try {
+      // The journal is the recovery authority and must exist before raw data can.
+      await fs.writeFile(manifestPath, JSON.stringify(manifest), { encoding: 'utf8', flag: 'wx' });
       rawHandle = await fs.open(rawPath, 'wx');
       audioHandle = await fs.open(audioPath, 'wx');
-      await fs.writeFile(manifestPath, JSON.stringify({
-        version: 1,
-        sessionId,
-        baseName,
-        width,
-        height,
-        fps,
-        audioSampleRate,
-        audioChannels,
-        startedAt: new Date().toISOString(),
-        meta: safeMeta
-      }), { encoding: 'utf8', flag: 'wx' });
     } catch (error) {
       await rawHandle?.close().catch(() => {});
       await audioHandle?.close().catch(() => {});
@@ -933,6 +1053,7 @@ class RecordingManager {
       rawPath,
       audioPath,
       manifestPath,
+      manifest,
       finalizingPath,
       rawHandle,
       audioHandle,
@@ -1133,7 +1254,13 @@ class RecordingManager {
       ? Math.round(Number(payload.durationMs))
       : Math.max(1, Date.now() - session.startedAtMs);
     const payloadMeta = normalizeRecordingMeta(payload.meta);
-    const effectiveFps = Math.max(0.1, Math.min(240, session.frameCount * 1000 / durationMs));
+    const frameSpanMs = session.frameCount > 1
+      && session.firstFrameTimestampUs != null && session.lastFrameTimestampUs != null
+      ? Math.max(0, (session.lastFrameTimestampUs - session.firstFrameTimestampUs) / 1000)
+      : 0;
+    const effectiveFps = Math.max(0.1, Math.min(240, frameSpanMs > 0
+      ? (session.frameCount - 1) * 1000 / frameSpanMs
+      : session.frameCount * 1000 / durationMs));
     const droppedFrames = Math.max(0, Number(payloadMeta.droppedFrames) || 0);
     const inputFrames = Math.max(
       session.frameCount + droppedFrames,
@@ -1151,7 +1278,7 @@ class RecordingManager {
         ? payload.failureReason.trim().slice(0, 500)
         : null
     );
-    const failureReason = explicitFailure || performanceWarning;
+    const failureReason = explicitFailure;
     const outputBase = failureReason ? `${session.baseName}_partial` : session.baseName;
     const target = await uniquePath(session.recordingsDir, outputBase, 'avi');
     const finalizingPath = session.finalizingPath || path.join(
@@ -1205,6 +1332,15 @@ class RecordingManager {
         requireAudio: hasAudio
       });
       validated = true;
+      const journal = {
+        ...(session.manifest || {}),
+        version: 2,
+        state: 'ready-to-commit',
+        targetName: path.basename(target),
+        durationMs,
+        frameCount: session.frameCount
+      };
+      await writeJsonAtomic(session.manifestPath, journal);
       // The staging directory is a child of recordingsDir, so this rename is a
       // same-volume atomic commit. The final name never contains a partial AVI.
       await fs.rename(finalizingPath, target);
@@ -1216,13 +1352,13 @@ class RecordingManager {
       );
     }
 
-    // Remove the recovery trigger first. If the app dies after the atomic rename,
-    // a valid but metadata-less AVI is shown as unverified instead of being duplicated.
-    await fs.rm(session.manifestPath, { force: true }).catch(() => {});
+    // The journal is removed last. A crash after commit can therefore identify the
+    // committed target and clean raw artifacts without creating a duplicate recording.
     await Promise.allSettled([
       fs.rm(session.rawPath, { force: true }),
       fs.rm(session.audioPath, { force: true })
     ]);
+    await fs.rm(session.manifestPath, { force: true }).catch(() => {});
     const stats = await statFile(target);
     const meta = {
       ...session.meta,
@@ -1247,6 +1383,8 @@ class RecordingManager {
       firstFrameTimestampUs: session.firstFrameTimestampUs,
       lastFrameTimestampUs: session.lastFrameTimestampUs,
       performanceDegraded,
+      qualityStatus: performanceDegraded ? 'degraded' : 'normal',
+      integrityStatus: failureReason ? 'partial' : 'complete',
       performanceWarning,
       audioPadded,
       stoppedAt: new Date().toISOString(),
@@ -1418,7 +1556,9 @@ class RecordingManager {
             ratio
           })
         });
-        await ffmpeg.validateMedia(combinedPath);
+        await ffmpeg.validateMedia(combinedPath, {
+          expectedDurationMs: Number(payload.durationMs) || Number(session.meta.durationMs) || 0
+        });
         session.tempPath = combinedPath;
         session.segmentPaths = [combinedPath];
         await Promise.allSettled(sourceSegments.map((filePath) => fs.rm(filePath, { force: true })));
@@ -1538,7 +1678,7 @@ class RecordingManager {
               jobId: `clip:${session.baseName}`,
               onProgress: progress
             });
-            await ffmpeg.validateMedia(target);
+            await ffmpeg.validateMedia(target, { expectedDurationMs: recentDurationMs });
           } catch {
             await fs.rm(target, { force: true }).catch(() => {});
             await ffmpeg.transcodeToMp4(session.tempPath, target, {
@@ -1579,7 +1719,7 @@ class RecordingManager {
             onProgress: progress
           });
         }
-        await ffmpeg.validateMedia(target);
+        await ffmpeg.validateMedia(target, { expectedDurationMs: recentDurationMs });
         await fs.rm(session.tempPath, { force: true });
         return { filePath: target, format: targetFormat, converted: true, optimizable: false };
       } catch (error) {
@@ -1615,7 +1755,7 @@ class RecordingManager {
         } else {
           await ffmpeg.remux(session.tempPath, target, remuxOptions);
         }
-        await ffmpeg.validateMedia(target);
+        await ffmpeg.validateMedia(target, { expectedDurationMs: durationMs });
         await fs.rm(session.tempPath, { force: true });
         return { filePath: target, format: 'mp4', converted: true, optimizable: false };
       } catch (error) {
@@ -1636,7 +1776,7 @@ class RecordingManager {
           jobId: `convert:${session.baseName}`,
           onProgress: (ratio) => this.emit('recording:convert-progress', { phase: 'transcode', ratio })
         });
-        await ffmpeg.validateMedia(target);
+        await ffmpeg.validateMedia(target, { expectedDurationMs: durationMs });
         await fs.rm(session.tempPath, { force: true });
         return { filePath: target, format: 'mp4', converted: true, optimizable: false };
       } catch (error) {
@@ -1692,6 +1832,9 @@ class RecordingManager {
    * runs, so the user never waits for it.
    */
   async reconcileRecordingsDir() {
+    if (this.reconciling) return { restored: 0, removed: 0, preservedCorrupt: 0, failed: [] };
+    this.reconciling = true;
+    try {
     const recordingsDir = this.settings.recordingsDir;
     await paths.ensureRecordingDirs(recordingsDir);
     const entries = await fs.readdir(recordingsDir, { withFileTypes: true }).catch(() => []);
@@ -1765,6 +1908,9 @@ class RecordingManager {
     }
 
     return result;
+    } finally {
+      this.reconciling = false;
+    }
   }
 
   enqueueOptimize(filePath, durationMs) {
@@ -1955,6 +2101,10 @@ class RecordingManager {
             continue;
           }
           this.emit('recording:optimize', { filePath: job.filePath, state: 'start' });
+          const sourceContract = await ffmpeg.validateMedia(job.filePath, {
+            expectedDurationMs: job.durationMs,
+            jobId: `optimize:${job.filePath}`
+          }) || {};
           await ffmpeg.remux(job.filePath, optimized, {
             jobId: `optimize:${job.filePath}`,
             totalDurationMs: job.durationMs
@@ -1964,10 +2114,15 @@ class RecordingManager {
           // Only swap when the result looks sane, so a truncated remux cannot replace a
           // good recording.
           if (after && before && after.size > before.size * 0.5) {
-            await ffmpeg.validateMedia(optimized);
+            const expectedDurationMs = sourceContract.durationMs || job.durationMs;
+            const expectedFrames = sourceContract.frameCount || 0;
+            await ffmpeg.validateMedia(optimized, { expectedDurationMs, expectedFrames });
             await replaceFileSafely(job.filePath, optimized, {
               move: this.moveFile,
-              validate: (filePath) => ffmpeg.validateMedia(filePath)
+              validate: (filePath) => ffmpeg.validateMedia(filePath, {
+                expectedDurationMs,
+                expectedFrames
+              })
             });
             const meta = this.metadata.get(job.filePath);
             if (meta) await this.setMetadata(job.filePath, { ...meta, optimized: true, bytes: after.size });
@@ -2009,10 +2164,12 @@ class RecordingManager {
 
   toDto(filePath, stats, meta = {}) {
     const hasMetadata = meta && typeof meta === 'object' && Object.keys(meta).length > 0;
+    const managed = hasMetadata;
     const extension = path.extname(filePath).slice(1).toLowerCase();
     const defaultStatus = !hasMetadata && extension === 'avi' ? 'unverified' : 'complete';
     return {
       filePath,
+      managed,
       name: path.basename(filePath),
       size: stats?.size || 0,
       createdAt: (stats?.birthtime || stats?.mtime || new Date()).toISOString(),
@@ -2028,11 +2185,15 @@ class RecordingManager {
       sourceName: meta.sourceName || null,
       modeLabel: meta.modeLabel || null,
       format: meta.format || extension,
-      status: meta.status || defaultStatus,
+      status: managed ? (meta.status || defaultStatus) : 'unmanaged',
       partial: Boolean(meta.partial),
       failureReason: meta.failureReason || null,
-      outcome: meta.outcome || (defaultStatus === 'unverified' ? 'unverified' : 'exact'),
+      outcome: managed
+        ? (meta.outcome || (defaultStatus === 'unverified' ? 'unverified' : 'exact'))
+        : 'unmanaged',
       performanceWarning: meta.performanceWarning || null,
+      qualityStatus: meta.qualityStatus || (meta.performanceDegraded ? 'degraded' : 'normal'),
+      integrityStatus: meta.integrityStatus || (meta.partial ? 'partial' : 'complete'),
       conversionError: meta.conversionError || null,
       recovered: Boolean(meta.recovered)
     };
@@ -2054,18 +2215,18 @@ class RecordingManager {
       .filter((entry) => !OPTIMIZING_FILE_PATTERN.test(entry.name))
       .map((entry) => path.join(recordingsDir, entry.name));
 
-    const recordings = await Promise.all(files.map(async (filePath) => {
+    const recordings = await mapWithConcurrency(files, 12, async (filePath) => {
       const stats = await statFile(filePath);
       return this.toDto(filePath, stats, this.metadata.get(filePath) || {});
-    }));
+    });
 
     // Drop index entries whose files are gone so the index cannot grow without bound.
-    const known = new Set(files);
+    const known = new Set(files.map(canonicalPathKey));
     let pruned = false;
     for (const filePath of [...this.metadata.keys()]) {
       const sameDirectory = path.dirname(path.resolve(filePath)).toLowerCase()
         === path.resolve(recordingsDir).toLowerCase();
-      if (!known.has(filePath) && sameDirectory) {
+      if (!known.has(canonicalPathKey(filePath)) && sameDirectory) {
         this.metadata.delete(filePath);
         pruned = true;
       }
@@ -2167,8 +2328,10 @@ class RecordingManager {
     if (path.dirname(target).toLowerCase() !== recordingsDir.toLowerCase()
       || !RECORDING_EXTENSIONS.test(target)) return false;
     if (!(await paths.pathExists(target))) return false;
+    const targetMeta = this.metadata.get(target);
+    if (!targetMeta) return false;
 
-    const previousMeta = this.metadata.get(target);
+    const previousMeta = targetMeta;
     let deleted = false;
     this.deletingFiles.add(target);
     try {
@@ -2249,6 +2412,11 @@ class RecordingManager {
 
   /** Closes every open handle. Awaited during shutdown so nothing is left dangling. */
   async closeAllSessions() {
+    if (this.shutdownAbandoned) {
+      // Process exit releases descriptors. Awaiting a wedged disk/encoder chain here
+      // would defeat the hard shutdown deadline; journals/temp files recover next boot.
+      return 0;
+    }
     const losslessIds = [...this.losslessSessions.keys()];
     await Promise.allSettled(losslessIds.map((sessionId) => this.stopLossless({
       sessionId,
@@ -2306,6 +2474,19 @@ class RecordingManager {
       if (result.status === 'fulfilled' && result.value) saved.push(result.value);
     }
     return saved;
+  }
+
+  abandonForRecovery(failureReason = '앱 종료 제한 시간 초과') {
+    this.shutdownAbandoned = true;
+    for (const session of this.sessions.values()) {
+      session.acceptingWrites = false;
+      session.failed = session.failed || failureReason;
+    }
+    for (const session of this.losslessSessions.values()) {
+      session.acceptingWrites = false;
+      session.failed = session.failed || failureReason;
+    }
+    return this.sessions.size + this.losslessSessions.size + this.finalizing.size;
   }
 }
 

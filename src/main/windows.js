@@ -144,6 +144,7 @@ async function drainRecordings(win, recordingManager, {
   clipShutdownMode = 'discard',
   timeoutFailureReason = null
 } = {}) {
+  const hardDeadline = Date.now() + Math.max(1, maxTotalMs);
   const requestId = crypto.randomUUID();
   let rendererReady = !win || win.isDestroyed();
   let rendererAccepted = rendererReady;
@@ -202,7 +203,7 @@ async function drainRecordings(win, recordingManager, {
       ipcMain.on('app:shutdown-ready', onReady);
       win.webContents.once('destroyed', onDestroyed);
       armInactivityTimer();
-      hardTimer = setTimeout(() => finish(false), maxTotalMs);
+      hardTimer = setTimeout(() => finish(false), Math.max(1, hardDeadline - Date.now()));
       try {
         win.webContents.send('app:finalize-recordings', { requestId, clipShutdownMode });
       } catch {
@@ -224,26 +225,44 @@ async function drainRecordings(win, recordingManager, {
     }
   }
 
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Math.min(Date.now() + timeoutMs, hardDeadline);
   while (recordingManager.hasActiveSessions() && Date.now() < deadline) {
     await sleep(150);
   }
 
-  // Safety net for anything the renderer could not finish on its own. Once finalization
-  // starts it is intentionally not timed out: cancelling ffmpeg here could corrupt the
-  // only copy of the recording.
+  // The hard deadline covers renderer stop, write chains and finalization. On timeout we
+  // leave app-owned temp files/journals intact for startup recovery instead of hanging.
   const timedOut = !rendererReady || recordingManager.hasActiveSessions();
-  if (timedOut) await ffmpeg.cancelAll({ timeoutMs: 5000 }).catch(() => false);
-  const saved = await recordingManager.finalizeAllSessions({
-    failureReason: timedOut
-      ? timeoutFailureReason || '앱 종료 대기 시간이 지나 부분 저장했습니다.'
-      : null
-  });
+  let saved = [];
+  let finalizationTimedOut = timedOut;
+  if (!timedOut) {
+    let timer;
+    const remainingMs = Math.max(0, hardDeadline - Date.now());
+    const result = await Promise.race([
+      recordingManager.finalizeAllSessions({ failureReason: null })
+        .then((value) => ({ completed: true, value })),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ completed: false, value: [] }), remainingMs);
+      })
+    ]);
+    clearTimeout(timer);
+    saved = result.value;
+    finalizationTimedOut = !result.completed;
+  }
+  if (finalizationTimedOut) {
+    const cancelBudgetMs = Math.max(0, Math.min(5000, hardDeadline - Date.now()));
+    if (cancelBudgetMs > 0) {
+      await ffmpeg.cancelAll({ timeoutMs: cancelBudgetMs }).catch(() => false);
+    }
+    recordingManager.abandonForRecovery?.(
+      timeoutFailureReason || '앱 종료 제한 시간이 지나 다음 실행에서 복구합니다.'
+    );
+  }
   return {
     drained: !recordingManager.hasPendingRecordings(),
     rendererReady,
     rendererAccepted,
-    timedOut,
+    timedOut: finalizationTimedOut,
     shutdownFailed: false,
     saved
   };

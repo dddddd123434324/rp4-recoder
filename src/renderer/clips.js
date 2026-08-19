@@ -138,8 +138,13 @@
 
   async function stopEpoch(epoch) {
     if (!epoch || epoch.recorder.state === 'inactive') return;
-    const stopped = new Promise((resolve) => {
-      epoch.recorder.addEventListener('stop', resolve, { once: true });
+    let timer;
+    const stopped = new Promise((resolve, reject) => {
+      epoch.recorder.addEventListener('stop', () => {
+        clearTimeout(timer);
+        resolve();
+      }, { once: true });
+      timer = setTimeout(() => reject(new Error('클립 녹화기 종료 응답 시간이 초과되었습니다.')), 10000);
     });
     epoch.recorder.stop();
     await stopped;
@@ -353,6 +358,7 @@
     let snapshotRemainingBytes = 0;
     let wasTrimmedForSize;
     let pausedForSnapshot = false;
+    let snapshotCommitted = false;
 
     try {
       snapshot = await enqueueOperation(session, () => captureSnapshot(session, requestedAt));
@@ -412,16 +418,9 @@
         const blobs = [epoch.initChunk, ...epoch.chunks.map((entry) => entry.blob)].filter(Boolean);
         for (const blob of blobs) {
           const result = await util.writeBlobInSlices(clipSession.sessionId, blob, { segmentIndex });
-          snapshotRemainingBytes -= blob.size;
-          session.pendingSnapshotBytes = Math.max(0, session.pendingSnapshotBytes - blob.size);
           if (result?.warning) throw new Error(result.warning);
         }
-        epoch.initChunk = null;
-        for (const entry of epoch.chunks) entry.blob = null;
-        epoch.chunks.length = 0;
-        pruneBuffer(session);
       }
-      snapshot.epochs.length = 0;
       const saved = await window.rp4.stopRecording({
         sessionId: clipSession.sessionId,
         durationMs: estimatedMs,
@@ -429,6 +428,7 @@
       });
       clipSession = null;
       if (!saved) throw new Error('클립 저장 결과가 없습니다.');
+      snapshotCommitted = true;
 
       await RP4.files.render();
       if (saved.outcome === 'partial' || saved.status === 'partial') {
@@ -465,6 +465,7 @@
         }).catch(() => null);
       }
       if (partial) {
+        snapshotCommitted = true;
         await RP4.files.render();
         RP4.ui.setStatus('클립 부분 저장됨', partial.name, 'warn');
         RP4.ui.showToast(`클립 일부만 저장했습니다: ${partial.name}`);
@@ -479,13 +480,20 @@
         error: partial ? null : error?.message || '클립 파일 저장을 완료하지 못했습니다.'
       };
     } finally {
-      if (snapshot) {
+      if (snapshot && snapshotCommitted) {
         for (const epoch of snapshot.epochs) {
           epoch.initChunk = null;
           for (const entry of epoch.chunks) entry.blob = null;
           epoch.chunks.length = 0;
         }
         snapshot.epochs.length = 0;
+      } else if (snapshot?.epochs?.length && state.clip === session && !session.stopping) {
+        // A failed save must not consume the pre-click rolling window. Ownership of the
+        // intact blobs returns to the active buffer so the user can retry immediately.
+        session.completedEpochs = [...snapshot.epochs, ...session.completedEpochs]
+          .sort((a, b) => a.startedAt - b.startedAt);
+        snapshot.epochs = [];
+        pruneCompletedEpochs(session);
       }
       session.pendingSnapshotBytes = Math.max(0, session.pendingSnapshotBytes - snapshotRemainingBytes);
       if (pausedForSnapshot && session.currentEpoch?.recorder?.state === 'paused') {

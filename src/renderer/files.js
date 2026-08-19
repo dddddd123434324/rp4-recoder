@@ -105,6 +105,7 @@
     if (recording.status === 'invalid') badges.push(['검증 실패', 'warn']);
     if (recording.outcome === 'original-preserved') badges.push(['원본 보존', 'warn']);
     if (recording.recovered || recording.outcome === 'recovered') badges.push(['복구됨', 'info']);
+    if (recording.managed === false) badges.push(['외부 파일 · 읽기 전용', 'info']);
     if (badges.length > 0) {
       const badgeRow = document.createElement('div');
       badgeRow.className = 'recording-badges';
@@ -157,7 +158,8 @@
         await render();
       }
     });
-    actions.append(open, play, remove);
+    actions.append(open, play);
+    if (recording.managed !== false) actions.append(remove);
 
     item.append(thumb, info, actions);
     return item;

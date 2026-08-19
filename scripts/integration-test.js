@@ -978,8 +978,9 @@ async function run() {
   const unknownAvi = path.join(RECORDINGS, 'external-unindexed.avi');
   await fsp.copyFile(losslessSaved.filePath, unknownAvi);
   const unknownListed = (await recordings.list()).find((entry) => entry.filePath === unknownAvi);
-  check('metadata-less AVI is listed as unverified',
-    unknownListed?.status === 'unverified' && unknownListed?.outcome === 'unverified');
+  check('metadata-less external AVI is listed as unmanaged read-only media',
+    unknownListed?.managed === false
+      && unknownListed?.status === 'unmanaged' && unknownListed?.outcome === 'unmanaged');
   await fsp.rm(unknownAvi, { force: true });
 
   const staleFinalizingId = crypto.randomUUID();

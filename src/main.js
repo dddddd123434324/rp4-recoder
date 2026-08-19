@@ -210,7 +210,6 @@ async function bootstrap() {
 
     recordings = new RecordingManager({ settings, emit: send });
     const indexRecovery = await recordings.loadIndex();
-    const reconciliation = await recordings.reconcileRecordingsDir();
 
     hotkeys = new HotkeyManager({
       onTrigger: (action) => send('hotkey:trigger', action)
@@ -267,11 +266,12 @@ async function bootstrap() {
 
     hotkeys.register(settings.value.hotkeys);
 
-    // Recover anything a previous crash left behind, and tell the user if their
-    // configured folder was not usable.
-    const sweep = await recordings.sweepTempDir();
-    void recordings.resumePendingMediaJobs();
     await rendererLoaded;
+    // The window becomes interactive before media probing/recovery. These jobs can
+    // decode large files and must never hold the first paint hostage.
+    const sweep = await recordings.sweepTempDir();
+    const reconciliation = await recordings.reconcileRecordingsDir();
+    void recordings.resumePendingMediaJobs();
     {
       if (loaded.settingsRecovered) {
         send('app:notice', {
