@@ -88,6 +88,136 @@
     return options;
   }
 
+  function localizedCaptureStartError(error) {
+    const name = String(error?.name || '');
+    const message = String(error?.message || '').toLowerCase();
+    if (name === 'NotAllowedError' || message.includes('permission')) {
+      return RP4.i18n.translate('화면 캡처 권한이 없어 녹화를 시작할 수 없습니다.');
+    }
+    if (name === 'OverconstrainedError' || name === 'ConstraintNotSatisfiedError') {
+      return RP4.i18n.translate('선택한 해상도나 FPS를 이 캡처 소스에서 사용할 수 없습니다.');
+    }
+    if (name === 'NotReadableError' || name === 'AbortError'
+      || message.includes('could not start video source')
+      || message.includes('failed to start video source')) {
+      return RP4.i18n.translate('선택한 창의 캡처를 시작할 수 없습니다. 창을 화면에 띄운 뒤 다시 선택해 주세요.');
+    }
+    return RP4.i18n.translate('캡처 장치를 시작하지 못했습니다. 다른 소스를 선택해 주세요.');
+  }
+
+  async function startLosslessPipelines(context) {
+    if (typeof window.MediaStreamTrackProcessor !== 'function'
+      || typeof window.VideoFrame !== 'function') {
+      throw new Error('이 시스템은 원본 프레임 무압축 녹화를 지원하지 않습니다.');
+    }
+    const sourceTrack = context.stream.getVideoTracks()[0];
+    if (!sourceTrack) throw new Error('무압축 녹화 영상 트랙이 없습니다.');
+    const rawTrack = sourceTrack.clone();
+    const processor = new window.MediaStreamTrackProcessor({ track: rawTrack });
+    const reader = processor.readable.getReader();
+    context.losslessTrack = rawTrack;
+    context.losslessReader = reader;
+    context.losslessAudioWriteQueue = Promise.resolve();
+
+    const audioTracks = context.stream.getAudioTracks();
+    if (audioTracks.length > 0) {
+      const audioStream = new MediaStream(audioTracks.map((track) => track.clone()));
+      const audioContext = context.audioContext || new AudioContext({
+        sampleRate: context.losslessAudioSampleRate
+      });
+      if (audioContext.state === 'suspended') await audioContext.resume();
+      if (audioContext.state !== 'running') {
+        throw new Error('무압축 PCM 오디오 처리기를 시작할 수 없습니다.');
+      }
+      const channels = context.losslessAudioChannels;
+      const source = audioContext.createMediaStreamSource(audioStream);
+      const processor = audioContext.createScriptProcessor(4096, channels, channels);
+      const silentOutput = audioContext.createGain();
+      silentOutput.gain.value = 0;
+      source.connect(processor);
+      processor.connect(silentOutput).connect(audioContext.destination);
+
+      context.losslessAudioStream = audioStream;
+      context.losslessPcmContext = audioContext;
+      context.losslessOwnsPcmContext = audioContext !== context.audioContext;
+      context.losslessPcmSource = source;
+      context.losslessPcmProcessor = processor;
+      context.losslessPcmSilentOutput = silentOutput;
+      processor.onaudioprocess = (event) => {
+        if (context.stopping || context.isPaused) return;
+        const input = event.inputBuffer;
+        const frameCount = input.length;
+        const channelData = Array.from({ length: channels }, (_unused, channel) => (
+          input.getChannelData(Math.min(channel, input.numberOfChannels - 1))
+        ));
+        const buffer = new ArrayBuffer(frameCount * channels * 2);
+        const view = new DataView(buffer);
+        let offset = 0;
+        for (let frame = 0; frame < frameCount; frame += 1) {
+          for (let channel = 0; channel < channels; channel += 1) {
+            const sample = Math.max(-1, Math.min(1, channelData[channel][frame]));
+            view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+            offset += 2;
+          }
+        }
+        context.losslessAudioWriteQueue = context.losslessAudioWriteQueue.then(async () => {
+          const result = await window.rp4.writeLosslessAudio({
+            sessionId: context.sessionId,
+            buffer
+          });
+          if (result?.warning) throw new Error(result.warning);
+        }).catch((error) => {
+          failRecording(context, error);
+        });
+      };
+    }
+
+    context.losslessPumpPromise = (async () => {
+      while (!context.stopping) {
+        const { value: frame, done } = await reader.read();
+        if (done || !frame) break;
+        try {
+          if (context.isPaused) continue;
+          const width = frame.displayWidth || frame.codedWidth;
+          const height = frame.displayHeight || frame.codedHeight;
+          if (width !== context.output.width || height !== context.output.height) {
+            throw new Error(`무압축 프레임 크기가 변경되었습니다. (${width}x${height})`);
+          }
+          const buffer = new ArrayBuffer(width * height * 4);
+          await frame.copyTo(new Uint8Array(buffer), {
+            format: 'BGRA',
+            layout: [{ offset: 0, stride: width * 4 }]
+          });
+          const result = await window.rp4.writeLosslessFrame({
+            sessionId: context.sessionId,
+            buffer
+          });
+          context.losslessFrameCount = Number(result?.frames) || context.losslessFrameCount + 1;
+          if (result?.warning) throw new Error(result.warning);
+        } finally {
+          frame.close();
+        }
+      }
+    })().catch((error) => {
+      if (!context.stopping) failRecording(context, error);
+    });
+  }
+
+  async function stopLosslessPipelines(context) {
+    if (context.losslessPcmProcessor) context.losslessPcmProcessor.onaudioprocess = null;
+    context.losslessPcmSource?.disconnect();
+    context.losslessPcmProcessor?.disconnect();
+    context.losslessPcmSilentOutput?.disconnect();
+    await context.losslessReader?.cancel().catch(() => {});
+    await context.losslessPumpPromise?.catch(() => {});
+    await context.losslessAudioWriteQueue?.catch(() => {});
+    context.losslessTrack?.stop();
+    util.stopStream(context.losslessAudioStream);
+    if (context.losslessOwnsPcmContext) {
+      await context.losslessPcmContext?.close().catch(() => {});
+    }
+  }
+
   /** Elapsed recording time with paused stretches excluded. */
   function elapsedMs(context = state.recording) {
     if (!context?.startedAt) return 0;
@@ -127,7 +257,9 @@
       sourceName: RP4.app.getSourceTitle(state.selectedSource),
       areaSelection: { ...state.areaSelection }
     };
-    const codec = RP4.capture.pickRecorderMime(profile.format);
+    const codec = profile.lossless
+      ? { mimeType: null, container: 'avi', codec: 'rawvideo', finish: 'direct' }
+      : RP4.capture.pickRecorderMime(profile.format);
     if (!codec) {
       RP4.lifecycle.finish(operationId);
       RP4.app.updateRecordingUi();
@@ -165,9 +297,21 @@
 
       RP4.capture.notifyAudioStatus(capture);
 
-      const recorder = new MediaRecorder(capture.stream, recorderOptions(profile, codec.mimeType));
-      const actualMimeType = recorder.mimeType || codec.mimeType;
-      session = await window.rp4.startRecording({
+      let recorder = null;
+      let actualMimeType = 'video/x-raw;format=bgra';
+      const acceleration = profile.lossless
+        ? { supported: true, powerEfficient: false }
+        : await RP4.capture.detectEncodingAcceleration(profile, codec.mimeType);
+      const losslessAudioTrack = profile.lossless ? capture.stream.getAudioTracks()[0] : null;
+      const losslessAudioSampleRate = Math.max(
+        8000,
+        Math.min(192000, Math.round(capture.audioContext?.sampleRate || 48000))
+      );
+      const losslessAudioChannels = Math.max(
+        1,
+        Math.min(2, Math.round(losslessAudioTrack?.getSettings().channelCount || 2))
+      );
+      const recordingMeta = {
         mode: sourceSnapshot.mode,
         modeLabel: sourceSnapshot.modeLabel,
         sourceName: sourceSnapshot.sourceName,
@@ -182,11 +326,26 @@
         requestedSystemAudio: capture.requestedSystemAudio,
         hasSystemAudio: capture.hasSystemAudio,
         requestedMic: capture.requestedMic,
-        hasMic: capture.hasMic
-      });
+        hasMic: capture.hasMic,
+        lossless: profile.lossless,
+        hardwareEncoding: acceleration.powerEfficient === true,
+        ...(profile.lossless ? {
+          audioSampleRate: losslessAudioSampleRate,
+          audioChannels: losslessAudioChannels
+        } : {})
+      };
+      if (profile.lossless) {
+        session = await window.rp4.startLosslessRecording(recordingMeta);
+      } else {
+        recorder = new MediaRecorder(capture.stream, recorderOptions(profile, codec.mimeType));
+        actualMimeType = recorder.mimeType || codec.mimeType;
+        recordingMeta.mimeType = actualMimeType;
+        session = await window.rp4.startRecording(recordingMeta);
+      }
 
       if (!RP4.lifecycle.isCurrent(operationId, 'starting-recording')) {
-        await window.rp4.stopRecording({ sessionId: session.sessionId }).catch(() => {});
+        const stop = profile.lossless ? window.rp4.stopLosslessRecording : window.rp4.stopRecording;
+        await stop({ sessionId: session.sessionId }).catch(() => {});
         capture.cleanup();
         return;
       }
@@ -195,6 +354,9 @@
         ...capture,
         operationId,
         recorder,
+        lossless: profile.lossless,
+        losslessAudioSampleRate,
+        losslessAudioChannels,
         sessionId: session.sessionId,
         codec,
         profile,
@@ -218,22 +380,27 @@
       state.pausedAt = 0;
       RP4.lifecycle.transition(operationId, 'recording');
 
-      recorder.addEventListener('dataavailable', (event) => {
-        if (event.data && event.data.size > 0) {
-          enqueueChunk(context, event.data, {
-            terminal: Boolean(context.failure || context.stopping || recorder.state === 'inactive')
-          });
-        }
-      });
-      recorder.addEventListener('error', (event) => {
-        failRecording(
-          context,
-          event.error || new Error('MediaRecorder가 녹화 중 실패했습니다.')
-        );
-      });
-      recorder.addEventListener('stop', () => {
-        void finalizeRecording(context);
-      }, { once: true });
+      if (context.lossless) {
+        await startLosslessPipelines(context);
+      } else {
+        recorder.addEventListener('dataavailable', (event) => {
+          if (event.data && event.data.size > 0) {
+            enqueueChunk(context, event.data, {
+              terminal: Boolean(context.failure || context.stopping || recorder.state === 'inactive')
+            });
+          }
+        });
+        recorder.addEventListener('error', (event) => {
+          failRecording(
+            context,
+            event.error || new Error('MediaRecorder가 녹화 중 실패했습니다.')
+          );
+        });
+        recorder.addEventListener('stop', () => {
+          void finalizeRecording(context);
+        }, { once: true });
+        recorder.start(CHUNK_INTERVAL_MS);
+      }
       for (const track of capture.stream.getTracks()) {
         track.addEventListener('ended', () => {
           if (!context.stopping) {
@@ -242,30 +409,43 @@
         }, { once: true });
       }
 
-      recorder.start(CHUNK_INTERVAL_MS);
       RP4.app.updateRecordingUi();
       RP4.app.startTimer();
 
-      const label = session.directToTarget
+      const label = profile.lossless
+        ? '원본 프레임을 무압축 AVI로 기록합니다.'
+        : session.directToTarget
         ? `${profile.format.toUpperCase()}로 직접 저장합니다.`
         : '저장 시 빠른 변환이 필요합니다.';
       RP4.ui.setStatus('녹화 중', `${sourceSnapshot.sourceName} · ${label}`, 'recording');
     } catch (error) {
       console.error(error);
+      const failedContext = state.recording?.operationId === operationId ? state.recording : null;
+      if (failedContext?.lossless) {
+        failedContext.stopping = true;
+        await stopLosslessPipelines(failedContext).catch(() => {});
+      }
       if (session?.sessionId) {
         try {
-          await window.rp4.stopRecording({ sessionId: session.sessionId });
+          if (profile.lossless) {
+            await window.rp4.stopLosslessRecording({
+              sessionId: session.sessionId,
+              failureReason: error?.message || '무압축 녹화를 시작하지 못했습니다.'
+            });
+          } else {
+            await window.rp4.stopRecording({ sessionId: session.sessionId });
+          }
         } catch {
           // ignore
         }
       }
       capture?.cleanup();
-      resetRecordingState(state.recording?.operationId === operationId ? state.recording : null);
+      resetRecordingState(failedContext);
       RP4.lifecycle.finish(operationId);
       RP4.app.updateRecordingUi();
       if (!state.shuttingDown) await startPreview();
       RP4.ui.setStatus('녹화 실패', '녹화를 시작하지 못했습니다.', 'warn');
-      RP4.ui.showToast(`녹화를 시작하지 못했습니다. ${error?.message || ''}`.trim());
+      RP4.ui.showToast(localizedCaptureStartError(error));
     }
   }
 
@@ -291,6 +471,10 @@
     console.error(error);
     RP4.ui.showToast(`녹화를 중지합니다. ${context.failure}`);
     RP4.ui.setStatus('녹화 오류', '데이터를 저장할 수 없어 부분 저장합니다.', 'warn');
+    if (context.lossless) {
+      void stopRecording();
+      return;
+    }
     try {
       if (context.recorder.state !== 'inactive') context.recorder.stop();
     } catch {
@@ -328,11 +512,60 @@
 
   async function stopRecording() {
     const context = state.recording;
-    if (!context || context.recorder.state === 'inactive' || context.stopping) return;
+    if (!context || context.stopping) return;
     context.stopping = true;
     RP4.lifecycle.transition(context.operationId, 'stopping-recording');
     RP4.ui.setStatus('저장 중', '녹화 파일을 마무리하고 있습니다.', 'warn');
+    if (context.lossless) {
+      await finalizeLosslessRecording(context);
+      return;
+    }
+    if (context.recorder.state === 'inactive') return;
     context.recorder.stop();
+  }
+
+  async function finalizeLosslessRecording(context) {
+    if (!context || context.finalized) return;
+    context.finalized = true;
+    const durationMs = elapsedMs(context);
+    try {
+      await stopLosslessPipelines(context);
+      const saved = await window.rp4.stopLosslessRecording({
+        sessionId: context.sessionId,
+        durationMs,
+        failureReason: context.failure,
+        meta: {
+          mode: context.sourceSnapshot.mode,
+          modeLabel: context.sourceSnapshot.modeLabel,
+          sourceName: context.sourceSnapshot.sourceName,
+          width: context.output.width,
+          height: context.output.height,
+          fps: context.profile.fps,
+          lossless: true,
+          hardwareEncoding: false
+        }
+      });
+      resetRecordingState(context);
+      RP4.app.updateRecordingUi();
+      await RP4.files.render();
+      if (!state.shuttingDown) await startPreview();
+      if (!saved) {
+        RP4.ui.setStatus('저장 취소', '기록된 데이터가 없습니다.', 'warn');
+      } else if (saved.status === 'partial') {
+        RP4.ui.setStatus('부분 저장됨', saved.name, 'warn');
+        RP4.ui.showToast(`무압축 녹화 일부만 저장했습니다: ${saved.name}`);
+      } else {
+        RP4.ui.setStatus('저장 완료', saved.name, 'ready');
+        RP4.ui.showToast(`무압축 무손실 저장 완료: ${saved.name}`);
+      }
+    } catch (error) {
+      console.error(error);
+      resetRecordingState(context);
+      RP4.app.updateRecordingUi();
+      if (!state.shuttingDown) await startPreview();
+      RP4.ui.setStatus('저장 실패', '무압축 AVI 저장을 완료하지 못했습니다.', 'warn');
+      RP4.ui.showToast(error?.message || '무압축 AVI 저장을 완료하지 못했습니다.');
+    }
   }
 
   /**
@@ -385,6 +618,28 @@
   function togglePause() {
     const session = state.recording;
     if (!session || !state.isRecording) return;
+    if (session.lossless) {
+      if (!session.isPaused) {
+        session.isPaused = true;
+        state.isPaused = true;
+        state.pausedAt = Date.now();
+        session.pausedAt = state.pausedAt;
+        RP4.app.updateRecordingUi();
+        RP4.ui.setStatus('일시정지', '녹화가 일시정지되었습니다.', 'warn');
+        return;
+      }
+      if (state.pausedAt) {
+        state.pausedAccumMs += Date.now() - state.pausedAt;
+        session.pausedAccumMs = state.pausedAccumMs;
+        state.pausedAt = 0;
+        session.pausedAt = 0;
+      }
+      state.isPaused = false;
+      session.isPaused = false;
+      RP4.app.updateRecordingUi();
+      RP4.ui.setStatus('녹화 중', `${RP4.app.getSourceTitle(state.selectedSource)} 녹화 중입니다.`, 'recording');
+      return;
+    }
     const recorder = session.recorder;
 
     if (recorder.state === 'recording') {

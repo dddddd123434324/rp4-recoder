@@ -43,13 +43,16 @@
 
   /** Reads the live form values. */
   function get() {
-    const [width, height] = String(els.resolutionSelect.value).split('x').map(Number);
+    const resolution = String(els.resolutionSelect.value);
+    const lossless = resolution === 'lossless';
+    const [width, height] = resolution.split('x').map(Number);
     return {
-      format: els.formatSelect.value === 'webm' ? 'webm' : 'mp4',
-      width: Number.isFinite(width) ? width : 1920,
-      height: Number.isFinite(height) ? height : 1080,
+      format: lossless ? 'avi' : els.formatSelect.value === 'webm' ? 'webm' : 'mp4',
+      width: lossless ? 7680 : Number.isFinite(width) ? width : 1920,
+      height: lossless ? 4320 : Number.isFinite(height) ? height : 1080,
+      lossless,
       fps: Number(els.fpsSelect.value) || 60,
-      bitrateMbps: Number(els.bitrateSelect.value) || 10,
+      bitrateMbps: lossless ? 0 : Number(els.bitrateSelect.value) || 10,
       encoderPreset: els.encoderPresetSelect.value,
       audioBitrateKbps: Number(els.audioBitrateSelect.value) || 192,
       micEnabled: els.micToggle.checked,
@@ -65,7 +68,7 @@
     const profile = get();
     return {
       format: profile.format,
-      resolution: `${profile.width}x${profile.height}`,
+      resolution: profile.lossless ? 'lossless' : `${profile.width}x${profile.height}`,
       fps: String(profile.fps),
       bitrate: String(profile.bitrateMbps),
       encoderPreset: profile.encoderPreset,
@@ -87,7 +90,7 @@
   }
 
   function applyToForm(profile = {}) {
-    setSelectValue(els.formatSelect, profile.format);
+    if (profile.format !== 'avi') setSelectValue(els.formatSelect, profile.format);
     setSelectValue(els.resolutionSelect, profile.resolution);
     setSelectValue(els.fpsSelect, profile.fps);
     setSelectValue(els.bitrateSelect, profile.bitrate);
@@ -182,6 +185,7 @@
     if (RP4.lifecycle.isBusy() && !allowWhileActive) return;
     setActivePreset(null);
     RP4.app.updatePreviewMeta();
+    RP4.app.updateLosslessUi();
     applyLiveGains();
     if (persist) scheduleProfileSave();
   }
@@ -200,6 +204,7 @@
     RP4.app.updateVolumeLabels();
     RP4.app.updatePreviewMeta();
     RP4.app.updateClipUi();
+    RP4.app.updateLosslessUi();
 
     if (persist) {
       const profile = getPersistable();
@@ -313,6 +318,9 @@
 
   function formatSummary(profile = {}) {
     const resolution = String(profile.resolution || '1920x1080');
+    if (resolution === 'lossless' || profile.format === 'avi') {
+      return `원본 · 무압축 무손실 · ${profile.fps || 60} FPS`;
+    }
     const [, height] = resolution.split('x');
     const label = height ? `${height}p` : resolution;
     return `${label} · ${profile.fps || 60} FPS · ${profile.bitrate || 10} Mbps`;

@@ -7,7 +7,7 @@ const crypto = require('node:crypto');
 const ffmpeg = require('./ffmpeg');
 const paths = require('./paths');
 
-const RECORDING_EXTENSIONS = /\.(webm|mp4|mkv)$/i;
+const RECORDING_EXTENSIONS = /\.(webm|mp4|mkv|avi)$/i;
 const INDEX_FILE_NAME = 'recordings-index.json';
 const MAX_INDEX_ENTRIES = 2000;
 const MAX_INDEX_BYTES = 16 * 1024 * 1024;
@@ -20,6 +20,8 @@ const MIN_RECOVERABLE_RECORDING_BYTES = 512;
 const MAX_IPC_CHUNK_BYTES = 64 * 1024 * 1024;
 const MAX_SESSION_QUEUED_BYTES = 128 * 1024 * 1024;
 const MAX_SCREENSHOT_BYTES = 256 * 1024 * 1024;
+const MIN_LOSSLESS_FREE_BYTES_TO_START = 2 * 1024 * 1024 * 1024;
+const MAX_LOSSLESS_FRAME_BYTES = 64 * 1024 * 1024;
 const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 const OPTIMIZING_FILE_PATTERN = new RegExp(
   `^(.*\\.mp4)\\.optimizing-(${UUID_PATTERN})\\.mp4$`,
@@ -133,6 +135,8 @@ function normalizeRecordingMeta(value = {}) {
     fps: [1, 480, false],
     bitrateMbps: [0.1, 1000, false],
     audioBitrateKbps: [8, 1024, false],
+    audioSampleRate: [8000, 192000, true],
+    audioChannels: [1, 8, true],
     durationMs: [0, 24 * 60 * 60 * 1000, true],
     trimRecentMs: [0, 24 * 60 * 60 * 1000, true],
     trimEndOffsetMs: [0, 24 * 60 * 60 * 1000, true]
@@ -144,6 +148,8 @@ function normalizeRecordingMeta(value = {}) {
   for (const key of [
     'clip',
     'segmentedClip',
+    'lossless',
+    'hardwareEncoding',
     'requestedSystemAudio',
     'hasSystemAudio',
     'requestedMic',
@@ -313,6 +319,7 @@ class RecordingManager {
     this.settings = settings;
     this.emit = emit || (() => {});
     this.sessions = new Map();
+    this.losslessSessions = new Map();
     this.finalizing = new Map();
     this.metadata = new Map();
     this.optimizeQueue = [];
@@ -332,15 +339,16 @@ class RecordingManager {
   }
 
   get activeCount() {
-    return this.sessions.size;
+    return this.sessions.size + this.losslessSessions.size;
   }
 
   hasActiveSessions() {
-    return this.sessions.size > 0;
+    return this.sessions.size > 0 || this.losslessSessions.size > 0;
   }
 
   hasPendingRecordings() {
     return this.startingWebContentsIds.size > 0 || this.sessions.size > 0
+      || this.losslessSessions.size > 0
       || this.finalizing.size > 0 || this.screenshotJobs.size > 0;
   }
 
@@ -536,12 +544,84 @@ class RecordingManager {
       removed += 1;
     }
 
+    const activeLosslessManifests = new Set(
+      [...this.losslessSessions.values()].map((session) => session.manifestPath)
+    );
+    for (const entry of entries) {
+      const match = /^rp4-([0-9a-f-]{36})\.lossless\.json$/i.exec(entry.name);
+      if (!match || !entry.isFile()) continue;
+      const manifestPath = path.join(tempDir, entry.name);
+      if (activeLosslessManifests.has(manifestPath)) continue;
+      const rawPath = path.join(tempDir, `rp4-${match[1]}.lossless.raw`);
+      const audioPath = path.join(tempDir, `rp4-${match[1]}.lossless.pcm`);
+      try {
+        const manifestStats = await statFile(manifestPath);
+        if (!manifestStats || manifestStats.size > 64 * 1024) {
+          throw new Error('무압축 복구 정보 크기가 올바르지 않습니다.');
+        }
+        const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+        const width = boundedNumber(manifest.width, 2, 7680, { integer: true });
+        const height = boundedNumber(manifest.height, 2, 4320, { integer: true });
+        const fps = boundedNumber(manifest.fps, 1, 240) || 60;
+        const audioSampleRate = boundedNumber(manifest.audioSampleRate, 8000, 192000, {
+          integer: true
+        }) || 48000;
+        const audioChannels = boundedNumber(manifest.audioChannels, 1, 8, { integer: true }) || 2;
+        const frameBytes = Number(width) * Number(height) * 4;
+        const rawStats = await statFile(rawPath);
+        const frameCount = Math.floor(Number(rawStats?.size || 0) / frameBytes);
+        if (!width || !height || width % 2 || height % 2
+          || frameBytes <= 0 || frameBytes > MAX_LOSSLESS_FRAME_BYTES || frameCount < 1) {
+          throw new Error('복구할 수 있는 완전한 무압축 프레임이 없습니다.');
+        }
+        await fs.truncate(rawPath, frameCount * frameBytes);
+        const recoverySession = {
+          sessionId: match[1],
+          recordingsDir: this.settings.recordingsDir,
+          baseName: `${timestamp()}_recovered_lossless_${match[1].slice(0, 8)}`,
+          rawPath,
+          audioPath,
+          manifestPath,
+          width,
+          height,
+          fps,
+          audioSampleRate,
+          audioChannels,
+          frameBytes,
+          frameCount,
+          rawBytes: frameCount * frameBytes,
+          audioBytes: (await statFile(audioPath))?.size || 0,
+          rawWriteChain: Promise.resolve(),
+          audioWriteChain: Promise.resolve(),
+          handlesClosed: true,
+          startedAtMs: Date.now() - frameCount / fps * 1000,
+          failed: null,
+          meta: {
+            ...normalizeRecordingMeta(manifest.meta),
+            modeLabel: '복구된 무압축 녹화',
+            format: 'avi',
+            recordedCodec: 'rawvideo',
+            lossless: true,
+            recovered: true
+          }
+        };
+        const saved = await this.finishLosslessSession(recoverySession, {
+          durationMs: Math.round(frameCount / fps * 1000),
+          failureReason: '비정상 종료 후 완전한 원본 프레임을 무압축 AVI로 복구했습니다.'
+        });
+        if (saved?.filePath) recovered.push(saved.filePath);
+      } catch (error) {
+        failed.push({ filePath: rawPath, error: error?.message || String(error) });
+      }
+    }
+
     return { removed, recovered, failed };
   }
 
   async start(meta = {}, { webContentsId } = {}) {
     const senderBusy = this.startingWebContentsIds.has(webContentsId)
       || [...this.sessions.values()].some((session) => session.webContentsId === webContentsId)
+      || [...this.losslessSessions.values()].some((session) => session.webContentsId === webContentsId)
       || [...this.finalizing.values()].some((entry) => entry.webContentsId === webContentsId);
     if (webContentsId != null && senderBusy) {
       throw new Error('이 창에는 이미 활성 녹화 세션이 있습니다.');
@@ -626,6 +706,361 @@ class RecordingManager {
       recordedContainer,
       recordedCodec,
       recordedAudioCodec
+    };
+  }
+
+  async startLossless(meta = {}, { webContentsId } = {}) {
+    const senderBusy = this.startingWebContentsIds.has(webContentsId)
+      || [...this.sessions.values()].some((session) => session.webContentsId === webContentsId)
+      || [...this.losslessSessions.values()].some((session) => session.webContentsId === webContentsId)
+      || [...this.finalizing.values()].some((entry) => entry.webContentsId === webContentsId);
+    if (webContentsId != null && senderBusy) {
+      throw new Error('이 창에는 이미 활성 녹화 세션이 있습니다.');
+    }
+    if (webContentsId != null) this.startingWebContentsIds.add(webContentsId);
+    try {
+      return await this.startLosslessReserved(meta, { webContentsId });
+    } finally {
+      if (webContentsId != null) this.startingWebContentsIds.delete(webContentsId);
+    }
+  }
+
+  async startLosslessReserved(meta = {}, { webContentsId } = {}) {
+    await paths.ensureRecordingDirs(this.settings.recordingsDir);
+    const recordingsDir = this.settings.recordingsDir;
+    const available = await freeBytes(recordingsDir);
+    if (available != null && available < MIN_LOSSLESS_FREE_BYTES_TO_START) {
+      throw new Error('무압축 녹화에는 최소 2GB 이상의 여유 공간이 필요합니다.');
+    }
+
+    const safeMeta = normalizeRecordingMeta({ ...meta, format: 'avi', lossless: true });
+    const width = boundedNumber(safeMeta.width, 2, 7680, { integer: true });
+    const height = boundedNumber(safeMeta.height, 2, 4320, { integer: true });
+    const fps = boundedNumber(safeMeta.fps, 1, 240) || 60;
+    const audioSampleRate = boundedNumber(safeMeta.audioSampleRate, 8000, 192000, {
+      integer: true
+    }) || 48000;
+    const audioChannels = boundedNumber(safeMeta.audioChannels, 1, 8, { integer: true }) || 2;
+    const frameBytes = Number(width) * Number(height) * 4;
+    if (!width || !height || width % 2 || height % 2
+      || frameBytes <= 0 || frameBytes > MAX_LOSSLESS_FRAME_BYTES) {
+      throw new Error('무압축 녹화 해상도가 안전한 프레임 한도를 초과했습니다.');
+    }
+
+    const sessionId = crypto.randomUUID();
+    const baseName = [
+      timestamp(),
+      sanitizeName(safeMeta.modeLabel || safeMeta.mode, 'lossless'),
+      sanitizeName(safeMeta.sourceName, 'source'),
+      sessionId.slice(0, 8)
+    ].join('_');
+    const tempDir = await paths.ensureOwnedTempDir(recordingsDir);
+    const rawPath = path.join(tempDir, `rp4-${sessionId}.lossless.raw`);
+    const audioPath = path.join(tempDir, `rp4-${sessionId}.lossless.pcm`);
+    const manifestPath = path.join(tempDir, `rp4-${sessionId}.lossless.json`);
+    let rawHandle = null;
+    let audioHandle = null;
+    try {
+      rawHandle = await fs.open(rawPath, 'wx');
+      audioHandle = await fs.open(audioPath, 'wx');
+      await fs.writeFile(manifestPath, JSON.stringify({
+        version: 1,
+        sessionId,
+        baseName,
+        width,
+        height,
+        fps,
+        audioSampleRate,
+        audioChannels,
+        startedAt: new Date().toISOString(),
+        meta: safeMeta
+      }), { encoding: 'utf8', flag: 'wx' });
+    } catch (error) {
+      await rawHandle?.close().catch(() => {});
+      await audioHandle?.close().catch(() => {});
+      await Promise.allSettled([
+        fs.rm(rawPath, { force: true }),
+        fs.rm(audioPath, { force: true }),
+        fs.rm(manifestPath, { force: true })
+      ]);
+      throw error;
+    }
+
+    this.losslessSessions.set(sessionId, {
+      sessionId,
+      webContentsId,
+      recordingsDir,
+      baseName,
+      rawPath,
+      audioPath,
+      manifestPath,
+      rawHandle,
+      audioHandle,
+      width,
+      height,
+      fps,
+      audioSampleRate,
+      audioChannels,
+      frameBytes,
+      frameCount: 0,
+      rawBytes: 0,
+      audioBytes: 0,
+      queuedBytes: 0,
+      rawWriteChain: Promise.resolve(),
+      audioWriteChain: Promise.resolve(),
+      acceptingWrites: true,
+      handlesClosed: false,
+      startedAtMs: Date.now(),
+      failed: null,
+      lastSpaceCheckBytes: 0,
+      diskCheckUnavailableWarned: available == null,
+      meta: {
+        ...safeMeta,
+        format: 'avi',
+        recordedContainer: 'avi',
+        recordedCodec: 'rawvideo',
+        lossless: true,
+        startedAt: new Date().toISOString()
+      }
+    });
+
+    return { sessionId, format: 'avi', recordedCodec: 'rawvideo', frameBytes };
+  }
+
+  getOwnedLosslessSession(sessionId, webContentsId) {
+    const session = this.losslessSessions.get(sessionId);
+    if (!session) throw new Error('무압축 녹화 세션을 찾을 수 없습니다.');
+    if (session.webContentsId != null && webContentsId != null
+      && session.webContentsId !== webContentsId) {
+      throw new Error('무압축 녹화 세션에 접근할 수 없습니다.');
+    }
+    if (!session.acceptingWrites) throw new Error('무압축 녹화 세션이 이미 종료 중입니다.');
+    return session;
+  }
+
+  writeLosslessFrame(payload = {}, { webContentsId } = {}) {
+    let session;
+    let frame;
+    try {
+      session = this.getOwnedLosslessSession(payload.sessionId, webContentsId);
+      frame = toBoundedBuffer(payload.buffer, MAX_LOSSLESS_FRAME_BYTES);
+      if (frame.length !== session.frameBytes) {
+        throw new Error('무압축 프레임 크기가 녹화 해상도와 일치하지 않습니다.');
+      }
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.enqueueLosslessWrite(session, frame, { audio: false });
+  }
+
+  writeLosslessAudio(payload = {}, { webContentsId } = {}) {
+    let session;
+    let chunk;
+    try {
+      session = this.getOwnedLosslessSession(payload.sessionId, webContentsId);
+      chunk = toBoundedBuffer(payload.buffer, MAX_IPC_CHUNK_BYTES);
+      if (chunk.length % (session.audioChannels * 2) !== 0) {
+        throw new Error('무압축 PCM 오디오 블록 크기가 채널 구성과 일치하지 않습니다.');
+      }
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.enqueueLosslessWrite(session, chunk, { audio: true });
+  }
+
+  enqueueLosslessWrite(session, chunk, { audio }) {
+    if (session.queuedBytes + chunk.length > this.maxSessionQueuedBytes) {
+      session.failed = '무압축 녹화 쓰기 대기열이 허용 한도를 초과했습니다.';
+      return Promise.reject(new Error(session.failed));
+    }
+    session.queuedBytes += chunk.length;
+    const chainName = audio ? 'audioWriteChain' : 'rawWriteChain';
+    const handle = audio ? session.audioHandle : session.rawHandle;
+    const task = async () => {
+      if (session.failed) throw new Error(session.failed);
+      let offset = 0;
+      while (offset < chunk.length) {
+        const { bytesWritten } = await handle.write(chunk, offset, chunk.length - offset);
+        if (!Number.isFinite(bytesWritten) || bytesWritten <= 0) {
+          throw new Error('무압축 녹화 파일 쓰기가 진행되지 않았습니다.');
+        }
+        offset += bytesWritten;
+      }
+      if (audio) session.audioBytes += chunk.length;
+      else {
+        session.rawBytes += chunk.length;
+        session.frameCount += 1;
+      }
+
+      const totalBytes = session.rawBytes + session.audioBytes;
+      if (totalBytes - session.lastSpaceCheckBytes >= 256 * 1024 * 1024) {
+        session.lastSpaceCheckBytes = totalBytes;
+        const available = await freeBytes(session.recordingsDir);
+        if (available == null && !session.diskCheckUnavailableWarned) {
+          session.diskCheckUnavailableWarned = true;
+          this.emit('app:notice', {
+            level: 'warn',
+            message: '무압축 녹화 중 저장 장치 여유 공간을 확인할 수 없습니다.'
+          });
+        } else if (available != null && available < Math.max(
+          MIN_FREE_BYTES_TO_CONTINUE,
+          session.rawBytes * 0.8 + MIN_FREE_BYTES_TO_START
+        )) {
+          session.failed = '저장 공간이 거의 없어 무압축 녹화를 중지해야 합니다.';
+          this.emit('recording:disk-full', { sessionId: session.sessionId });
+        }
+      }
+      return {
+        frames: session.frameCount,
+        bytes: session.rawBytes + session.audioBytes,
+        warning: session.failed
+      };
+    };
+    const result = session[chainName].then(task).catch((error) => {
+      session.failed = error?.message || String(error);
+      throw error;
+    }).finally(() => {
+      session.queuedBytes = Math.max(0, session.queuedBytes - chunk.length);
+    });
+    session[chainName] = result.catch(() => {});
+    return result;
+  }
+
+  stopLossless(payload = {}, { webContentsId } = {}) {
+    const existing = this.finalizing.get(payload.sessionId);
+    if (existing) {
+      if (existing.webContentsId != null && webContentsId != null
+        && existing.webContentsId !== webContentsId) {
+        return Promise.reject(new Error('무압축 녹화 세션에 접근할 수 없습니다.'));
+      }
+      return existing.promise;
+    }
+    const session = this.losslessSessions.get(payload.sessionId);
+    if (!session) return Promise.resolve(null);
+    if (session.webContentsId != null && webContentsId != null
+      && session.webContentsId !== webContentsId) {
+      return Promise.reject(new Error('무압축 녹화 세션에 접근할 수 없습니다.'));
+    }
+    session.acceptingWrites = false;
+    this.losslessSessions.delete(payload.sessionId);
+    const promise = this.finishLosslessSession(session, payload)
+      .finally(() => this.finalizing.delete(payload.sessionId));
+    this.finalizing.set(payload.sessionId, { promise, webContentsId: session.webContentsId });
+    return promise;
+  }
+
+  async closeLosslessHandles(session) {
+    if (!session || session.handlesClosed) return;
+    session.handlesClosed = true;
+    const results = await Promise.allSettled([
+      session.rawHandle?.close(),
+      session.audioHandle?.close()
+    ]);
+    const rejected = results.find((result) => result.status === 'rejected');
+    if (rejected) session.failed = rejected.reason?.message || String(rejected.reason);
+  }
+
+  async finishLosslessSession(session, payload = {}) {
+    await Promise.allSettled([session.rawWriteChain, session.audioWriteChain]);
+    await this.closeLosslessHandles(session);
+    if (!session.frameCount || !session.rawBytes) {
+      await Promise.allSettled([
+        fs.rm(session.rawPath, { force: true }),
+        fs.rm(session.audioPath, { force: true }),
+        fs.rm(session.manifestPath, { force: true })
+      ]);
+      return null;
+    }
+
+    const durationMs = Number(payload.durationMs) > 0
+      ? Math.round(Number(payload.durationMs))
+      : Math.max(1, Date.now() - session.startedAtMs);
+    const effectiveFps = Math.max(0.1, Math.min(240, session.frameCount * 1000 / durationMs));
+    const failureReason = session.failed || (
+      typeof payload.failureReason === 'string' && payload.failureReason.trim()
+        ? payload.failureReason.trim().slice(0, 500)
+        : null
+    );
+    const outputBase = failureReason ? `${session.baseName}_partial` : session.baseName;
+    const target = await uniquePath(session.recordingsDir, outputBase, 'avi');
+    const audioStats = await statFile(session.audioPath);
+    const hasAudio = Boolean(audioStats?.size);
+    const args = [
+      '-y',
+      '-f', 'rawvideo',
+      '-pixel_format', 'bgra',
+      '-video_size', `${session.width}x${session.height}`,
+      '-framerate', effectiveFps.toFixed(6),
+      '-i', session.rawPath
+    ];
+    if (hasAudio) {
+      args.push(
+        '-f', 's16le',
+        '-ar', String(session.audioSampleRate),
+        '-ac', String(session.audioChannels),
+        '-i', session.audioPath
+      );
+    }
+    args.push(
+      '-map', '0:v:0',
+      ...(hasAudio ? ['-map', '1:a:0?'] : []),
+      '-c:v', 'rawvideo',
+      '-pix_fmt', 'bgr24',
+      ...(hasAudio ? ['-c:a', 'pcm_s16le', '-shortest'] : []),
+      target
+    );
+
+    try {
+      await ffmpeg.run(args, {
+        jobId: `lossless:${session.sessionId}`,
+        totalDurationMs: durationMs,
+        onProgress: (ratio) => this.emit('recording:convert-progress', {
+          phase: 'lossless-finalize',
+          ratio
+        })
+      });
+      await ffmpeg.validateMedia(target);
+    } catch (error) {
+      await fs.rm(target, { force: true }).catch(() => {});
+      throw new Error(
+        `무압축 AVI를 마무리하지 못했습니다. 원본 프레임은 ${session.rawPath}에 보존했습니다. ${error?.message || error}`,
+        { cause: error }
+      );
+    }
+
+    await Promise.allSettled([
+      fs.rm(session.rawPath, { force: true }),
+      fs.rm(session.audioPath, { force: true }),
+      fs.rm(session.manifestPath, { force: true })
+    ]);
+    const stats = await statFile(target);
+    const meta = {
+      ...session.meta,
+      ...normalizeRecordingMeta(payload.meta),
+      format: 'avi',
+      recordedContainer: 'avi',
+      recordedCodec: 'rawvideo',
+      recordedAudioCodec: hasAudio ? 'pcm_s16le' : 'none',
+      lossless: true,
+      hardwareEncoding: false,
+      status: failureReason ? 'partial' : 'complete',
+      partial: Boolean(failureReason),
+      failureReason,
+      outcome: failureReason ? 'partial' : 'exact',
+      durationMs,
+      capturedFrames: session.frameCount,
+      effectiveFps,
+      stoppedAt: new Date().toISOString(),
+      bytes: stats?.size || 0
+    };
+    await this.setMetadata(target, meta);
+    return {
+      ...this.toDto(target, stats, meta),
+      status: meta.status,
+      failureReason,
+      outcome: meta.outcome,
+      converted: false,
+      conversionError: null
     };
   }
 
@@ -1408,6 +1843,11 @@ class RecordingManager {
 
   /** Closes every open handle. Awaited during shutdown so nothing is left dangling. */
   async closeAllSessions() {
+    const losslessIds = [...this.losslessSessions.keys()];
+    await Promise.allSettled(losslessIds.map((sessionId) => this.stopLossless({
+      sessionId,
+      failureReason: '앱 종료 중 무압축 녹화를 마무리했습니다.'
+    })));
     const sessions = [...this.sessions.entries()];
     this.sessions.clear();
 
@@ -1427,7 +1867,7 @@ class RecordingManager {
       });
     });
 
-    return sessions.length;
+    return sessions.length + losslessIds.length;
   }
 
   /**
@@ -1436,6 +1876,7 @@ class RecordingManager {
    */
   async finalizeAllSessions({ failureReason = null } = {}) {
     const ids = [...this.sessions.keys()];
+    const losslessIds = [...this.losslessSessions.keys()];
     const saved = [];
     for (const sessionId of ids) {
       try {
@@ -1443,6 +1884,14 @@ class RecordingManager {
         if (result) saved.push(result);
       } catch {
         // Best effort: the sweep on next launch recovers anything left behind.
+      }
+    }
+    for (const sessionId of losslessIds) {
+      try {
+        const result = await this.stopLossless({ sessionId, failureReason });
+        if (result) saved.push(result);
+      } catch {
+        // Raw frames and the recovery manifest remain in the owned temp folder.
       }
     }
     const finishing = [...this.finalizing.values()].map((entry) => entry.promise);
@@ -1474,5 +1923,7 @@ module.exports = {
   MAX_IPC_CHUNK_BYTES,
   MAX_SESSION_QUEUED_BYTES,
   MAX_SCREENSHOT_BYTES,
+  MAX_LOSSLESS_FRAME_BYTES,
+  MIN_LOSSLESS_FREE_BYTES_TO_START,
   MAX_INDEX_BYTES
 };

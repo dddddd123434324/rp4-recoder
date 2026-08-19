@@ -19,6 +19,7 @@ const settings = new SettingsStore();
 const windowCrop = new WindowCropService();
 
 let mainWindow = null;
+let tray = null;
 let recordings = null;
 let hotkeys = null;
 let isQuitting = false;
@@ -132,6 +133,8 @@ async function shutdown({
     mainWindow.rp4AllowClose = true;
     mainWindow.destroy();
   }
+  tray?.destroy();
+  tray = null;
 
   app.exit(exitCode);
   return true;
@@ -243,10 +246,16 @@ async function bootstrap() {
 
     mainWindow = windows.createMainWindow({
       isSmoke: IS_SMOKE,
-      onQuitRequested: handleQuitRequest,
       onRendererGone: handleRendererGone,
       onRendererUnresponsive: handleRendererUnresponsive
     });
+    if (!IS_SMOKE) {
+      tray = windows.createTray({
+        getMainWindow: () => mainWindow,
+        getLanguage: () => settings.value.language,
+        onQuitRequested: handleQuitRequest
+      });
+    }
     const rendererLoaded = mainWindow.rp4Loaded;
 
     hotkeys.register(settings.value.hotkeys);
@@ -325,10 +334,11 @@ async function bootstrap() {
     if (BrowserWindow.getAllWindows().length === 0) {
       mainWindow = windows.createMainWindow({
         isSmoke: IS_SMOKE,
-        onQuitRequested: handleQuitRequest,
         onRendererGone: handleRendererGone,
         onRendererUnresponsive: handleRendererUnresponsive
       });
+    } else {
+      windows.showMainWindow(mainWindow);
     }
   });
 

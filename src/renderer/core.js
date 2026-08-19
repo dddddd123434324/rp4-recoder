@@ -58,6 +58,8 @@ window.RP4 = window.RP4 || {};
       profile: null,
       recordingsDir: '',
       optimizeMp4: true,
+      gameFpsOverlay: true,
+      gameFpsIntervalMs: 500,
       screenshotFormat: 'png',
       screenshotQuality: 100,
       clipBufferLimitMb: 256,

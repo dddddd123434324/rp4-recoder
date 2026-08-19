@@ -199,6 +199,10 @@
       return;
     }
     if (RP4.lifecycle.isBusy()) return;
+    if (RP4.profile.get().lossless) {
+      RP4.ui.showToast('무압축 무손실 설정에서는 클립 모드를 사용할 수 없습니다.');
+      return;
+    }
     await startClipMode();
   }
 

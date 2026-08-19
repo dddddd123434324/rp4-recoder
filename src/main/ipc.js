@@ -21,7 +21,7 @@ const settingsModule = require('./settings');
 const windows = require('./windows');
 const { parseWindowHandle } = require('./window-crop');
 
-const MEDIA_FILE_PATTERN = /\.(mp4|webm|mkv)$/i;
+const MEDIA_FILE_PATTERN = /\.(mp4|webm|mkv|avi)$/i;
 const MAX_SCREENSHOT_BYTES = 256 * 1024 * 1024;
 const MAX_SCREENSHOT_PIXELS = 7680 * 4320;
 const MAX_WEBP_RENDERER_PIXELS = 4096 * 2160;
@@ -79,7 +79,14 @@ async function resolveRecordingMediaFile(recordingsDir, filePath) {
  * @param {boolean} context.isSmoke
  */
 function registerIpcHandlers(context) {
-  const { settings, recordings, windowCrop, hotkeys, isSmoke, setCaptureState } = context;
+  const {
+    settings,
+    recordings,
+    windowCrop,
+    hotkeys,
+    isSmoke,
+    setCaptureState
+  } = context;
   let folderDialogActive = false;
   const handleMain = (channel, handler) => ipcMain.handle(channel, (event, ...args) => {
     if (!isTopLevelWindowSender(event)) throw new Error('허용되지 않은 IPC 송신자입니다.');
@@ -109,6 +116,8 @@ function registerIpcHandlers(context) {
       defaultRecordingsDir: paths.defaultRecordingsDir(),
       settingsFile: paths.settingsFile(),
       optimizeMp4: value.optimizeMp4,
+      gameFpsOverlay: value.gameFpsOverlay,
+      gameFpsIntervalMs: value.gameFpsIntervalMs,
       screenshotFormat: value.screenshotFormat,
       screenshotQuality: value.screenshotQuality,
       clipBufferLimitMb: value.clipBufferLimitMb,
@@ -257,6 +266,9 @@ function registerIpcHandlers(context) {
       .map((source) => [parseWindowHandle(source.id), source]));
     const mergedWindows = [];
     const includedHandles = new Set();
+    const ownHandles = new Set(nativeWindows
+      .filter((nativeWindow) => Number(nativeWindow.processId) === process.pid)
+      .map((nativeWindow) => String(nativeWindow.hwnd)));
     for (const nativeWindow of nativeWindows) {
       const hwnd = String(nativeWindow.hwnd);
       if (Number(nativeWindow.processId) === process.pid || includedHandles.has(hwnd)) continue;
@@ -280,7 +292,7 @@ function registerIpcHandlers(context) {
       }
     }
     for (const [hwnd, source] of capturedWindows) {
-      if (!includedHandles.has(hwnd)) mergedWindows.push(toDto(source));
+      if (!includedHandles.has(hwnd) && !ownHandles.has(hwnd)) mergedWindows.push(toDto(source));
     }
     return [...screens, ...mergedWindows];
   });
@@ -321,7 +333,23 @@ function registerIpcHandlers(context) {
     language: settings.value.language
   }));
 
-  handleMain('area:select', async () => windows.selectDesktopArea({ isSmoke }));
+  handleMain('area:select', async (event) => {
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    const restoreOwner = Boolean(owner && !owner.isDestroyed() && owner.isVisible());
+    if (restoreOwner) {
+      owner.hide();
+      // Give DWM time to remove RP4 before the transparent selector exposes the desktop.
+      await new Promise((resolve) => setTimeout(resolve, 160));
+    }
+    try {
+      return await windows.selectDesktopArea({ isSmoke });
+    } finally {
+      if (restoreOwner && owner && !owner.isDestroyed()) {
+        owner.show();
+        owner.focus();
+      }
+    }
+  });
 
   handleMain('window:client-crop', async (_event, sourceId) => {
     const hwnd = parseWindowHandle(sourceId);
@@ -387,6 +415,25 @@ function registerIpcHandlers(context) {
   handleMain('recording:stop', async (event, payload = {}) => recordings.stop(payload, {
     webContentsId: event.sender.id
   }));
+
+  handleMain('lossless:start', async (event, meta = {}) => {
+    if (folderDialogActive) {
+      throw new Error('저장 폴더를 선택하는 동안에는 녹화를 시작할 수 없습니다.');
+    }
+    return recordings.startLossless(meta, { webContentsId: event.sender.id });
+  });
+
+  handleMain('lossless:write-frame', async (event, payload = {}) => (
+    recordings.writeLosslessFrame(payload, { webContentsId: event.sender.id })
+  ));
+
+  handleMain('lossless:write-audio', async (event, payload = {}) => (
+    recordings.writeLosslessAudio(payload, { webContentsId: event.sender.id })
+  ));
+
+  handleMain('lossless:stop', async (event, payload = {}) => (
+    recordings.stopLossless(payload, { webContentsId: event.sender.id })
+  ));
 
   handleMain('screenshot:save', async (_event, payload = {}) => {
     if (folderDialogActive) {
@@ -524,6 +571,12 @@ function registerIpcHandlers(context) {
     const patch = {};
     if (options.language === 'ko' || options.language === 'en') patch.language = options.language;
     if (typeof options.optimizeMp4 === 'boolean') patch.optimizeMp4 = options.optimizeMp4;
+    if (typeof options.gameFpsOverlay === 'boolean') {
+      patch.gameFpsOverlay = options.gameFpsOverlay;
+    }
+    if (settingsModule.GAME_FPS_INTERVALS.includes(Number(options.gameFpsIntervalMs))) {
+      patch.gameFpsIntervalMs = Number(options.gameFpsIntervalMs);
+    }
     if (typeof options.screenshotFormat === 'string') {
       patch.screenshotFormat = options.screenshotFormat;
     }

@@ -1,6 +1,6 @@
 'use strict';
 
-const { BrowserWindow, ipcMain, shell, dialog } = require('electron/main');
+const { BrowserWindow, Menu, Tray, ipcMain, shell, dialog } = require('electron/main');
 const crypto = require('node:crypto');
 const path = require('node:path');
 
@@ -40,7 +40,7 @@ function hardenWebContents(contents) {
   });
 }
 
-function createMainWindow({ isSmoke, onQuitRequested, onRendererGone, onRendererUnresponsive }) {
+function createMainWindow({ isSmoke, onRendererGone, onRendererUnresponsive }) {
   const win = new BrowserWindow({
     width: 1440,
     height: 900,
@@ -90,7 +90,7 @@ function createMainWindow({ isSmoke, onQuitRequested, onRendererGone, onRenderer
   win.on('close', (event) => {
     if (win.rp4AllowClose) return;
     event.preventDefault();
-    void onQuitRequested(win);
+    win.hide();
   });
 
   win.rp4Loaded = win.loadFile(path.join(SRC_DIR, 'index.html')).catch(async (error) => {
@@ -109,6 +109,28 @@ function createMainWindow({ isSmoke, onQuitRequested, onRendererGone, onRenderer
     throw error;
   });
   return win;
+}
+
+function showMainWindow(win) {
+  if (!win || win.isDestroyed()) return;
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+}
+
+function createTray({ getMainWindow, getLanguage, onQuitRequested }) {
+  const tray = new Tray(ICON_PATH);
+  tray.setToolTip('RP4 Recorder');
+  const buildContextMenu = () => Menu.buildFromTemplate([
+    {
+      label: getLanguage?.() === 'en' ? 'Exit' : '종료',
+      click: () => void onQuitRequested?.(getMainWindow?.())
+    }
+  ]);
+  tray.on('click', () => showMainWindow(getMainWindow?.()));
+  tray.on('double-click', () => showMainWindow(getMainWindow?.()));
+  tray.on('right-click', () => tray.popUpContextMenu(buildContextMenu()));
+  return tray;
 }
 
 /**
@@ -381,6 +403,8 @@ module.exports = {
   SRC_DIR,
   ICON_PATH,
   createMainWindow,
+  createTray,
+  showMainWindow,
   hardenWebContents,
   drainRecordings,
   confirmCloseWhileRecording,

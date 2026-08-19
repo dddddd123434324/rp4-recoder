@@ -20,12 +20,14 @@ const DEFAULT_SELECTED_PRESET = 'normal';
 const MAX_CUSTOM_PRESETS = 48;
 
 const ENCODER_PRESETS = ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium'];
-const CONTAINERS = ['mp4', 'webm'];
+const CONTAINERS = ['mp4', 'webm', 'avi'];
 const SCREENSHOT_FORMATS = ['png', 'jpeg', 'webp'];
 const DEFAULT_SCREENSHOT_FORMAT = 'png';
 const DEFAULT_SCREENSHOT_QUALITY = 100;
 const SCREENSHOT_QUALITIES = [70, 80, 90, 95, 100];
 const LANGUAGES = new Set(['ko', 'en']);
+const GAME_FPS_INTERVALS = [250, 500, 1000];
+const DEFAULT_GAME_FPS_INTERVAL_MS = 500;
 
 // Clip mode keeps recent footage buffered. Without a byte ceiling a 7200s buffer at
 // 35 Mbps would try to hold ~31 GB, so the buffer is bounded in megabytes as well as
@@ -83,6 +85,7 @@ function normalizeScreenshotQuality(quality) {
 }
 
 function normalizeResolution(resolution) {
+  if (resolution === 'lossless') return 'lossless';
   const match = /^(\d{2,5})x(\d{2,5})$/.exec(String(resolution || ''));
   if (!match) return DEFAULT_PROFILE.resolution;
   const width = Math.floor(clampNumber(Number(match[1]), 320, 7680) / 2) * 2;
@@ -177,6 +180,10 @@ function normalize(value = {}, { recordingsDirFallback } = {}) {
     // Recording writes a ready-to-play MP4 directly. This optional pass re-muxes it in
     // the background (never blocking the user) so the moov atom sits at the front.
     optimizeMp4: source.optimizeMp4 !== false,
+    gameFpsOverlay: source.gameFpsOverlay !== false,
+    gameFpsIntervalMs: GAME_FPS_INTERVALS.includes(Number(source.gameFpsIntervalMs))
+      ? Number(source.gameFpsIntervalMs)
+      : DEFAULT_GAME_FPS_INTERVAL_MS,
     screenshotFormat: normalizeScreenshotFormat(source.screenshotFormat),
     screenshotQuality: normalizeScreenshotQuality(source.screenshotQuality),
     clipBufferLimitMb: clampNumber(
@@ -337,6 +344,8 @@ module.exports = {
   SCREENSHOT_FORMATS,
   SCREENSHOT_QUALITIES,
   LANGUAGES,
+  GAME_FPS_INTERVALS,
+  DEFAULT_GAME_FPS_INTERVAL_MS,
   MIN_CLIP_BUFFER_LIMIT_MB,
   MAX_CLIP_BUFFER_LIMIT_MB,
   MAX_SETTINGS_BYTES,

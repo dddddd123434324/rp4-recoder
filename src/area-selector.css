@@ -90,6 +90,11 @@ body {
   background: #f22b08;
 }
 
+.actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .selection {
   position: absolute;
   display: none;

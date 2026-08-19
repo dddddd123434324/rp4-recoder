@@ -138,6 +138,7 @@ function drawSelection() {
   selection.style.width = `${rect.width}px`;
   selection.style.height = `${rect.height}px`;
   selection.dataset.size = `${Math.round(rect.width * s.x)} x ${Math.round(rect.height * s.y)}`;
+  applyButton.disabled = false;
 }
 
 function beginPointer(event) {
@@ -159,17 +160,18 @@ function beginPointer(event) {
     return;
   }
 
-  rect = { x: event.clientX, y: event.clientY, width: 1, height: 1 };
+  rect = null;
+  selection.classList.remove('active');
+  applyButton.disabled = true;
   drag = {
     mode: 'create',
     display: displayAt(event.clientX, event.clientY),
     pointerId: event.pointerId,
     startX: event.clientX,
     startY: event.clientY,
-    rect: { ...rect }
+    rect: null
   };
-  selection.classList.add('active');
-  drawSelection();
+  event.preventDefault();
 }
 
 function movePointer(event) {
@@ -181,6 +183,7 @@ function movePointer(event) {
   const start = drag.rect;
 
   if (drag.mode === 'create') {
+    if (Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
     rect = normalizeRect({
       x: Math.min(drag.startX, event.clientX),
       y: Math.min(drag.startY, event.clientY),
@@ -200,7 +203,9 @@ function finishPointer(event) {
   if (!drag || event.pointerId !== drag.pointerId) return;
   selection.releasePointerCapture?.(event.pointerId);
   const display = drag.display;
+  const created = drag.mode === 'create';
   drag = null;
+  if (created && !rect) return;
   rect = normalizeRect(rect, display);
   drawSelection();
 }
@@ -271,7 +276,6 @@ async function init() {
   fillDisplayButton.addEventListener('click', fillDisplay);
   selection.addEventListener('dblclick', applySelection);
 
-  fillDisplay();
 }
 
 void init();

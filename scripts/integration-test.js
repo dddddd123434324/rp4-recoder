@@ -22,6 +22,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const ffmpegStatic = require('ffmpeg-static');
+const ffmpeg = require('../src/main/ffmpeg');
 
 const SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'rp4-itest-'));
 const USER_DATA = path.join(SANDBOX, 'userData');
@@ -181,6 +182,16 @@ async function run() {
   await settings.update({ language: 'en' });
   check('English language preference persists', settings.value.language === 'en');
   await settings.update({ language: 'ko' });
+  await settings.update({ gameFpsOverlay: false, gameFpsIntervalMs: 1000 });
+  check('game capture settings persist',
+    settings.value.gameFpsOverlay === false && settings.value.gameFpsIntervalMs === 1000);
+  await settings.update({ gameFpsOverlay: true, gameFpsIntervalMs: 500 });
+
+  const losslessProfile = require('../src/main/settings').normalize({
+    profile: { format: 'avi', resolution: 'lossless', fps: '60' }
+  }).profile;
+  check('lossless native-resolution profile survives normalization',
+    losslessProfile.format === 'avi' && losslessProfile.resolution === 'lossless');
 
   await settings.update({ profile: { resolution: '1280x720', fps: '30' } });
   check('saved profile round-trips', settings.value.profile?.resolution === '1280x720',
@@ -485,6 +496,36 @@ async function run() {
       && i18nResult.korean.text === '스크린샷'
       && i18nResult.korean.label === '닫기');
 
+  const bgraCopy = JSON.parse(await win.webContents.executeJavaScript(`
+    (async () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 64; canvas.height = 48;
+      const context = canvas.getContext('2d', { alpha: false });
+      context.fillStyle = '#ff3b13';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      const stream = canvas.captureStream(10);
+      const track = stream.getVideoTracks()[0];
+      const processor = new MediaStreamTrackProcessor({ track });
+      const reader = processor.readable.getReader();
+      const pendingFrame = reader.read();
+      context.fillStyle = '#ff5a1f';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      const { value: frame } = await pendingFrame;
+      const bytes = new Uint8Array(64 * 48 * 4);
+      await frame.copyTo(bytes, {
+        format: 'BGRA',
+        layout: [{ offset: 0, stride: 64 * 4 }]
+      });
+      frame.close();
+      await reader.cancel();
+      track.stop();
+      return JSON.stringify({ bytes: bytes.byteLength, alpha: bytes[3] });
+    })()
+  `));
+  check('renderer can copy native BGRA frames for uncompressed recording',
+    bgraCopy.bytes === 64 * 48 * 4 && bgraCopy.alpha === 255,
+    `${bgraCopy.bytes} bytes`);
+
   const clipsSource = await fsp.readFile(path.join(__dirname, '..', 'src', 'renderer', 'clips.js'), 'utf8');
   const clipPolicyResult = JSON.parse(await win.webContents.executeJavaScript(`
     (async () => {
@@ -607,6 +648,56 @@ async function run() {
   check('reported duration excludes nothing unexpected',
     Math.abs((probe.durationSec || 0) - 5) < 1.5, `${probe.durationSec}s vs 5s`);
 
+  // ---- native-frame uncompressed recording ------------------------------------
+  const losslessMeta = {
+    mode: 'game',
+    modeLabel: '게임 녹화',
+    sourceName: '무압축 테스트',
+    format: 'avi',
+    width: 64,
+    height: 48,
+    fps: 10,
+    audioSampleRate: 48000,
+    audioChannels: 2,
+    lossless: true
+  };
+  const losslessSession = await recordings.startLossless(losslessMeta, {
+    webContentsId: win.webContents.id
+  });
+  check('lossless session reserves exact BGRA frame size',
+    losslessSession.frameBytes === 64 * 48 * 4, `${losslessSession.frameBytes} bytes`);
+  for (let frameIndex = 0; frameIndex < 10; frameIndex += 1) {
+    const frame = Buffer.alloc(64 * 48 * 4);
+    for (let offset = 0; offset < frame.length; offset += 4) {
+      frame[offset] = frameIndex * 20;
+      frame[offset + 1] = (offset / 4) % 255;
+      frame[offset + 2] = 255 - frameIndex * 20;
+      frame[offset + 3] = 255;
+    }
+    await recordings.writeLosslessFrame({ sessionId: losslessSession.sessionId, buffer: frame }, {
+      webContentsId: win.webContents.id
+    });
+  }
+  await recordings.writeLosslessAudio({
+    sessionId: losslessSession.sessionId,
+    buffer: Buffer.alloc(48000 * 2 * 2)
+  }, { webContentsId: win.webContents.id });
+  const losslessSaved = await recordings.stopLossless({
+    sessionId: losslessSession.sessionId,
+    durationMs: 1000
+  }, { webContentsId: win.webContents.id });
+  const losslessProbe = await ffprobe(losslessSaved.filePath);
+  check('uncompressed lossless AVI is readable raw video',
+    losslessSaved.name.endsWith('.avi')
+      && losslessProbe.codec === 'rawvideo'
+      && losslessProbe.width === 64
+      && losslessProbe.height === 48,
+    `container=${losslessProbe.container} codec=${losslessProbe.codec}`);
+  check('lossless AVI audio is uncompressed PCM',
+    losslessProbe.audioCodec === 'pcm_s16le', `audio=${losslessProbe.audioCodec}`);
+  check('lossless temporary frame files are removed after save',
+    fs.readdirSync(settings.tempDir).every((name) => !name.includes('.lossless.')));
+
   const invalidSession = await recordings.start(meta, { webContentsId: win.webContents.id });
   await recordings.write({
     sessionId: invalidSession.sessionId,
@@ -623,6 +714,19 @@ async function run() {
   }
   check('invalid direct recording is not classified complete',
     recordings.metadata.get(invalidSaved.filePath)?.status === 'invalid');
+
+  const audioOnlyPath = path.join(SANDBOX, 'audio-only.mp4');
+  await runFfmpeg([
+    '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+    '-t', '0.4', '-c:a', 'aac', audioOnlyPath
+  ]);
+  let audioOnlyRejected = false;
+  try {
+    await ffmpeg.validateMedia(audioOnlyPath);
+  } catch {
+    audioOnlyRejected = true;
+  }
+  check('recording validation rejects audio-only output', audioOnlyRejected);
 
   recordings.optimizeQueue.push({ filePath: 'pending-test.mp4', durationMs: 1 });
   check('pending optimization blocks recording-folder mutation', recordings.hasPendingFileMutations());
@@ -929,6 +1033,31 @@ async function run() {
   check('orphaned temp recording is recovered', sweep.recovered.length === 1,
     sweep.recovered[0] ? path.basename(sweep.recovered[0]) : 'none');
   check('recovered file left the temp folder', !fs.existsSync(orphan));
+
+  const orphanLosslessId = crypto.randomUUID();
+  const orphanLosslessRaw = path.join(settings.tempDir, `rp4-${orphanLosslessId}.lossless.raw`);
+  const orphanLosslessAudio = path.join(settings.tempDir, `rp4-${orphanLosslessId}.lossless.pcm`);
+  const orphanLosslessManifest = path.join(settings.tempDir, `rp4-${orphanLosslessId}.lossless.json`);
+  await fsp.writeFile(orphanLosslessRaw, Buffer.alloc(64 * 48 * 4 * 5, 0x7f));
+  await fsp.writeFile(orphanLosslessAudio, Buffer.alloc(0));
+  await fsp.writeFile(orphanLosslessManifest, JSON.stringify({
+    version: 1,
+    sessionId: orphanLosslessId,
+    width: 64,
+    height: 48,
+    fps: 10,
+    audioSampleRate: 48000,
+    audioChannels: 2,
+    meta: { mode: 'game', sourceName: 'recovery test', lossless: true }
+  }));
+  const losslessSweep = await recordings.sweepTempDir();
+  const recoveredLossless = losslessSweep.recovered.find((filePath) => filePath.endsWith('.avi'));
+  const recoveredLosslessProbe = recoveredLossless ? await ffprobe(recoveredLossless) : null;
+  check('orphaned native frames recover into a partial AVI',
+    recoveredLosslessProbe?.codec === 'rawvideo'
+      && !fs.existsSync(orphanLosslessRaw)
+      && !fs.existsSync(orphanLosslessManifest),
+    recoveredLossless ? path.basename(recoveredLossless) : 'none');
 
   const corruptOrphan = path.join(settings.tempDir, `rp4-${crypto.randomUUID()}.part.mp4`);
   await fsp.writeFile(corruptOrphan, Buffer.alloc(2048, 0xaa));

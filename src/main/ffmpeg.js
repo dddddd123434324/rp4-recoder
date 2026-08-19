@@ -132,12 +132,12 @@ function hasActiveJobs() {
   return activeJobs.size > 0;
 }
 
-/** Parses a media file end-to-end without decoding it, catching truncated swap artifacts. */
+/** Parses a recording end-to-end and requires a video stream. */
 async function validateMedia(inputPath) {
   await run([
     '-v', 'error',
     '-i', inputPath,
-    '-map', '0',
+    '-map', '0:v:0',
     '-c', 'copy',
     '-f', 'null',
     '-'

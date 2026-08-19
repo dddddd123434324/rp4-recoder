@@ -35,6 +35,10 @@ contextBridge.exposeInMainWorld('rp4', {
   startRecording: (meta) => ipcRenderer.invoke('recording:start', meta),
   writeRecordingChunk: (payload) => invokeWithBoundedBuffer('recording:write', payload),
   stopRecording: (payload) => ipcRenderer.invoke('recording:stop', payload),
+  startLosslessRecording: (meta) => ipcRenderer.invoke('lossless:start', meta),
+  writeLosslessFrame: (payload) => invokeWithBoundedBuffer('lossless:write-frame', payload),
+  writeLosslessAudio: (payload) => invokeWithBoundedBuffer('lossless:write-audio', payload),
+  stopLosslessRecording: (payload) => ipcRenderer.invoke('lossless:stop', payload),
   saveScreenshot: (payload) => invokeWithBoundedBuffer('screenshot:save', payload, MAX_SCREENSHOT_BYTES),
   cancelConversion: (jobId) => ipcRenderer.invoke('convert:cancel', jobId),
 
