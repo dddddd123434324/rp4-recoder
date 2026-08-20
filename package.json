@@ -11,6 +11,7 @@
     "lint": "eslint src scripts",
     "lint:syntax": "node scripts/check-syntax.js",
     "smoke": "node scripts/smoke-test.js",
+    "smoke:packaged": "node scripts/packaged-smoke-test.js",
     "test:integration": "node scripts/run-electron.js scripts/integration-test.js",
     "test": "npm run lint && npm run smoke && npm run test:integration",
     "dist": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false ELECTRON_BUILDER_DISABLE_BUILD_CACHE=true electron-builder --win --x64 && node scripts/write-checksums.js",

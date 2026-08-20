@@ -31,6 +31,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run dist
+      - run: npm run smoke:packaged
       - name: Verify release artifacts
         shell: pwsh
         run: |
