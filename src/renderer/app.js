@@ -148,7 +148,7 @@
     const profile = state.recording?.profile || state.clip?.profile || RP4.profile.get();
     if (profile.lossless) {
       els.pipelineNote.textContent =
-        '원본 프레임을 압축하지 않고 AVI로 저장합니다. 파일 용량이 매우 크며 프레임당 최대 64MiB를 지원합니다.';
+        '원본 프레임을 압축하지 않고 AVI로 저장합니다. 큰 화면에서는 프레임을 자동으로 건너뛸 수 있지만, 저장되는 프레임은 원본 해상도·무압축으로 유지됩니다.';
       return;
     }
     const codec = RP4.capture.pickRecorderMime(profile.format);

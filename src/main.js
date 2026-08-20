@@ -29,6 +29,10 @@ let rendererCaptureState = { recordingActive: false, clipActive: false, clipSavi
 const failedRendererIds = new Set();
 let rendererUnresponsivePromptOpen = false;
 let fatalAsyncShutdownScheduled = false;
+let systemSessionShutdownPromise = null;
+const SYSTEM_SESSION_END_DRAIN_TIMEOUT_MS = 4000;
+const SYSTEM_SESSION_END_MAX_TOTAL_MS = 12000;
+const SYSTEM_SESSION_END_HARD_DEADLINE_MS = 15000;
 
 function send(channel, payload) {
   if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return false;
@@ -104,6 +108,60 @@ function rendererUnresponsiveGraceMs() {
     : windows.UNRESPONSIVE_GRACE_MS;
 }
 
+function hasVolatileCaptureWork() {
+  return Boolean(
+    rendererCaptureState.recordingActive
+    || rendererCaptureState.clipActive
+    || rendererCaptureState.clipSaving
+    || recordings?.hasPendingRecordings()
+  );
+}
+
+function systemSessionClipShutdownMode() {
+  if (rendererCaptureState.clipSaving) return 'wait-current-save';
+  return rendererCaptureState.clipActive ? 'save-current-buffer' : 'discard';
+}
+
+/**
+ * Windows bypasses Electron's ordinary quit events while ending a user session.  Do a
+ * short, non-interactive finalization attempt here, then leave journals/raw staging in
+ * place for next-start recovery if the OS deadline wins.
+ */
+function beginSystemSessionShutdown() {
+  if (systemSessionShutdownPromise) return systemSessionShutdownPromise;
+  const failureReason = 'Windows 종료 또는 로그아웃으로 녹화를 안전하게 마무리합니다.';
+  const hardTimer = setTimeout(() => {
+    recordings?.abandonForRecovery('Windows 종료 제한 시간 초과');
+    void recordings?.closeAllSessions().catch(() => {});
+    app.exit(0);
+  }, SYSTEM_SESSION_END_HARD_DEADLINE_MS);
+  systemSessionShutdownPromise = shutdown({
+    clipShutdownMode: systemSessionClipShutdownMode(),
+    failureReason,
+    systemSessionEnding: true,
+    drainTimeoutMs: SYSTEM_SESSION_END_DRAIN_TIMEOUT_MS,
+    drainMaxTotalMs: SYSTEM_SESSION_END_MAX_TOTAL_MS
+  }).catch((error) => {
+    process.stderr.write(`Windows session shutdown failed: ${error?.stack || error}\n`);
+    recordings?.abandonForRecovery(failureReason);
+    app.exit(1);
+  }).finally(() => {
+    clearTimeout(hardTimer);
+  });
+  return systemSessionShutdownPromise;
+}
+
+function handleQuerySessionEnd() {
+  if (isQuitting || !hasVolatileCaptureWork()) return false;
+  void beginSystemSessionShutdown();
+  return true;
+}
+
+function handleSessionEnd() {
+  if (isQuitting || !hasVolatileCaptureWork()) return;
+  void beginSystemSessionShutdown();
+}
+
 /**
  * Cleanly shuts down: finalizes any in-flight recording, releases hotkeys, stops the
  * helper process and cancels background ffmpeg work.
@@ -115,7 +173,10 @@ async function shutdown({
   clipShutdownMode = 'discard',
   rendererUnavailable = false,
   failureReason = null,
-  exitCode = 0
+  exitCode = 0,
+  systemSessionEnding = false,
+  drainTimeoutMs = 20000,
+  drainMaxTotalMs = windows.MAX_TOTAL_SHUTDOWN_MS
 } = {}) {
   if (isQuitting) return;
   isQuitting = true;
@@ -137,7 +198,8 @@ async function shutdown({
       // still use the same bounded finalization/recovery policy as a normal close.
       await cleanup('recordings', async () => {
         drainResult = await windows.drainRecordings(null, recordings, {
-          timeoutMs: 20000,
+          timeoutMs: drainTimeoutMs,
+          maxTotalMs: drainMaxTotalMs,
           clipShutdownMode: 'discard',
           timeoutFailureReason: failureReason
         });
@@ -145,7 +207,8 @@ async function shutdown({
     } else {
       try {
         drainResult = await windows.drainRecordings(mainWindow, recordings, {
-          timeoutMs: 20000,
+          timeoutMs: drainTimeoutMs,
+          maxTotalMs: drainMaxTotalMs,
           clipShutdownMode,
           timeoutFailureReason: failureReason
         });
@@ -153,6 +216,14 @@ async function shutdown({
         process.stderr.write(`shutdown recordings error: ${error?.message || error}\n`);
       }
       if (drainResult?.shutdownFailed && clipShutdownMode !== 'discard') {
+        if (systemSessionEnding) {
+          await windows.drainRecordings(mainWindow, recordings, {
+            timeoutMs: Math.min(drainTimeoutMs, 3000),
+            maxTotalMs: Math.min(drainMaxTotalMs, 5000),
+            clipShutdownMode: 'discard',
+            timeoutFailureReason: failureReason
+          });
+        } else {
         const decision = await windows.confirmClipSaveFailure(
           mainWindow,
           drainResult.error,
@@ -168,10 +239,12 @@ async function shutdown({
           return false;
         }
         await windows.drainRecordings(mainWindow, recordings, {
-          timeoutMs: 20000,
+          timeoutMs: drainTimeoutMs,
+          maxTotalMs: drainMaxTotalMs,
           clipShutdownMode: 'discard',
           timeoutFailureReason: failureReason
         });
+        }
       }
     }
     await cleanup('session handles', () => recordings.closeAllSessions());
@@ -316,7 +389,9 @@ async function bootstrap() {
         .catch((error) => reportFatalAsyncFailure(error, 'renderer-gone recovery')),
       onRendererUnresponsive: (win) => handleRendererUnresponsive(win)
         .catch((error) => reportFatalAsyncFailure(error, 'renderer-unresponsive recovery')),
-      getRendererUnresponsiveGraceMs: rendererUnresponsiveGraceMs
+      getRendererUnresponsiveGraceMs: rendererUnresponsiveGraceMs,
+      onQuerySessionEnd: handleQuerySessionEnd,
+      onSessionEnd: handleSessionEnd
     });
     if (!IS_SMOKE) {
       tray = windows.createTray({
@@ -431,7 +506,9 @@ async function bootstrap() {
           .catch((error) => reportFatalAsyncFailure(error, 'renderer-gone recovery')),
         onRendererUnresponsive: (win) => handleRendererUnresponsive(win)
           .catch((error) => reportFatalAsyncFailure(error, 'renderer-unresponsive recovery')),
-        getRendererUnresponsiveGraceMs: rendererUnresponsiveGraceMs
+        getRendererUnresponsiveGraceMs: rendererUnresponsiveGraceMs,
+        onQuerySessionEnd: handleQuerySessionEnd,
+        onSessionEnd: handleSessionEnd
       });
     } else {
       windows.showMainWindow(mainWindow);

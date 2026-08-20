@@ -25,7 +25,11 @@ const MAX_IPC_CHUNK_BYTES = 64 * 1024 * 1024;
 const MAX_SESSION_QUEUED_BYTES = 128 * 1024 * 1024;
 const MAX_SCREENSHOT_BYTES = 256 * 1024 * 1024;
 const MIN_LOSSLESS_FREE_BYTES_TO_START = 2 * 1024 * 1024 * 1024;
-const MAX_LOSSLESS_FRAME_BYTES = 64 * 1024 * 1024;
+// Native BGRA frames can exceed 64 MiB on large/8K displays.  Keep the transport
+// bounded, but allow one large frame in flight instead of refusing to record at all.
+// The renderer deliberately drops frames when this budget is exhausted.
+const MAX_LOSSLESS_FRAME_BYTES = 192 * 1024 * 1024;
+const MAX_LOSSLESS_IN_FLIGHT_BYTES = 192 * 1024 * 1024;
 const MAX_RECORDING_DURATION_MS = 24 * 60 * 60 * 1000;
 const VERIFICATION_CONCURRENCY = 1;
 const VERIFICATION_SHUTDOWN_TIMEOUT_MS = 5000;
@@ -50,6 +54,11 @@ const LOSSLESS_FINALIZING_PATTERN = new RegExp(
   `^rp4-(${UUID_PATTERN})\\.lossless-finalizing\\.avi$`,
   'i'
 );
+const ARTIFACT_COMMIT_JOURNAL_PATTERN = new RegExp(
+  `^rp4-(${UUID_PATTERN})\\.commit\\.json$`,
+  'i'
+);
+const MAX_ARTIFACT_COMMIT_JOURNAL_BYTES = 64 * 1024;
 function canonicalPathKey(filePath) {
   const resolved = path.resolve(String(filePath || ''));
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
@@ -422,7 +431,7 @@ function numberedPath(dir, baseName, extension, attempt) {
  * full-file disk reservation, and no overwrite race.  A filesystem without hard-link
  * support gets an explicit exclusive-copy fallback with enough free-space headroom.
  */
-async function commitFileNoClobber(from, target) {
+async function commitFileNoClobber(from, target, { onCopyPrepared } = {}) {
   const sourceIdentity = await fileIdentity(from);
   if (!sourceIdentity) {
     throw codedError('INVALID_STAGING_FILE', '안전하게 커밋할 임시 파일을 확인할 수 없습니다.');
@@ -454,6 +463,10 @@ async function commitFileNoClobber(from, target) {
     if (!sourceContentIdentity || !(await fileMatchesIdentity(from, sourceIdentity))) {
       throw codedError('STAGING_FILE_CHANGED', '임시 파일이 복사 준비 중 변경되었습니다.');
     }
+    // A durable caller records this before the fallback copy begins.  If the process
+    // dies after the exclusive copy, recovery can still prove that the target is the
+    // already-committed staging content instead of publishing a duplicate take.
+    await onCopyPrepared?.(sourceContentIdentity);
     await fs.copyFile(from, target, fsConstants.COPYFILE_EXCL);
     // `copyFile` completion alone is not a durability boundary on every network/removable
     // filesystem. Flush the newly created target before allowing the staging source to go.
@@ -475,17 +488,24 @@ async function commitFileNoClobber(from, target) {
   }
   // Do not unlink a new file that happened to replace the staging path after the
   // hard-link/copy completed. The committed target remains valid either way.
-  if (await fileMatchesIdentity(from, sourceIdentity)) {
+  let sourceRemoved = !(await statFile(from));
+  if (!sourceRemoved && await fileMatchesIdentity(from, sourceIdentity)) {
     await fs.rm(from, { force: true }).catch(() => {});
+    sourceRemoved = !(await statFile(from));
   }
-  return target;
+  return {
+    target,
+    sourceRemoved,
+    sourceIdentity,
+    sourceContentIdentity
+  };
 }
 
 async function commitStagedFileToUnique(from, dir, baseName, extension) {
   for (let attempt = 0; attempt < 500; attempt += 1) {
     const target = numberedPath(dir, baseName, extension, attempt);
     try {
-      return await commitFileNoClobber(from, target);
+      return (await commitFileNoClobber(from, target)).target;
     } catch (error) {
       if (error?.code !== 'EEXIST') throw error;
     }
@@ -505,7 +525,65 @@ async function recordingStagingPath(recordingsDir, extension) {
 
 /** Moves only when the destination did not appear concurrently. */
 async function moveFile(from, to) {
-  return commitFileNoClobber(from, to);
+  return (await commitFileNoClobber(from, to)).target;
+}
+
+function isDirectChildPath(parent, candidate) {
+  if (typeof parent !== 'string' || typeof candidate !== 'string') return false;
+  return path.dirname(path.resolve(candidate)).toLowerCase() === path.resolve(parent).toLowerCase();
+}
+
+function artifactSourcePath(tempDir, source) {
+  if (!source || typeof source.name !== 'string' || path.basename(source.name) !== source.name) {
+    return null;
+  }
+  return path.join(tempDir, source.name);
+}
+
+function normalizeArtifactSource(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const name = typeof value.name === 'string' && value.name.length > 0
+    && value.name.length <= 255 && path.basename(value.name) === value.name
+    ? value.name : null;
+  const identity = normalizeStagedIdentity(value.identity);
+  if (!name || !identity) return null;
+  const content = normalizeContentIdentity(value.contentIdentity);
+  return { name, identity, ...(content ? { contentIdentity: content } : {}) };
+}
+
+function normalizeArtifactJournal(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || value.version !== 1) return null;
+  const targetName = typeof value.targetName === 'string' && value.targetName.length > 0
+    && value.targetName.length <= 255 && path.basename(value.targetName) === value.targetName
+    && RECORDING_EXTENSIONS.test(value.targetName)
+    ? value.targetName : null;
+  const baseName = typeof value.baseName === 'string' && value.baseName.length > 0
+    && value.baseName.length <= 255 && path.basename(value.baseName) === value.baseName
+    ? value.baseName : null;
+  const extension = typeof value.extension === 'string' && /^(mp4|webm|mkv|avi)$/i.test(value.extension)
+    ? value.extension.toLowerCase() : null;
+  const source = normalizeArtifactSource(value.source);
+  const cleanupSources = Array.isArray(value.cleanupSources)
+    ? value.cleanupSources.map(normalizeArtifactSource).filter(Boolean) : [];
+  if (!targetName || !baseName || !extension || !source) return null;
+  const names = new Set();
+  for (const entry of [source, ...cleanupSources]) {
+    if (names.has(entry.name.toLowerCase())) return null;
+    names.add(entry.name.toLowerCase());
+  }
+  return {
+    version: 1,
+    state: value.state === 'cleanup-pending' ? 'cleanup-pending' : 'ready-to-commit',
+    targetName,
+    baseName,
+    extension,
+    source,
+    cleanupSources,
+    ...(value.meta && typeof value.meta === 'object' && !Array.isArray(value.meta)
+      ? { meta: normalizeRecordingMeta(value.meta) } : {}),
+    ...(Number.isFinite(Number(value.durationMs))
+      ? { durationMs: boundedDurationMs(value.durationMs) } : {})
+  };
 }
 
 /** Opens only a direct regular-file child of an app-owned directory. */
@@ -774,6 +852,7 @@ class RecordingManager {
       session.tempPath,
       ...(Array.isArray(session.segmentPaths) ? session.segmentPaths : []),
       ...(session.pendingTempPaths ? [...session.pendingTempPaths] : []),
+      ...(session.cleanupTempPaths ? [...session.cleanupTempPaths] : []),
       session.rawPath,
       session.audioPath,
       session.manifestPath,
@@ -909,7 +988,7 @@ class RecordingManager {
     this.emit('recordings:changed', { filePath });
   }
 
-  async metadataForFile(filePath, stats = null) {
+  async metadataForFile(filePath) {
     const meta = this.metadata.get(filePath);
     if (!meta || typeof meta !== 'object') return { meta: {}, changed: false };
     const expected = normalizeStagedIdentity(meta.fileIdentity);
@@ -919,23 +998,238 @@ class RecordingManager {
       return { meta: {}, changed: true };
     }
 
-    // One-time migration from pre-0.2.24 entries.  Those entries did not retain a file
-    // identity, so only adopt a legacy path when its recorded byte count still matches.
-    // New metadata always carries an identity and a same-name external replacement is
-    // therefore read-only instead of becoming deletable.
-    const knownBytes = Number(meta.bytes);
-    if (Number.isFinite(knownBytes) && stats && knownBytes !== Number(stats.size)) {
-      this.metadata.delete(filePath);
-      return { meta: {}, changed: true };
+    // Versions before 0.2.24 did not save a file identity.  A same-name file with the
+    // same byte count is not proof that it is still the RP4 recording, so never upgrade
+    // it into a deletable/optimizable file merely because it happens to be present now.
+    // Keep its descriptive metadata for the list, but make it explicitly read-only.
+    if (meta.ownership === 'legacy-unverified') return { meta, changed: false };
+    const legacy = { ...meta, ownership: 'legacy-unverified' };
+    this.metadata.set(filePath, legacy);
+    return { meta: legacy, changed: true };
+  }
+
+  async describeArtifactSource(tempDir, filePath, { optional = false } = {}) {
+    if (!isDirectChildPath(tempDir, filePath)) {
+      throw new Error('커밋 정리 대상이 앱 임시 폴더를 벗어났습니다.');
+    }
+    const details = await fs.lstat(filePath).catch(() => null);
+    if (!details) {
+      if (optional) return null;
+      throw new Error('커밋할 임시 파일을 찾을 수 없습니다.');
+    }
+    if (!details.isFile() || details.isSymbolicLink()) {
+      throw new Error('커밋 정리 대상이 안전한 일반 파일이 아닙니다.');
     }
     const identity = await fileIdentity(filePath);
-    if (!identity) {
-      this.metadata.delete(filePath);
-      return { meta: {}, changed: true };
+    if (!identity) throw new Error('커밋할 임시 파일의 정체성을 확인할 수 없습니다.');
+    return { name: path.basename(filePath), identity };
+  }
+
+  async artifactSourceMatches(tempDir, source) {
+    const filePath = artifactSourcePath(tempDir, source);
+    if (!filePath || !isDirectChildPath(tempDir, filePath)) return false;
+    const details = await fs.lstat(filePath).catch(() => null);
+    if (!details?.isFile() || details.isSymbolicLink()) return false;
+    return source.contentIdentity
+      ? fileMatchesContentIdentity(filePath, source.contentIdentity)
+      : fileMatchesIdentity(filePath, source.identity);
+  }
+
+  async artifactTargetMatches(filePath, source) {
+    return source.contentIdentity
+      ? fileMatchesContentIdentity(filePath, source.contentIdentity)
+      : fileMatchesIdentity(filePath, source.identity);
+  }
+
+  async cleanupArtifactSources(tempDir, sources) {
+    let pending = false;
+    for (const source of sources) {
+      const filePath = artifactSourcePath(tempDir, source);
+      if (!filePath || !(await this.artifactSourceMatches(tempDir, source))) continue;
+      await fs.rm(filePath, { force: true }).catch(() => {});
+      if (await this.artifactSourceMatches(tempDir, source)) pending = true;
     }
-    const migrated = { ...meta, fileIdentity: identity };
-    this.metadata.set(filePath, migrated);
-    return { meta: migrated, changed: true };
+    return !pending;
+  }
+
+  async commitArtifactToUnique({
+    sourcePath,
+    recordingsDir,
+    baseName,
+    extension,
+    cleanupPaths = [],
+    meta = null,
+    durationMs = 0
+  }) {
+    const normalizedExtension = String(extension || '').replace(/^\./, '').toLowerCase();
+    if (!/^(mp4|webm|mkv|avi)$/.test(normalizedExtension)) {
+      throw new Error('커밋할 녹화 파일 형식이 올바르지 않습니다.');
+    }
+    const tempDir = await paths.ensureOwnedTempDir(recordingsDir);
+    const source = await this.describeArtifactSource(tempDir, sourcePath);
+    const cleanupSources = [];
+    const knownSourceNames = new Set([source.name.toLowerCase()]);
+    for (const candidate of cleanupPaths) {
+      if (typeof candidate !== 'string' || !candidate) continue;
+      const extra = await this.describeArtifactSource(tempDir, candidate, { optional: true });
+      if (!extra || knownSourceNames.has(extra.name.toLowerCase())) continue;
+      knownSourceNames.add(extra.name.toLowerCase());
+      cleanupSources.push(extra);
+    }
+
+    const journalPath = path.join(tempDir, `rp4-${crypto.randomUUID()}.commit.json`);
+    let journal = {
+      version: 1,
+      state: 'ready-to-commit',
+      targetName: path.basename(numberedPath(recordingsDir, baseName, normalizedExtension, 0)),
+      baseName,
+      extension: normalizedExtension,
+      source,
+      cleanupSources,
+      ...(meta && typeof meta === 'object' ? { meta: normalizeRecordingMeta(meta) } : {}),
+      durationMs: boundedDurationMs(durationMs)
+    };
+    const persist = async () => writeJsonAtomic(journalPath, journal);
+
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      const target = numberedPath(recordingsDir, baseName, normalizedExtension, attempt);
+      journal = { ...journal, targetName: path.basename(target), state: 'ready-to-commit' };
+      await persist();
+      let committed;
+      try {
+        committed = await commitFileNoClobber(sourcePath, target, {
+          onCopyPrepared: async (contentIdentityValue) => {
+            journal = {
+              ...journal,
+              source: { ...journal.source, contentIdentity: contentIdentityValue }
+            };
+            await persist();
+          }
+        });
+      } catch (error) {
+        if (error?.code === 'EEXIST') continue;
+        throw error;
+      }
+      if (!(await this.artifactTargetMatches(committed.target, journal.source))) {
+        throw codedError('COMMIT_IDENTITY_MISMATCH', '커밋된 녹화 파일의 정체성을 확인할 수 없습니다.');
+      }
+
+      // The target is now durable.  Cleanup is a separate transaction phase: a locked
+      // temp file must never turn a successful clip conversion into an "original" save.
+      journal = { ...journal, state: 'cleanup-pending' };
+      await persist().catch(() => {});
+      const cleanupComplete = await this.cleanupArtifactSources(tempDir, [journal.source, ...journal.cleanupSources]);
+      if (cleanupComplete) {
+        await fs.rm(journalPath, { force: true }).catch(() => {});
+      } else {
+        await persist().catch(() => {});
+      }
+      return { target: committed.target, cleanupPending: !cleanupComplete };
+    }
+    throw new Error('고유한 녹화 파일 이름을 확보하지 못했습니다.');
+  }
+
+  async recoverArtifactCommitJournals(tempDir, recordingsDir) {
+    const pendingPaths = new Set();
+    const recovered = [];
+    const failed = [];
+    const entries = await fs.readdir(tempDir, { withFileTypes: true }).catch(() => []);
+
+    for (const entry of entries) {
+      if (!entry.isFile() || !ARTIFACT_COMMIT_JOURNAL_PATTERN.test(entry.name)) continue;
+      const journalPath = path.join(tempDir, entry.name);
+      const details = await fs.lstat(journalPath).catch(() => null);
+      if (!details?.isFile() || details.isSymbolicLink()
+        || details.size > MAX_ARTIFACT_COMMIT_JOURNAL_BYTES) {
+        failed.push({ filePath: journalPath, error: '커밋 복구 정보 형식이 올바르지 않습니다.' });
+        continue;
+      }
+      let journal;
+      try {
+        journal = normalizeArtifactJournal(JSON.parse(await fs.readFile(journalPath, 'utf8')));
+      } catch {
+        journal = null;
+      }
+      if (!journal) {
+        failed.push({ filePath: journalPath, error: '커밋 복구 정보를 읽을 수 없습니다.' });
+        continue;
+      }
+
+      const allSources = [journal.source, ...journal.cleanupSources];
+      for (const source of allSources) {
+        const sourcePath = artifactSourcePath(tempDir, source);
+        if (sourcePath) pendingPaths.add(canonicalPathKey(sourcePath));
+      }
+      const persist = async () => writeJsonAtomic(journalPath, journal);
+      let target = path.join(recordingsDir, journal.targetName);
+      let committed = await this.artifactTargetMatches(target, journal.source);
+
+      if (!committed) {
+        const sourcePath = artifactSourcePath(tempDir, journal.source);
+        if (!sourcePath || !(await this.artifactSourceMatches(tempDir, journal.source))) {
+          failed.push({ filePath: journalPath, error: '커밋 대상 또는 임시 원본의 정체성을 확인할 수 없습니다.' });
+          continue;
+        }
+        for (let attempt = 0; attempt < 500; attempt += 1) {
+          target = attempt === 0 ? path.join(recordingsDir, journal.targetName)
+            : numberedPath(recordingsDir, journal.baseName, journal.extension, attempt);
+          journal = { ...journal, targetName: path.basename(target), state: 'ready-to-commit' };
+          try {
+            await persist();
+            await commitFileNoClobber(sourcePath, target, {
+              onCopyPrepared: async (contentIdentityValue) => {
+                journal = {
+                  ...journal,
+                  source: { ...journal.source, contentIdentity: contentIdentityValue }
+                };
+                await persist();
+              }
+            });
+            committed = await this.artifactTargetMatches(target, journal.source);
+            if (committed) break;
+          } catch (error) {
+            if (error?.code !== 'EEXIST') {
+              failed.push({ filePath: journalPath, error: error?.message || String(error) });
+              break;
+            }
+          }
+        }
+      }
+
+      if (!committed) {
+        failed.push({ filePath: journalPath, error: '커밋된 녹화 파일의 정체성을 확인할 수 없습니다.' });
+        continue;
+      }
+
+      journal = { ...journal, state: 'cleanup-pending' };
+      await persist().catch(() => {});
+      const cleanupComplete = await this.cleanupArtifactSources(tempDir, [journal.source, ...journal.cleanupSources]);
+      if (!cleanupComplete) {
+        await persist().catch(() => {});
+        failed.push({ filePath: journalPath, error: '커밋된 원본 정리를 다음 실행에서 다시 시도합니다.' });
+        continue;
+      }
+      await fs.rm(journalPath, { force: true }).catch(() => {});
+      for (const source of allSources) {
+        const sourcePath = artifactSourcePath(tempDir, source);
+        if (sourcePath) pendingPaths.delete(canonicalPathKey(sourcePath));
+      }
+      if (!this.metadata.has(target)) {
+        const stats = await statFile(target);
+        await this.setMetadata(target, {
+          ...normalizeRecordingMeta(journal.meta),
+          format: journal.extension,
+          status: 'complete',
+          partial: false,
+          outcome: 'recovered-committed',
+          recovered: true,
+          durationMs: boundedDurationMs(journal.durationMs),
+          bytes: stats?.size || 0
+        });
+      }
+      recovered.push(target);
+    }
+    return { pendingPaths, recovered, failed };
   }
 
   async flushIndex() {
@@ -967,6 +1261,15 @@ class RecordingManager {
           failed: [{ filePath: paths.tempDirFor(recordingsDir), error: error.message }]
         };
       }
+      let artifactRecovery = { pendingPaths: new Set(), recovered: [], failed: [] };
+      try {
+        artifactRecovery = await this.recoverArtifactCommitJournals(tempDir, recordingsDir);
+      } catch (error) {
+        artifactRecovery.failed.push({
+          filePath: tempDir,
+          error: `커밋 복구를 완료하지 못했습니다. ${error?.message || error}`
+        });
+      }
       let entries;
       try {
         entries = await fs.readdir(tempDir, { withFileTypes: true });
@@ -974,8 +1277,8 @@ class RecordingManager {
         return { removed: 0, recovered: [], failed: [] };
       }
 
-    const recovered = [];
-    const failed = [];
+    const recovered = [...artifactRecovery.recovered];
+    const failed = [...artifactRecovery.failed];
     let removed = 0;
 
     // A crash can leave FFmpeg's same-volume staging AVI behind. If its raw manifest
@@ -985,6 +1288,7 @@ class RecordingManager {
       const match = LOSSLESS_FINALIZING_PATTERN.exec(entry.name);
       if (!match || !entry.isFile()) continue;
       const fullPath = path.join(tempDir, entry.name);
+      if (artifactRecovery.pendingPaths.has(canonicalPathKey(fullPath))) continue;
       if (this.isActiveTempPath(fullPath)) continue;
       const manifestPath = path.join(tempDir, `rp4-${match[1]}.lossless.json`);
       if (await paths.pathExists(manifestPath)) continue;
@@ -1024,6 +1328,7 @@ class RecordingManager {
       const repairMatch = TEMP_REPAIR_PATTERN.exec(entry.name);
       if ((!normalMatch && !repairMatch) || !entry.isFile()) continue;
       const fullPath = path.join(tempDir, entry.name);
+      if (artifactRecovery.pendingPaths.has(canonicalPathKey(fullPath))) continue;
       if (this.isActiveTempPath(fullPath)) continue;
       const isRepair = Boolean(repairMatch);
       const sessionUuid = normalMatch?.[1] || repairMatch[1];
@@ -1408,6 +1713,7 @@ class RecordingManager {
       segmentedClip: safeMeta.clip === true && safeMeta.segmentedClip === true,
       segmentPaths: [tempPath],
       pendingTempPaths: new Set(),
+      cleanupTempPaths: new Set(),
       currentSegmentIndex: 0,
       highestQueuedSegmentIndex: 0,
       handleClosed: false,
@@ -1485,9 +1791,14 @@ class RecordingManager {
       || frameBytes <= 0 || frameBytes > MAX_LOSSLESS_FRAME_BYTES) {
       throw codedError(
         'FRAME_TOO_LARGE',
-        '원본 프레임이 64MiB 안전 한도를 초과해 무압축 녹화를 시작할 수 없습니다.'
+        '원본 프레임이 192MiB 안전 한도를 초과해 무압축 녹화를 시작할 수 없습니다.'
       );
     }
+    const maxInFlightFrames = Math.max(1, Math.min(
+      3,
+      Math.floor(MAX_LOSSLESS_IN_FLIGHT_BYTES / frameBytes)
+    ));
+    const maxQueuedBytes = Math.max(this.maxSessionQueuedBytes, frameBytes);
 
     const sessionId = crypto.randomUUID();
     const baseName = [
@@ -1551,6 +1862,8 @@ class RecordingManager {
       audioSampleRate,
       audioChannels,
       frameBytes,
+      maxQueuedBytes,
+      maxInFlightFrames,
       frameCount: 0,
       firstFrameTimestampUs: null,
       lastFrameTimestampUs: null,
@@ -1581,7 +1894,7 @@ class RecordingManager {
       recordedCodec: 'rawvideo',
       frameBytes,
       maxFrameBytes: MAX_LOSSLESS_FRAME_BYTES,
-      maxInFlightFrames: 3
+      maxInFlightFrames
     };
   }
 
@@ -1631,7 +1944,7 @@ class RecordingManager {
   }
 
   enqueueLosslessWrite(session, chunk, { audio, timestampUs = null }) {
-    if (session.queuedBytes + chunk.length > this.maxSessionQueuedBytes) {
+    if (session.queuedBytes + chunk.length > (session.maxQueuedBytes || this.maxSessionQueuedBytes)) {
       session.failed = '무압축 녹화 쓰기 대기열이 허용 한도를 초과했습니다.';
       return Promise.reject(new Error(session.failed));
     }
@@ -2121,20 +2434,28 @@ class RecordingManager {
       this.addFinalizingPath(session.sessionId, combinedPath);
       try {
         const sourceSegments = [...session.segmentPaths];
+        const expectsAudio = Boolean(session.meta.hasSystemAudio || session.meta.hasMic);
         await ffmpeg.concatSegments(session.segmentPaths, combinedPath, {
           jobId: `clip-concat:${session.baseName}`,
           totalDurationMs: Number(payload.durationMs) || Number(session.meta.durationMs) || 0,
+          requireAudio: expectsAudio,
           onProgress: (ratio) => this.emit('recording:convert-progress', {
             phase: 'clip-concat',
             ratio
           })
         });
         await ffmpeg.validateMedia(combinedPath, {
-          expectedDurationMs: Number(payload.durationMs) || Number(session.meta.durationMs) || 0
+          expectedDurationMs: Number(payload.durationMs) || Number(session.meta.durationMs) || 0,
+          requireAudio: expectsAudio
         });
         session.tempPath = combinedPath;
         session.segmentPaths = [combinedPath];
-        await Promise.allSettled(sourceSegments.map((filePath) => fs.rm(filePath, { force: true })));
+        // Do not drop the source epochs until the user-visible clip itself has committed.
+        // A cleanup journal will remove them on a later launch if Windows/AV temporarily
+        // keeps one open, rather than recovering each epoch as an extra recording.
+        for (const filePath of sourceSegments) {
+          if (filePath !== combinedPath) session.cleanupTempPaths.add(filePath);
+        }
       } catch (error) {
         await fs.rm(combinedPath, { force: true }).catch(() => {});
         session.failed = `클립 세그먼트를 결합하지 못했습니다. ${error?.message || error}`.slice(0, 500);
@@ -2171,7 +2492,7 @@ class RecordingManager {
         : null
     );
     const finalized = failureReason
-      ? await this.keepPartial(session, failureReason)
+      ? await this.keepPartial(session, failureReason, { durationMs })
       : await this.finalize(session, { durationMs });
     const stats = await statFile(finalized.filePath);
     const outcome = finalized.partial
@@ -2196,7 +2517,12 @@ class RecordingManager {
     await this.setMetadata(finalized.filePath, meta);
 
     if (verificationPending) {
-      this.enqueueVerification(finalized.filePath, durationMs, finalized.optimizable);
+      this.enqueueVerification(
+        finalized.filePath,
+        durationMs,
+        finalized.optimizable,
+        Boolean(meta.hasSystemAudio || meta.hasMic)
+      );
     } else if (finalized.optimizable && this.settings.value.optimizeMp4) {
       this.enqueueOptimize(finalized.filePath, durationMs);
     }
@@ -2231,6 +2557,19 @@ class RecordingManager {
   async finalize(session, { durationMs }) {
     const { targetFormat, recordedContainer, recordedCodec, recordedAudioCodec } = session;
     const canStreamCopyToMp4 = targetFormat === 'mp4' && recordedCodec === 'h264';
+    const expectsAudio = Boolean(session.meta.hasSystemAudio || session.meta.hasMic);
+    const inheritedCleanupPaths = [...(session.cleanupTempPaths || [])];
+    const commitArtifact = async (sourcePath, extension, cleanupPaths = [], commitDurationMs = durationMs) => (
+      await this.commitArtifactToUnique({
+        sourcePath,
+        recordingsDir: session.recordingsDir,
+        baseName: session.baseName,
+        extension,
+        cleanupPaths: [...inheritedCleanupPaths, ...cleanupPaths],
+        meta: session.meta,
+        durationMs: commitDurationMs
+      })
+    );
 
     // A user-visible recent clip has an exact privacy boundary. Re-encode across the
     // start boundary rather than stream-copying from a preceding H.264 keyframe.
@@ -2249,38 +2588,41 @@ class RecordingManager {
           bitrateMbps: session.meta.bitrateMbps,
           audioBitrateKbps: session.meta.audioBitrateKbps,
           encoderPreset: session.meta.encoderPreset,
+          requireAudio: expectsAudio,
           jobId: `clip:${session.baseName}`,
           onProgress: progress
         });
         await ffmpeg.validateMedia(staging, {
           expectedDurationMs: recentDurationMs,
+          requireAudio: expectsAudio,
           maxDurationRatio: 1.05
         });
-        const target = await commitStagedFileToUnique(
+        const committed = await commitArtifact(
           staging,
-          session.recordingsDir,
-          session.baseName,
-          targetFormat
+          targetFormat,
+          [session.tempPath],
+          recentDurationMs
         );
-        await fs.rm(session.tempPath, { force: true });
-        return { filePath: target, format: targetFormat, converted: true, optimizable: false };
+        return {
+          filePath: committed.target,
+          format: targetFormat,
+          converted: true,
+          optimizable: false,
+          cleanupPending: committed.cleanupPending
+        };
       } catch (error) {
         await fs.rm(staging, { force: true }).catch(() => {});
-        return this.keepOriginal(session, error);
+        return this.keepOriginal(session, error, { durationMs });
       }
     }
 
     if (recordedContainer === targetFormat) {
-      const target = await commitStagedFileToUnique(
-        session.tempPath,
-        session.recordingsDir,
-        session.baseName,
-        targetFormat
-      );
+      const committed = await commitArtifact(session.tempPath, targetFormat);
       return {
-        filePath: target,
+        filePath: committed.target,
         format: targetFormat,
         converted: false,
+        cleanupPending: committed.cleanupPending,
         // A stream-copy pass moves the moov atom to the front. It is optional, runs in
         // the background, and never delays the save.
         optimizable: targetFormat === 'mp4',
@@ -2295,6 +2637,7 @@ class RecordingManager {
         const remuxOptions = {
           totalDurationMs: durationMs,
           audioBitrateKbps: session.meta.audioBitrateKbps,
+          requireAudio: expectsAudio,
           onProgress: (ratio) => this.emit('recording:convert-progress', { phase: 'remux', ratio })
         };
         if (recordedAudioCodec === 'opus') {
@@ -2302,18 +2645,22 @@ class RecordingManager {
         } else {
           await ffmpeg.remux(session.tempPath, staging, remuxOptions);
         }
-        await ffmpeg.validateMedia(staging, { expectedDurationMs: durationMs });
-        const target = await commitStagedFileToUnique(
+        await ffmpeg.validateMedia(staging, { expectedDurationMs: durationMs, requireAudio: expectsAudio });
+        const committed = await commitArtifact(
           staging,
-          session.recordingsDir,
-          session.baseName,
-          'mp4'
+          'mp4',
+          [session.tempPath]
         );
-        await fs.rm(session.tempPath, { force: true });
-        return { filePath: target, format: 'mp4', converted: true, optimizable: false };
+        return {
+          filePath: committed.target,
+          format: 'mp4',
+          converted: true,
+          optimizable: false,
+          cleanupPending: committed.cleanupPending
+        };
       } catch (error) {
         await fs.rm(staging, { force: true }).catch(() => {});
-        return this.keepOriginal(session, error);
+        return this.keepOriginal(session, error, { durationMs });
       }
     }
 
@@ -2326,66 +2673,80 @@ class RecordingManager {
           bitrateMbps: session.meta.bitrateMbps,
           audioBitrateKbps: session.meta.audioBitrateKbps,
           encoderPreset: session.meta.encoderPreset,
+          requireAudio: expectsAudio,
           totalDurationMs: durationMs,
           jobId: `convert:${session.baseName}`,
           onProgress: (ratio) => this.emit('recording:convert-progress', { phase: 'transcode', ratio })
         });
-        await ffmpeg.validateMedia(staging, { expectedDurationMs: durationMs });
-        const target = await commitStagedFileToUnique(
+        await ffmpeg.validateMedia(staging, { expectedDurationMs: durationMs, requireAudio: expectsAudio });
+        const committed = await commitArtifact(
           staging,
-          session.recordingsDir,
-          session.baseName,
-          'mp4'
+          'mp4',
+          [session.tempPath]
         );
-        await fs.rm(session.tempPath, { force: true });
-        return { filePath: target, format: 'mp4', converted: true, optimizable: false };
+        return {
+          filePath: committed.target,
+          format: 'mp4',
+          converted: true,
+          optimizable: false,
+          cleanupPending: committed.cleanupPending
+        };
       } catch (error) {
         await fs.rm(staging, { force: true }).catch(() => {});
-        return this.keepOriginal(session, error);
+        return this.keepOriginal(session, error, { durationMs });
       }
     }
 
     // Requested WebM but recorded something else: keep the real container rather than
     // lying about the extension.
-    const target = await commitStagedFileToUnique(
-      session.tempPath,
-      session.recordingsDir,
-      session.baseName,
-      recordedContainer
-    );
-    return { filePath: target, format: recordedContainer, converted: false, optimizable: false };
+    const committed = await commitArtifact(session.tempPath, recordedContainer);
+    return {
+      filePath: committed.target,
+      format: recordedContainer,
+      converted: false,
+      optimizable: false,
+      cleanupPending: committed.cleanupPending
+    };
   }
 
   /** Conversion failed: keep the untouched recording so nothing is ever lost. */
-  async keepOriginal(session, error) {
-    const target = await commitStagedFileToUnique(
-      session.tempPath,
-      session.recordingsDir,
-      `${session.baseName}_original`,
-      session.recordedContainer
-    );
+  async keepOriginal(session, error, { durationMs = 0 } = {}) {
+    const committed = await this.commitArtifactToUnique({
+      sourcePath: session.tempPath,
+      recordingsDir: session.recordingsDir,
+      baseName: `${session.baseName}_original`,
+      extension: session.recordedContainer,
+      cleanupPaths: [...(session.cleanupTempPaths || [])],
+      meta: session.meta,
+      durationMs
+    });
     return {
-      filePath: target,
+      filePath: committed.target,
       format: session.recordedContainer,
       converted: false,
       optimizable: false,
+      cleanupPending: committed.cleanupPending,
       conversionError: error?.message || String(error)
     };
   }
 
   /** A write failed: preserve every byte under an explicit partial name. */
-  async keepPartial(session, failureReason) {
-    const target = await commitStagedFileToUnique(
-      session.tempPath,
-      session.recordingsDir,
-      `${session.baseName}_partial`,
-      session.recordedContainer
-    );
+  async keepPartial(session, failureReason, { durationMs = 0 } = {}) {
+    const committed = await this.commitArtifactToUnique({
+      sourcePath: session.tempPath,
+      recordingsDir: session.recordingsDir,
+      baseName: `${session.baseName}_partial`,
+      extension: session.recordedContainer,
+      cleanupPaths: [...(session.cleanupTempPaths || [])],
+      meta: session.meta,
+      durationMs
+    });
     return {
-      filePath: target,
+      filePath: committed.target,
       format: session.recordedContainer,
       converted: false,
       optimizable: false,
+      cleanupPending: committed.cleanupPending,
       partial: true,
       failureReason
     };
@@ -2444,7 +2805,7 @@ class RecordingManager {
       });
   }
 
-  enqueueVerification(filePath, durationMs, optimizable = false) {
+  enqueueVerification(filePath, durationMs, optimizable = false, requireAudio = false) {
     if (this.verificationCancelled) return Promise.resolve(false);
     const key = recordingWorkKey(filePath);
     if (this.verificationJobs.has(key)) return this.verificationJobs.get(key);
@@ -2456,6 +2817,7 @@ class RecordingManager {
       key,
       durationMs,
       optimizable,
+      requireAudio: Boolean(requireAudio),
       jobId: `verify:${crypto.randomUUID()}`,
       promise,
       resolve: resolveJob
@@ -2483,7 +2845,7 @@ class RecordingManager {
   }
 
   async runVerification(job) {
-    const { filePath, key, durationMs, optimizable } = job;
+    const { filePath, key, durationMs, optimizable, requireAudio } = job;
     if (this.deletingFiles.has(key)) return false;
     const sourceIdentity = await fileIdentity(filePath);
     if (sourceIdentity) {
@@ -2500,6 +2862,7 @@ class RecordingManager {
     try {
       await ffmpeg.validateMedia(filePath, {
         expectedDurationMs: durationMs,
+        requireAudio,
         jobId: job.jobId
       });
       if (this.deletingFiles.has(key)) return false;
@@ -2633,7 +2996,12 @@ class RecordingManager {
       resumed += 1;
       const durationMs = Number(meta.durationMs) || 0;
       const optimizable = String(meta.format || '').toLowerCase() === 'mp4';
-      this.enqueueVerification(filePath, durationMs, optimizable);
+      this.enqueueVerification(
+        filePath,
+        durationMs,
+        optimizable,
+        Boolean(meta.hasSystemAudio || meta.hasMic)
+      );
     }
     return resumed;
   }
@@ -2781,7 +3149,9 @@ class RecordingManager {
 
   toDto(filePath, stats, meta = {}) {
     const hasMetadata = meta && typeof meta === 'object' && Object.keys(meta).length > 0;
-    const managed = hasMetadata;
+    // Descriptive legacy metadata is intentionally not ownership evidence.  Only a
+    // current identity can authorize destructive operations such as trash/optimization.
+    const managed = Boolean(normalizeStagedIdentity(meta?.fileIdentity));
     const extension = path.extname(filePath).slice(1).toLowerCase();
     const defaultStatus = !hasMetadata && extension === 'avi' ? 'unverified' : 'complete';
     return {
@@ -3012,7 +3382,8 @@ class RecordingManager {
         this.enqueueVerification(
           target,
           Number(previousMeta.durationMs) || 0,
-          String(previousMeta.format || '').toLowerCase() === 'mp4'
+          String(previousMeta.format || '').toLowerCase() === 'mp4',
+          Boolean(previousMeta.hasSystemAudio || previousMeta.hasMic)
         );
       }
     }

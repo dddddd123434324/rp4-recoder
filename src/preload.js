@@ -105,7 +105,11 @@ contextBridge.exposeInMainWorld('rp4', {
     ipcRenderer.send('app:shutdown-failed', { requestId, error: String(error || '').slice(0, 500) })
   ),
   reportFinalizeComplete: (requestId, result = {}) => (
-    ipcRenderer.send('app:shutdown-ready', { requestId, ok: result.ok !== false })
+    ipcRenderer.send('app:shutdown-ready', {
+      requestId,
+      ok: result.ok !== false,
+      ...(result.ok === false && result.error ? { error: String(result.error).slice(0, 500) } : {})
+    })
   ),
 
   window: {

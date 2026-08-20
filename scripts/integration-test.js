@@ -516,6 +516,48 @@ async function run() {
   check('oversized recording index is backed up without parsing',
     oversizedIndex.recovered && Boolean(oversizedIndex.backupPath));
 
+  // A successful user-visible commit and a failed temp cleanup are different phases.
+  // In particular, a precise clip must never surface its longer source buffer as another
+  // recovered recording merely because an antivirus/indexer held that temp file open.
+  const artifactOriginal = path.join(settings.tempDir, `rp4-${crypto.randomUUID()}.part.mp4`);
+  const artifactTrimmed = path.join(settings.tempDir, `rp4-${crypto.randomUUID()}.part.mp4`);
+  await fsp.writeFile(artifactOriginal, Buffer.from('older private footage'));
+  await fsp.writeFile(artifactTrimmed, Buffer.from('precise requested clip'));
+  const originalArtifactRm = fsp.rm;
+  fsp.rm = async (target, options) => {
+    if (path.resolve(target) === path.resolve(artifactOriginal)) {
+      const error = new Error('simulated temporary file lock');
+      error.code = 'EPERM';
+      throw error;
+    }
+    return originalArtifactRm(target, options);
+  };
+  let committedArtifact;
+  try {
+    committedArtifact = await recordings.commitArtifactToUnique({
+      sourcePath: artifactTrimmed,
+      recordingsDir: RECORDINGS,
+      baseName: 'clip-cleanup-journal',
+      extension: 'mp4',
+      cleanupPaths: [artifactOriginal],
+      meta: { clip: true, mode: 'area', sourceName: 'journal test' },
+      durationMs: 1000
+    });
+  } finally {
+    fsp.rm = originalArtifactRm;
+  }
+  const artifactRecovery = await recordings.sweepTempDir();
+  const artifactRecoveryFiles = (await fsp.readdir(RECORDINGS)).filter((name) => (
+    name.startsWith('clip-cleanup-journal') && name.endsWith('.mp4')
+  ));
+  check('commit cleanup journal preserves one precise clip after an unlink failure',
+    committedArtifact?.cleanupPending === true
+      && (await fsp.readFile(committedArtifact.target, 'utf8')) === 'precise requested clip'
+      && !fs.existsSync(artifactOriginal)
+      && !fs.existsSync(artifactTrimmed)
+      && artifactRecoveryFiles.length === 1
+      && !artifactRecovery.recovered.some((filePath) => path.basename(filePath).includes('recovered')));
+
   require('../src/main/ipc').registerIpcHandlers({
     settings,
     recordings,
@@ -739,6 +781,23 @@ async function run() {
 
   // Main waits for an explicit renderer ACK even before a recording session exists.
   const windowHelpers = require('../src/main/windows');
+  const fakeSessionWindow = new EventEmitter();
+  let querySessionEndCalls = 0;
+  let sessionEndCalls = 0;
+  windowHelpers.attachSessionEndHandlers(fakeSessionWindow, {
+    onQuerySessionEnd: () => {
+      querySessionEndCalls += 1;
+      return true;
+    },
+    onSessionEnd: () => { sessionEndCalls += 1; }
+  });
+  let querySessionEndPrevented = false;
+  fakeSessionWindow.emit('query-session-end', {
+    preventDefault: () => { querySessionEndPrevented = true; }
+  });
+  fakeSessionWindow.emit('session-end', {});
+  check('Windows session end lifecycle delays volatile capture only at query-session-end',
+    querySessionEndCalls === 1 && querySessionEndPrevented && sessionEndCalls === 1);
   const electron = require('electron');
   const originalShowMessageBox = electron.dialog.showMessageBox;
   const unresponsivePrompts = [];
@@ -879,6 +938,24 @@ async function run() {
     failedDrain.shutdownFailed === true
       && /simulated/.test(failedDrain.error)
       && failedFinalizeCalls === 0);
+
+  const rejectedReadyContents = new EventEmitter();
+  rejectedReadyContents.send = (channel, payload) => {
+    if (channel !== 'app:finalize-recordings') return;
+    setImmediate(() => require('electron').ipcMain.emit(
+      'app:shutdown-ready',
+      { sender: rejectedReadyContents },
+      { requestId: payload.requestId, ok: false, error: 'simulated recording save failure' }
+    ));
+  };
+  const rejectedReadyDrain = await windowHelpers.drainRecordings(
+    { isDestroyed: () => false, webContents: rejectedReadyContents },
+    fakeRecordings,
+    { timeoutMs: 100 }
+  );
+  check('shutdown-ready with ok:false is treated as a failed save, not success',
+    rejectedReadyDrain.shutdownFailed === true
+      && /simulated recording save failure/.test(rejectedReadyDrain.error));
 
   let closeAttempts = 0;
   const closeFailureSession = {
@@ -1262,6 +1339,31 @@ async function run() {
     ownershipDeleted === false && ownershipTrashCalled === false && fs.existsSync(ownershipPath));
   await fsp.rm(ownershipPath, { force: true });
 
+  // A pre-0.2.24 index has descriptive data but no immutable ownership proof.  Even a
+  // same-size external replacement must stay read-only until it is explicitly adopted.
+  const legacyOwnershipPath = path.join(RECORDINGS, 'legacy-ownership-unverified.mp4');
+  await fsp.copyFile(saved.filePath, legacyOwnershipPath);
+  const legacyOwnershipStats = await fsp.stat(legacyOwnershipPath);
+  recordings.metadata.set(legacyOwnershipPath, {
+    bytes: legacyOwnershipStats.size,
+    durationMs: 5000,
+    sourceName: 'old RP4 metadata'
+  });
+  const legacyOwnershipListed = (await recordings.list()).find((entry) => (
+    entry.filePath === legacyOwnershipPath
+  ));
+  let legacyOwnershipTrashCalled = false;
+  const legacyOwnershipDeleted = await recordings.trashRecording(legacyOwnershipPath, {
+    trash: async () => { legacyOwnershipTrashCalled = true; }
+  });
+  check('legacy metadata without an identity remains read-only even for a same-size file',
+    legacyOwnershipListed?.managed === false
+      && legacyOwnershipListed?.status === 'unmanaged'
+      && legacyOwnershipDeleted === false
+      && legacyOwnershipTrashCalled === false
+      && recordings.metadata.get(legacyOwnershipPath)?.ownership === 'legacy-unverified');
+  await fsp.rm(legacyOwnershipPath, { force: true });
+
   const optimizeOwnershipPath = path.join(RECORDINGS, 'optimize-ownership.mp4');
   const optimizeOwnershipReplacement = path.join(RECORDINGS, 'optimize-ownership-external.mp4');
   await fsp.copyFile(saved.filePath, optimizeOwnershipPath);
@@ -1369,16 +1471,20 @@ async function run() {
   check('lossless AVI is atomically committed without a staging artifact',
     fs.readdirSync(settings.tempDir).every((name) => !name.includes('lossless-finalizing')));
 
-  let oversizedFrameError = null;
-  try {
-    await recordings.startLossless({ ...losslessMeta, width: 7680, height: 4320 }, {
-      webContentsId: win.webContents.id
-    });
-  } catch (error) {
-    oversizedFrameError = error;
-  }
-  check('oversized native frames fail before recording starts with a stable code',
-    oversizedFrameError?.code === 'FRAME_TOO_LARGE');
+  const largeFrameSession = await recordings.startLossless({
+    ...losslessMeta,
+    width: 7680,
+    height: 4320
+  }, { webContentsId: win.webContents.id });
+  const emptyLargeFrameStop = await recordings.stopLossless({
+    sessionId: largeFrameSession.sessionId
+  }, { webContentsId: win.webContents.id });
+  check('8K lossless mode starts with a one-frame backpressure budget instead of refusing',
+    largeFrameSession.frameBytes > 64 * 1024 * 1024
+      && largeFrameSession.frameBytes <= largeFrameSession.maxFrameBytes
+      && largeFrameSession.maxInFlightFrames === 1
+      && emptyLargeFrameStop === null,
+    `${Math.round(largeFrameSession.frameBytes / 1024 / 1024)}MiB, inFlight=${largeFrameSession.maxInFlightFrames}`);
 
   const unknownAvi = path.join(RECORDINGS, 'external-unindexed.avi');
   await fsp.copyFile(losslessSaved.filePath, unknownAvi);
@@ -1481,6 +1587,20 @@ async function run() {
     missingRequiredAudioRejected = true;
   }
   check('recording validation rejects missing required audio', missingRequiredAudioRejected);
+
+  const expectedAudioPath = path.join(RECORDINGS, 'expected-audio-missing.avi');
+  await fsp.copyFile(videoOnlyPath, expectedAudioPath);
+  const expectedAudioManager = new RecordingManager({ settings, emit: () => {} });
+  await expectedAudioManager.setMetadata(expectedAudioPath, {
+    status: 'verifying',
+    durationMs: 400,
+    hasSystemAudio: true,
+    bytes: (await fsp.stat(expectedAudioPath)).size
+  });
+  await expectedAudioManager.enqueueVerification(expectedAudioPath, 400, false, true);
+  check('a recording that captured audio is not marked complete when its audio stream disappears',
+    expectedAudioManager.metadata.get(expectedAudioPath)?.status === 'invalid');
+  await fsp.rm(expectedAudioPath, { force: true });
 
   const overlongPath = path.join(SANDBOX, 'overlong.mp4');
   await runFfmpeg([
@@ -1828,7 +1948,7 @@ async function run() {
     settings,
     emit: (channel, payload) => deleteEvents.push({ channel, payload })
   });
-  deleteManager.metadata.set(deleteTarget, {
+  await deleteManager.setMetadata(deleteTarget, {
     status: 'verifying', durationMs: 5000, format: 'mp4'
   });
   const originalDeleteValidate = ffmpeg.validateMedia;

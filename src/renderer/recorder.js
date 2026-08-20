@@ -8,7 +8,8 @@
 
   const CHUNK_INTERVAL_MS = 2000;
   const FALLBACK_MAX_QUEUED_BYTES = 128 * 1024 * 1024;
-  const MAX_LOSSLESS_FRAME_BYTES = 64 * 1024 * 1024;
+  const MAX_LOSSLESS_FRAME_BYTES = 192 * 1024 * 1024;
+  const MAX_LOSSLESS_IN_FLIGHT_BYTES = 192 * 1024 * 1024;
   const LOSSLESS_FRAME_QUEUE_SIZE = 3;
   const LOSSLESS_ACK_TIMEOUT_MS = 15000;
   const LOSSLESS_DRAIN_TIMEOUT_MS = 15000;
@@ -115,7 +116,7 @@
   function localizedRecordingStartError(error) {
     const known = {
       INSUFFICIENT_SPACE: '무압축 녹화에는 최소 2GB 이상의 여유 공간이 필요합니다.',
-      FRAME_TOO_LARGE: '원본 프레임이 64MiB 안전 한도를 초과해 무압축 녹화를 시작할 수 없습니다.',
+      FRAME_TOO_LARGE: '원본 프레임이 192MiB 안전 한도를 초과해 무압축 녹화를 시작할 수 없습니다.',
       MESSAGE_PORT_UNAVAILABLE: '이 시스템은 고속 무압축 프레임 전송을 지원하지 않습니다.',
       FOLDER_DIALOG_ACTIVE: '저장 폴더를 선택하는 동안에는 녹화를 시작할 수 없습니다.'
     };
@@ -155,6 +156,15 @@
     }
     writer.pending.clear();
     settleLosslessWriter(writer);
+  }
+
+  function losslessInFlightFrameLimit(frameBytes, preferred = LOSSLESS_FRAME_QUEUE_SIZE) {
+    const boundedFrameBytes = Math.max(1, Number(frameBytes) || 1);
+    return Math.max(1, Math.min(
+      LOSSLESS_FRAME_QUEUE_SIZE,
+      Math.max(1, Math.floor(MAX_LOSSLESS_IN_FLIGHT_BYTES / boundedFrameBytes)),
+      Math.max(1, Number(preferred) || 1)
+    ));
   }
 
   async function openLosslessWriter(context) {
@@ -229,8 +239,13 @@
       || Number(context.output?.width) * Number(context.output?.height) * 4;
     if (Number.isSafeInteger(frameBytes) && frameBytes > 0
       && frameBytes <= MAX_LOSSLESS_FRAME_BYTES) {
+      const maxInFlightFrames = losslessInFlightFrameLimit(
+        frameBytes,
+        context.losslessMaxInFlightFrames
+      );
+      context.losslessMaxInFlightFrames = maxInFlightFrames;
       writer.framePool = Array.from(
-        { length: LOSSLESS_FRAME_QUEUE_SIZE },
+        { length: maxInFlightFrames },
         () => new ArrayBuffer(frameBytes)
       );
     }
@@ -427,7 +442,7 @@
           context.losslessInputFrames += 1;
           const sourceTimestampUs = Number(frame.timestamp);
           const timestampUs = normalizeLosslessTimestamp(context, sourceTimestampUs);
-          if (context.losslessFrameWrites.size >= LOSSLESS_FRAME_QUEUE_SIZE) {
+          if (context.losslessFrameWrites.size >= context.losslessMaxInFlightFrames) {
             context.losslessDroppedFrames += 1;
             updateLosslessPerformance(context);
             continue;
@@ -616,7 +631,7 @@
       if (profile.lossless
         && capture.output.width * capture.output.height * 4 > MAX_LOSSLESS_FRAME_BYTES) {
         const error = new Error(
-          '원본 프레임이 64MiB 안전 한도를 초과해 무압축 녹화를 시작할 수 없습니다.'
+          '원본 프레임이 192MiB 안전 한도를 초과해 무압축 녹화를 시작할 수 없습니다.'
         );
         error.code = 'FRAME_TOO_LARGE';
         throw error;
@@ -687,6 +702,10 @@
         recorder,
         lossless: profile.lossless,
         losslessFrameBytes: session.frameBytes,
+        losslessMaxInFlightFrames: Math.max(
+          1,
+          Math.min(LOSSLESS_FRAME_QUEUE_SIZE, Number(session.maxInFlightFrames) || 1)
+        ),
         losslessAudioSampleRate,
         losslessAudioChannels,
         sessionId: session.sessionId,
@@ -922,57 +941,69 @@
   }
 
   async function finalizeLosslessRecording(context) {
-    if (!context || context.finalized) return;
+    if (!context) return { ok: true, saved: null };
+    if (context.finalizePromise) return context.finalizePromise;
+    if (context.finalized) return context.finalizeResult || { ok: true, saved: null };
     context.finalized = true;
-    const durationMs = elapsedMs(context);
-    try {
-      await stopLosslessPipelines(context);
-      const saved = await window.rp4.stopLosslessRecording({
-        sessionId: context.sessionId,
-        durationMs,
-        failureReason: context.failure,
-        meta: {
-          mode: context.sourceSnapshot.mode,
-          modeLabel: context.sourceSnapshot.modeLabel,
-          sourceName: context.sourceSnapshot.sourceName,
-          width: context.output.width,
-          height: context.output.height,
-          fps: context.profile.fps,
-          lossless: true,
-          hardwareEncoding: false,
-          inputFrames: context.losslessInputFrames,
-          droppedFrames: context.losslessDroppedFrames,
-          capturedFrames: context.losslessWrittenFrames,
-          effectiveFps: context.losslessActualFps,
-          firstFrameTimestampUs: context.losslessFirstTimestampUs,
-          lastFrameTimestampUs: context.losslessLastTimestampUs,
-          performanceDegraded: context.losslessDroppedFrames > 0
-            || context.losslessActualFps < context.profile.fps * 0.85
+    context.finalizePromise = (async () => {
+      const durationMs = elapsedMs(context);
+      try {
+        await stopLosslessPipelines(context);
+        const saved = await window.rp4.stopLosslessRecording({
+          sessionId: context.sessionId,
+          durationMs,
+          failureReason: context.failure,
+          meta: {
+            mode: context.sourceSnapshot.mode,
+            modeLabel: context.sourceSnapshot.modeLabel,
+            sourceName: context.sourceSnapshot.sourceName,
+            width: context.output.width,
+            height: context.output.height,
+            fps: context.profile.fps,
+            lossless: true,
+            hardwareEncoding: false,
+            inputFrames: context.losslessInputFrames,
+            droppedFrames: context.losslessDroppedFrames,
+            capturedFrames: context.losslessWrittenFrames,
+            effectiveFps: context.losslessActualFps,
+            firstFrameTimestampUs: context.losslessFirstTimestampUs,
+            lastFrameTimestampUs: context.losslessLastTimestampUs,
+            performanceDegraded: context.losslessDroppedFrames > 0
+              || context.losslessActualFps < context.profile.fps * 0.85
+          }
+        });
+        resetRecordingState(context);
+        RP4.app.updateRecordingUi();
+        await RP4.files.render();
+        if (!state.shuttingDown) await startPreview();
+        if (RP4.lifecycle.isCurrent(context.operationId, 'idle') && !state.recording) {
+          if (!saved) {
+            RP4.ui.setStatus('저장 취소', '기록된 데이터가 없습니다.', 'warn');
+          } else if (saved.status === 'partial') {
+            RP4.ui.setStatus('부분 저장됨', saved.name, 'warn');
+            RP4.ui.showToast(`무압축 녹화 일부만 저장했습니다: ${saved.name}`);
+          } else {
+            RP4.ui.setStatus('저장 완료', saved.name, 'ready');
+            RP4.ui.showToast(`무압축 무손실 저장 완료: ${saved.name}`);
+          }
         }
-      });
-      resetRecordingState(context);
-      RP4.app.updateRecordingUi();
-      await RP4.files.render();
-      if (!state.shuttingDown) await startPreview();
-      if (!RP4.lifecycle.isCurrent(context.operationId, 'idle') || state.recording) return;
-      if (!saved) {
-        RP4.ui.setStatus('저장 취소', '기록된 데이터가 없습니다.', 'warn');
-      } else if (saved.status === 'partial') {
-        RP4.ui.setStatus('부분 저장됨', saved.name, 'warn');
-        RP4.ui.showToast(`무압축 녹화 일부만 저장했습니다: ${saved.name}`);
-      } else {
-        RP4.ui.setStatus('저장 완료', saved.name, 'ready');
-        RP4.ui.showToast(`무압축 무손실 저장 완료: ${saved.name}`);
+        context.finalizeResult = { ok: true, saved };
+        return context.finalizeResult;
+      } catch (error) {
+        console.error(error);
+        context.finalizeError = error;
+        resetRecordingState(context);
+        RP4.app.updateRecordingUi();
+        if (!state.shuttingDown) await startPreview();
+        if (RP4.lifecycle.isCurrent(context.operationId, 'idle') && !state.recording) {
+          RP4.ui.setStatus('저장 실패', '무압축 AVI 저장을 완료하지 못했습니다.', 'warn');
+          RP4.ui.showToast(error?.message || '무압축 AVI 저장을 완료하지 못했습니다.');
+        }
+        context.finalizeResult = { ok: false, saved: null, error };
+        return context.finalizeResult;
       }
-    } catch (error) {
-      console.error(error);
-      resetRecordingState(context);
-      RP4.app.updateRecordingUi();
-      if (!state.shuttingDown) await startPreview();
-      if (!RP4.lifecycle.isCurrent(context.operationId, 'idle') || state.recording) return;
-      RP4.ui.setStatus('저장 실패', '무압축 AVI 저장을 완료하지 못했습니다.', 'warn');
-      RP4.ui.showToast(error?.message || '무압축 AVI 저장을 완료하지 못했습니다.');
-    }
+    })();
+    return context.finalizePromise;
   }
 
   /**
@@ -980,49 +1011,56 @@
    * this is a close plus a rename and returns immediately.
    */
   async function finalizeRecording(context) {
-    if (!context || context.finalized) return;
+    if (!context) return { ok: true, saved: null };
+    if (context.finalizePromise) return context.finalizePromise;
+    if (context.finalized) return context.finalizeResult || { ok: true, saved: null };
 
     context.finalized = true;
     window.clearTimeout(context.stopTimeout);
-    const durationMs = elapsedMs(context);
-    await context.writeQueue;
-
-    try {
-      const saved = await window.rp4.stopRecording({
-        sessionId: context.sessionId,
-        durationMs,
-        failureReason: context.failure
-      });
-      resetRecordingState(context);
-      RP4.app.updateRecordingUi();
-      await RP4.files.render();
-      if (!state.shuttingDown) await startPreview();
-      if (!RP4.lifecycle.isCurrent(context.operationId, 'idle') || state.recording) return;
-
-      if (!saved) {
-        RP4.ui.setStatus('저장 취소', '기록된 데이터가 없습니다.', 'warn');
-        return;
+    context.finalizePromise = (async () => {
+      const durationMs = elapsedMs(context);
+      try {
+        await context.writeQueue;
+        const saved = await window.rp4.stopRecording({
+          sessionId: context.sessionId,
+          durationMs,
+          failureReason: context.failure
+        });
+        resetRecordingState(context);
+        RP4.app.updateRecordingUi();
+        await RP4.files.render();
+        if (!state.shuttingDown) await startPreview();
+        if (RP4.lifecycle.isCurrent(context.operationId, 'idle') && !state.recording) {
+          if (!saved) {
+            RP4.ui.setStatus('저장 취소', '기록된 데이터가 없습니다.', 'warn');
+          } else if (saved.status === 'partial') {
+            RP4.ui.setStatus('부분 저장됨', saved.name, 'warn');
+            RP4.ui.showToast(`녹화 오류로 일부만 저장했습니다: ${saved.name}`);
+          } else if (saved.conversionError) {
+            RP4.ui.setStatus('원본 저장됨', saved.name, 'warn');
+            RP4.ui.showToast(`원본을 그대로 저장했습니다: ${saved.name}`);
+          } else {
+            RP4.ui.setStatus('저장 완료', saved.name, 'ready');
+            RP4.ui.showToast(`저장 완료: ${saved.name}`);
+          }
+        }
+        context.finalizeResult = { ok: true, saved };
+        return context.finalizeResult;
+      } catch (error) {
+        console.error(error);
+        context.finalizeError = error;
+        resetRecordingState(context);
+        RP4.app.updateRecordingUi();
+        if (!state.shuttingDown) await startPreview();
+        if (RP4.lifecycle.isCurrent(context.operationId, 'idle') && !state.recording) {
+          RP4.ui.setStatus('저장 실패', '녹화 파일 저장을 완료하지 못했습니다.', 'warn');
+          RP4.ui.showToast('녹화 파일 저장을 완료하지 못했습니다.');
+        }
+        context.finalizeResult = { ok: false, saved: null, error };
+        return context.finalizeResult;
       }
-
-      if (saved.status === 'partial') {
-        RP4.ui.setStatus('부분 저장됨', saved.name, 'warn');
-        RP4.ui.showToast(`녹화 오류로 일부만 저장했습니다: ${saved.name}`);
-      } else if (saved.conversionError) {
-        RP4.ui.setStatus('원본 저장됨', saved.name, 'warn');
-        RP4.ui.showToast(`원본을 그대로 저장했습니다: ${saved.name}`);
-      } else {
-        RP4.ui.setStatus('저장 완료', saved.name, 'ready');
-        RP4.ui.showToast(`저장 완료: ${saved.name}`);
-      }
-    } catch (error) {
-      console.error(error);
-      resetRecordingState(context);
-      RP4.app.updateRecordingUi();
-      if (!state.shuttingDown) await startPreview();
-      if (!RP4.lifecycle.isCurrent(context.operationId, 'idle') || state.recording) return;
-      RP4.ui.setStatus('저장 실패', '녹화 파일 저장을 완료하지 못했습니다.', 'warn');
-      RP4.ui.showToast('녹화 파일 저장을 완료하지 못했습니다.');
-    }
+    })();
+    return context.finalizePromise;
   }
 
   function togglePause() {
@@ -1114,6 +1152,7 @@
     }
     await state.recordingStartPromise?.catch(() => {});
     if (!state.recording) return;
+    const context = state.recording;
     const done = new Promise((resolve) => {
       const poll = () => {
         if (!state.recording) {
@@ -1135,7 +1174,17 @@
     window.clearTimeout(timer);
     if (!finalized && state.recording) {
       state.recording.failure ||= '앱 종료 중 녹화 마무리 시간이 초과되었습니다.';
-      await finalizeRecording(state.recording).catch(() => {});
+      const forced = context.lossless
+        ? await finalizeLosslessRecording(context)
+        : await finalizeRecording(context);
+      if (forced?.ok === false) {
+        throw forced.error || new Error('앱 종료 중 녹화 파일을 저장하지 못했습니다.');
+      }
+      return;
+    }
+    const outcome = await context.finalizePromise;
+    if (outcome?.ok === false) {
+      throw outcome.error || new Error('앱 종료 중 녹화 파일을 저장하지 못했습니다.');
     }
   }
 

@@ -342,13 +342,13 @@ async function createThumbnail(inputPath, outputPath, { jobId, timeoutMs } = {})
  * Stream-copy remux. No re-encoding, so this is I/O bound (measured ~75 ms for 11.5 MB)
  * rather than the minutes a libx264 pass costs.
  */
-function remuxArguments(inputPath, outputPath) {
+function remuxArguments(inputPath, outputPath, { requireAudio = false } = {}) {
   const args = [
     '-y',
     '-fflags', '+genpts',
     '-i', inputPath,
     '-map', '0:v:0',
-    '-map', '0:a?',
+    '-map', requireAudio ? '0:a:0' : '0:a?',
     '-c', 'copy'
   ];
   // `faststart` rewrites the MP4/MOV moov atom. It is not a Matroska/WebM
@@ -361,11 +361,11 @@ function remuxArguments(inputPath, outputPath) {
 }
 
 async function remux(inputPath, outputPath, {
-  jobId, onProgress, totalDurationMs, timeoutMs
+  jobId, onProgress, totalDurationMs, timeoutMs, requireAudio = false
 } = {}) {
   await fs.rm(outputPath, { force: true });
   const inputBytes = await fs.stat(inputPath).then((stats) => stats.size, () => 0);
-  await run(remuxArguments(inputPath, outputPath), {
+  await run(remuxArguments(inputPath, outputPath, { requireAudio }), {
     jobId, onProgress, totalDurationMs, timeoutMs, inputBytes
   });
 }
@@ -387,7 +387,7 @@ async function concatSegments(inputPaths, outputPath, options = {}) {
       '-safe', '0',
       '-i', listPath,
       '-map', '0:v:0',
-      '-map', '0:a?',
+      '-map', options.requireAudio ? '0:a:0' : '0:a?',
       '-c', 'copy',
       '-fflags', '+genpts'
     ];
@@ -415,7 +415,7 @@ async function remuxH264ToMp4(inputPath, outputPath, options = {}) {
     '-fflags', '+genpts',
     '-i', inputPath,
     '-map', '0:v:0',
-    '-map', '0:a?',
+    '-map', options.requireAudio ? '0:a:0' : '0:a?',
     '-c:v', 'copy',
     '-c:a', 'aac',
     '-b:a', `${audioBitrateKbps}k`,
@@ -435,7 +435,8 @@ async function trimRecent(inputPath, outputPath, {
   endOffsetMs = 0,
   jobId,
   onProgress,
-  timeoutMs
+  timeoutMs,
+  requireAudio = false
 } = {}) {
   const seconds = Math.max(0.1, Number(durationMs) / 1000 || 0.1);
   const seekSeconds = seconds + Math.max(0, Number(endOffsetMs) || 0) / 1000;
@@ -446,7 +447,7 @@ async function trimRecent(inputPath, outputPath, {
     '-i', inputPath,
     '-t', seconds.toFixed(3),
     '-map', '0:v:0',
-    '-map', '0:a?',
+    '-map', requireAudio ? '0:a:0' : '0:a?',
     '-c', 'copy',
     '-avoid_negative_ts', 'make_zero'
   ];
@@ -479,7 +480,7 @@ async function trimRecentToMp4(inputPath, outputPath, options = {}) {
     '-i', inputPath,
     '-t', seconds.toFixed(3),
     '-map', '0:v:0',
-    '-map', '0:a?',
+    '-map', options.requireAudio ? '0:a:0' : '0:a?',
     '-c:v', 'copy',
     '-c:a', 'aac',
     '-b:a', `${audioBitrateKbps}k`,
@@ -518,7 +519,7 @@ async function trimRecentPrecisely(inputPath, outputPath, options = {}) {
     '-i', inputPath,
     '-t', seconds.toFixed(3),
     '-map', '0:v:0',
-    '-map', '0:a:0?',
+    '-map', options.requireAudio ? '0:a:0' : '0:a:0?',
     '-vf', `fps=${fps},pad=ceil(iw/2)*2:ceil(ih/2)*2`,
     '-c:v', webm ? 'libvpx-vp9' : 'libx264',
     ...(webm ? ['-b:v', `${bitrateMbps}M`, '-row-mt', '1'] : [
@@ -563,7 +564,7 @@ async function transcodeToMp4(inputPath, outputPath, options = {}) {
     '-i', inputPath,
     ...(recentDurationMs > 0 ? ['-t', (recentDurationMs / 1000).toFixed(3)] : []),
     '-map', '0:v:0',
-    '-map', '0:a?',
+    '-map', options.requireAudio ? '0:a:0' : '0:a?',
     '-vf', `fps=${fps},pad=ceil(iw/2)*2:ceil(ih/2)*2`,
     '-c:v', 'libx264',
     '-preset', preset,

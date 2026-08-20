@@ -43,11 +43,33 @@ function hardenWebContents(contents) {
   });
 }
 
+function attachSessionEndHandlers(win, { onQuerySessionEnd, onSessionEnd } = {}) {
+  win.on('query-session-end', (event) => {
+    try {
+      // This is the only Windows lifecycle point where Electron permits a short delay
+      // for data preservation.  The callback must decide synchronously so the event can
+      // be cancelled before Windows continues the logoff/restart sequence.
+      if (onQuerySessionEnd?.(win, event) === true) event.preventDefault();
+    } catch (error) {
+      process.stderr.write(`query-session-end handler failed: ${error?.stack || error}\n`);
+    }
+  });
+  win.on('session-end', (event) => {
+    try {
+      onSessionEnd?.(win, event);
+    } catch (error) {
+      process.stderr.write(`session-end handler failed: ${error?.stack || error}\n`);
+    }
+  });
+}
+
 function createMainWindow({
   isSmoke,
   onRendererGone,
   onRendererUnresponsive,
-  getRendererUnresponsiveGraceMs
+  getRendererUnresponsiveGraceMs,
+  onQuerySessionEnd,
+  onSessionEnd
 }) {
   const win = new BrowserWindow({
     width: 1440,
@@ -111,6 +133,7 @@ function createMainWindow({
   };
   win.on('hide', () => reportVisibility(false));
   win.on('show', () => reportVisibility(true));
+  attachSessionEndHandlers(win, { onQuerySessionEnd, onSessionEnd });
 
   win.on('close', (event) => {
     if (win.rp4AllowClose) return;
@@ -239,6 +262,13 @@ async function drainRecordings(win, recordingManager, {
       };
       const onReady = (event, payload = {}) => {
         if (!matches(event, payload)) return;
+        if (payload.ok === false) {
+          finish(false, {
+            failed: true,
+            error: payload.error || '녹화 저장을 완료하지 못했습니다.'
+          });
+          return;
+        }
         finish(true);
       };
       const onDestroyed = () => finish(false);
@@ -500,6 +530,7 @@ module.exports = {
   createTray,
   showMainWindow,
   hardenWebContents,
+  attachSessionEndHandlers,
   drainRecordings,
   confirmCloseWhileRecording,
   confirmRendererUnresponsive,
