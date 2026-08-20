@@ -1,8 +1,8 @@
 {
   "name": "rp4-recorder",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "productName": "RP4 Recorder",
-  "description": "RP4 desktop screen recorder",
+  "description": "Local-only open-source screen recorder for Windows",
   "author": "RP4",
   "license": "MIT",
   "main": "src/main.js",
@@ -12,9 +12,12 @@
     "lint:syntax": "node scripts/check-syntax.js",
     "smoke": "node scripts/smoke-test.js",
     "smoke:packaged": "node scripts/packaged-smoke-test.js",
+    "smoke:store": "cross-env RP4_PACKAGED_DIR=dist-store/win-unpacked node scripts/packaged-smoke-test.js",
     "test:integration": "node scripts/run-electron.js scripts/integration-test.js",
     "test": "npm run lint && npm run smoke && npm run test:integration",
     "dist": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false ELECTRON_BUILDER_DISABLE_BUILD_CACHE=true electron-builder --win --x64 && node scripts/write-checksums.js",
+    "dist:store": "npm run legal:update && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false ELECTRON_BUILDER_DISABLE_BUILD_CACHE=true electron-builder --win appx --x64 --config electron-builder.store.yml && npm run smoke:store",
+    "legal:update": "node scripts/update-legal.js",
     "checksums": "node scripts/write-checksums.js"
   },
   "build": {
@@ -32,7 +35,9 @@
     "files": [
       "src/**/*",
       "icon.ico",
+      "LICENSE",
       "THIRD_PARTY_NOTICES.md",
+      "legal/**/*",
       "package.json"
     ],
     "win": {

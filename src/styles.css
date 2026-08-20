@@ -1289,7 +1289,7 @@ svg {
 
 .settings-tabs {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   border: 1px solid #4a505a;
 }
 
@@ -1323,6 +1323,36 @@ svg {
 
 .settings-note + .settings-note {
   margin-top: 6px;
+}
+
+.about-settings {
+  display: grid;
+  gap: 8px;
+}
+
+.about-settings p {
+  margin: 0 0 6px;
+  color: #c9ced6;
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.about-settings a {
+  display: block;
+  padding: 11px 12px;
+  border: 1px solid #4a505a;
+  color: #f1f3f5;
+  background: #343941;
+  font-size: 12px;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.about-settings a:hover,
+.about-settings a:focus-visible {
+  border-color: #ff4a25;
+  background: rgba(255, 45, 10, 0.16);
+  outline: none;
 }
 
 .field-grid select:disabled {

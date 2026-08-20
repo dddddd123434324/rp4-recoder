@@ -1,0 +1,52 @@
+appId: com.rp4.recorder
+productName: RP4 Recorder
+copyright: Copyright © 2026 RP4
+
+toolsets:
+  winCodeSign: 1.1.0
+
+asar: true
+
+asarUnpack:
+  - node_modules/ffmpeg-static/**/*
+
+afterPack: scripts/after-pack.js
+
+directories:
+  output: dist-store
+  buildResources: build
+
+files:
+  - src/**/*
+  - icon.ico
+  - LICENSE
+  - THIRD_PARTY_NOTICES.md
+  - legal/**/*
+  - package.json
+
+win:
+  icon: icon.ico
+  signAndEditExecutable: false
+  signExts:
+    - "!"
+  target:
+    - target: appx
+      arch:
+        - x64
+
+appx:
+  identityName: REAN.RP4Recorder
+  publisher: CN=577818EC-6A79-4ADE-BF63-73675DD6E6F2
+  publisherDisplayName: REAN
+  applicationId: RP4Recorder
+  displayName: RP4 Recorder
+  artifactName: RP4-Recorder-Store-${version}.${ext}
+  backgroundColor: "#111315"
+  languages:
+    - ko-KR
+    - en-US
+  capabilities:
+    - runFullTrust
+    - microphone
+  minVersion: 10.0.17763.0
+  maxVersionTested: 10.0.26100.0

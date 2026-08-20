@@ -13,7 +13,10 @@ const os = require('node:os');
 const path = require('node:path');
 
 const projectRoot = path.resolve(__dirname, '..');
-const executable = path.join(projectRoot, 'dist', 'win-unpacked', 'RP4 Recorder.exe');
+const packagedDir = process.env.RP4_PACKAGED_DIR
+  ? path.resolve(projectRoot, process.env.RP4_PACKAGED_DIR)
+  : path.join(projectRoot, 'dist', 'win-unpacked');
+const executable = path.join(packagedDir, 'RP4 Recorder.exe');
 
 async function main() {
   await fs.access(executable);

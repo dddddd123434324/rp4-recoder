@@ -604,6 +604,7 @@
     RP4.$('#recordSettingsBody').classList.toggle('hidden', type !== 'record');
     RP4.$('#screenshotSettingsBody').classList.toggle('hidden', type !== 'screenshot');
     RP4.$('#hotkeySettingsBody').classList.toggle('hidden', type !== 'hotkeys');
+    RP4.$('#aboutSettingsBody').classList.toggle('hidden', type !== 'about');
     for (const button of RP4.$$('[data-settings-tab]')) {
       const active = button.dataset.settingsTab === type;
       button.classList.toggle('active', active);

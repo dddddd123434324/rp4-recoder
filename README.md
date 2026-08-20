@@ -23,6 +23,8 @@ Windows용 화면 녹화 프로그램입니다. H.264 영상을 MP4로 바로 �
 
 [GitHub Releases](https://github.com/dddddd123434324/rp4-recoder/releases/latest)에서 설치판 또는 포터블 버전을 받을 수 있습니다.
 
+Microsoft Store 배포도 준비 중입니다.
+
 Windows 코드 서명 인증서는 아직 포함되어 있지 않습니다. 각 릴리즈의
 `SHA256SUMS.txt`로 내려받은 파일의 SHA-256을 확인할 수 있습니다.
 
@@ -47,6 +49,8 @@ RP4 Recorder is a Windows screen recorder. It writes H.264 video directly to MP4
 
 Download the installer or portable build from [GitHub Releases](https://github.com/dddddd123434324/rp4-recoder/releases/latest).
 
+Microsoft Store distribution is in preparation.
+
 The Windows binaries are currently unsigned. Each release includes `SHA256SUMS.txt`
 so you can verify the SHA-256 of a downloaded artifact.
 
@@ -57,6 +61,7 @@ npm.cmd install
 npm.cmd start
 npm.cmd test
 npm.cmd run dist
+npm.cmd run dist:store
 ```
 
 Build output is created in `dist/`. Tests use an isolated temporary profile and do not access the user's settings or recordings.
@@ -69,4 +74,8 @@ Build output is created in `dist/`. Tests use an isolated temporary profile and 
 
 ## License
 
-MIT License
+RP4 Recorder source code is licensed under the MIT License. The distributed application
+also contains GPL-licensed FFmpeg and OFL-licensed PyeojinGothic components. See
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and [`legal/`](legal/) for details.
+
+Privacy information is available in [Korean and English](legal/PRIVACY.md).
