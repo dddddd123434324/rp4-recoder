@@ -10,8 +10,11 @@ const paths = require('./paths');
 
 const RECORDING_EXTENSIONS = /\.(webm|mp4|mkv|avi)$/i;
 const INDEX_FILE_NAME = 'recordings-index.json';
-const MAX_INDEX_ENTRIES = 2000;
-const MAX_INDEX_BYTES = 16 * 1024 * 1024;
+// Ownership records are small and must not be silently discarded by an arbitrary entry
+// count: losing an old record changes a saved RP4 file into an "external" file.  Keep a
+// generous byte ceiling as the actual resource guard instead.
+const MAX_INDEX_BYTES = 64 * 1024 * 1024;
+const STARTUP_RECOVERY_MIN_AGE_MS = 60 * 1000;
 
 // Refuse to start a recording without some headroom, and stop cleanly rather than
 // letting writes fail halfway through once the disk is nearly full.
@@ -37,6 +40,10 @@ const BACKUP_FILE_PATTERN = new RegExp(
 );
 const TEMP_RECORDING_PATTERN = new RegExp(
   `^rp4-(${UUID_PATTERN})\\.part\\.(mp4|webm|mkv)$`,
+  'i'
+);
+const TEMP_REPAIR_PATTERN = new RegExp(
+  `^rp4-(${UUID_PATTERN})\\.part\\.(mp4|webm|mkv)\\.repair-(${UUID_PATTERN})\\.(mp4|webm|mkv)$`,
   'i'
 );
 const LOSSLESS_FINALIZING_PATTERN = new RegExp(
@@ -261,14 +268,32 @@ function normalizeStagedIdentity(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const size = Number(value.size);
   if (!Number.isSafeInteger(size) || size < 0) return null;
+  const normalizeTimestamp = (timestamp) => {
+    const number = Number(timestamp);
+    return Number.isFinite(number) && number >= 0 ? Math.round(number) : null;
+  };
+  const mtimeMs = normalizeTimestamp(value.mtimeMs);
+  const birthtimeMs = normalizeTimestamp(value.birthtimeMs);
   const dev = typeof value.dev === 'string' ? value.dev : null;
   const ino = typeof value.ino === 'string' ? value.ino : null;
   if (dev && ino && dev.length <= 64 && ino.length <= 64) {
-    return { size, dev, ino };
+    return {
+      size,
+      dev,
+      ino,
+      ...(mtimeMs != null ? { mtimeMs } : {}),
+      ...(birthtimeMs != null ? { birthtimeMs } : {})
+    };
   }
   const sha256 = typeof value.sha256 === 'string' ? value.sha256.toLowerCase() : null;
   if (sha256 && /^[a-f0-9]{64}$/.test(sha256)) return { size, sha256 };
   return null;
+}
+
+function normalizeContentIdentity(value) {
+  const identity = normalizeStagedIdentity(value);
+  if (!identity?.sha256) return null;
+  return { size: identity.size, sha256: identity.sha256 };
 }
 
 async function hashFile(filePath) {
@@ -294,18 +319,23 @@ async function fileIdentity(filePath) {
   if (!initial?.isFile()) return null;
   const size = Number(initial.size);
   if (!Number.isSafeInteger(size) || size < 0) return null;
+  const timestamps = {
+    ...(Number.isFinite(initial.mtimeMs) ? { mtimeMs: Math.round(initial.mtimeMs) } : {}),
+    ...(Number.isFinite(initial.birthtimeMs) ? { birthtimeMs: Math.round(initial.birthtimeMs) } : {})
+  };
   const dev = String(initial.dev);
   const ino = String(initial.ino);
   // NTFS and the supported POSIX filesystems expose a stable file ID. This avoids
   // hashing multi-gigabyte lossless AVI files merely to prove a committed hard-link.
   if (/^\d+$/.test(dev) && /^\d+$/.test(ino) && dev !== '0' && ino !== '0') {
-    return { size, dev, ino };
+    return { size, dev, ino, ...timestamps };
   }
 
   const sha256 = await hashFile(filePath);
   const final = await statFile(filePath);
-  if (!final?.isFile() || Number(final.size) !== size) return null;
-  return { size, sha256 };
+  if (!final?.isFile() || Number(final.size) !== size
+    || Math.round(final.mtimeMs) !== Math.round(initial.mtimeMs)) return null;
+  return { size, sha256, ...timestamps };
 }
 
 async function fileMatchesIdentity(filePath, expectedValue) {
@@ -314,19 +344,44 @@ async function fileMatchesIdentity(filePath, expectedValue) {
   const stats = await statFile(filePath);
   if (!stats?.isFile() || Number(stats.size) !== expected.size) return false;
   if (expected.dev && expected.ino) {
-    return String(stats.dev) === expected.dev && String(stats.ino) === expected.ino;
+    return String(stats.dev) === expected.dev && String(stats.ino) === expected.ino
+      && (expected.mtimeMs == null || Math.round(stats.mtimeMs) === expected.mtimeMs)
+      && (expected.birthtimeMs == null || Math.round(stats.birthtimeMs) === expected.birthtimeMs);
   }
   const sha256 = await hashFile(filePath);
   const final = await statFile(filePath);
   return Boolean(final?.isFile() && Number(final.size) === expected.size && sha256 === expected.sha256);
 }
 
+async function contentIdentity(filePath) {
+  const initial = await statFile(filePath);
+  if (!initial?.isFile()) return null;
+  const sha256 = await hashFile(filePath);
+  const final = await statFile(filePath);
+  if (!final?.isFile() || Number(final.size) !== Number(initial.size)
+    || Math.round(final.mtimeMs) !== Math.round(initial.mtimeMs)) return null;
+  return { size: Number(initial.size), sha256 };
+}
+
+async function fileMatchesContentIdentity(filePath, expectedValue) {
+  const expected = normalizeContentIdentity(expectedValue);
+  if (!expected) return false;
+  const actual = await contentIdentity(filePath);
+  return Boolean(actual && actual.size === expected.size && actual.sha256 === expected.sha256);
+}
+
 async function writeJsonAtomic(filePath, value) {
   const temporary = `${filePath}.tmp-${crypto.randomUUID()}`;
+  let handle = null;
   try {
-    await fs.writeFile(temporary, JSON.stringify(value), { encoding: 'utf8', flag: 'wx' });
+    handle = await fs.open(temporary, 'wx');
+    await handle.writeFile(JSON.stringify(value), 'utf8');
+    await handle.sync();
+    await handle.close();
+    handle = null;
     await fs.rename(temporary, filePath);
   } finally {
+    await handle?.close().catch(() => {});
     await fs.rm(temporary, { force: true }).catch(() => {});
   }
 }
@@ -373,6 +428,7 @@ async function commitFileNoClobber(from, target) {
     throw codedError('INVALID_STAGING_FILE', '안전하게 커밋할 임시 파일을 확인할 수 없습니다.');
   }
   let committedByHardLink = false;
+  let sourceContentIdentity;
   try {
     await fs.link(from, target);
     committedByHardLink = true;
@@ -391,8 +447,26 @@ async function commitFileNoClobber(from, target) {
       );
     }
     // Non-NTFS/network filesystems may not support hard links. Preserve no-clobber
-    // semantics there even though the fallback necessarily copies the file once.
+    // semantics there even though the fallback necessarily copies the file once.  A copy
+    // receives a new filesystem ID, so verify content rather than comparing its inode to
+    // the staging file's inode.
+    sourceContentIdentity = await contentIdentity(from);
+    if (!sourceContentIdentity || !(await fileMatchesIdentity(from, sourceIdentity))) {
+      throw codedError('STAGING_FILE_CHANGED', '임시 파일이 복사 준비 중 변경되었습니다.');
+    }
     await fs.copyFile(from, target, fsConstants.COPYFILE_EXCL);
+    // `copyFile` completion alone is not a durability boundary on every network/removable
+    // filesystem. Flush the newly created target before allowing the staging source to go.
+    const copiedHandle = await fs.open(target, 'r+');
+    try {
+      await copiedHandle.sync();
+    } finally {
+      await copiedHandle.close().catch(() => {});
+    }
+    if (!(await fileMatchesContentIdentity(target, sourceContentIdentity))
+      || !(await fileMatchesContentIdentity(from, sourceContentIdentity))) {
+      throw codedError('STAGING_FILE_CHANGED', '임시 파일이 복사 중 변경되어 결과를 확인할 수 없습니다.');
+    }
   }
   if (committedByHardLink && !(await fileMatchesIdentity(target, sourceIdentity))) {
     // The app never overwrites this destination, so leave it in place for inspection if
@@ -480,21 +554,49 @@ async function openOwnedRegularFile(ownedDir, filePath, flags, { optional = fals
 async function replaceFileSafely(original, replacement, {
   move = moveFile,
   remove = (filePath) => fs.rm(filePath, { force: true }),
-  validate = null
+  validate = null,
+  expectedOriginalIdentity = null,
+  backupPath = null
 } = {}) {
-  const backup = `${original}.backup-${crypto.randomUUID()}`;
-  const replacementIdentity = await fileIdentity(replacement);
+  const backup = backupPath || `${original}.backup-${crypto.randomUUID()}`;
+  const originalIdentity = normalizeStagedIdentity(expectedOriginalIdentity)
+    || await fileIdentity(original);
+  if (!originalIdentity || !(await fileMatchesIdentity(original, originalIdentity))) {
+    throw codedError('SOURCE_CHANGED', '최적화할 원본 파일이 변경되어 교체하지 않았습니다.');
+  }
+  if (!(await fileIdentity(replacement))) {
+    throw codedError('INVALID_REPLACEMENT_FILE', '교체할 최적화 파일을 확인할 수 없습니다.');
+  }
+  // Check once more immediately before the destructive move.  The move implementation
+  // also retains no-clobber semantics, but a recording can live in a sync folder where a
+  // different process swaps the original path during a long FFmpeg pass.
+  if (!(await fileMatchesIdentity(original, originalIdentity))) {
+    throw codedError('SOURCE_CHANGED', '최적화 중 원본 파일이 변경되어 교체하지 않았습니다.');
+  }
   await move(original, backup);
+  const backupIdentity = await fileIdentity(backup);
+  if (!backupIdentity) {
+    throw codedError('BACKUP_CHANGED', '교체 전 원본 백업을 확인할 수 없습니다.');
+  }
   let replacementMoved = false;
+  let committedReplacementIdentity = null;
 
   try {
     await move(replacement, original);
     replacementMoved = true;
+    committedReplacementIdentity = await fileIdentity(original);
+    if (!committedReplacementIdentity) {
+      throw codedError('REPLACEMENT_CHANGED', '교체된 파일을 확인할 수 없습니다.');
+    }
     if (validate) await validate(original);
+    if (!(await fileMatchesIdentity(original, committedReplacementIdentity))) {
+      throw codedError('REPLACEMENT_CHANGED', '교체 파일이 검증 중 변경되었습니다.');
+    }
   } catch (error) {
     try {
       if (replacementMoved) {
-        if (!replacementIdentity || !(await fileMatchesIdentity(original, replacementIdentity))) {
+        if (!committedReplacementIdentity
+          || !(await fileMatchesIdentity(original, committedReplacementIdentity))) {
           throw codedError(
             'REPLACEMENT_CHANGED',
             '교체 중인 파일이 변경되어 기존 파일을 안전하게 복원할 수 없습니다.'
@@ -503,6 +605,9 @@ async function replaceFileSafely(original, replacement, {
         await remove(original);
       }
       await move(backup, original);
+      if (!(await fileMatchesIdentity(original, backupIdentity))) {
+        throw codedError('BACKUP_CHANGED', '복원된 원본 파일을 확인할 수 없습니다.');
+      }
     } catch (restoreError) {
       error.restoreError = restoreError;
       error.backupPath = backup;
@@ -625,6 +730,11 @@ class RecordingManager {
     this.verificationCancelled = false;
     this.deletingFiles = new Set();
     this.startingWebContentsIds = new Set();
+    // Creating a staging file and publishing it in `sessions` must be atomic relative to
+    // startup recovery.  This deliberately serializes only the short state transitions;
+    // the long-running recording/FFmpeg work remains asynchronous.
+    this.fileMutationChain = Promise.resolve();
+    this.startupRecoveryPromise = null;
     this.moveFile = move;
     this.maxSessionQueuedBytes = Math.max(1, Number(maxSessionQueuedBytes) || MAX_SESSION_QUEUED_BYTES);
   }
@@ -650,6 +760,62 @@ class RecordingManager {
       || this.recovering
       || this.optimizeQueue.length > 0
       || this.verificationJobs.size > 0;
+  }
+
+  runFileMutation(task) {
+    const result = this.fileMutationChain.then(task, task);
+    this.fileMutationChain = result.catch(() => {});
+    return result;
+  }
+
+  sessionTempPaths(session) {
+    if (!session) return [];
+    return [
+      session.tempPath,
+      ...(Array.isArray(session.segmentPaths) ? session.segmentPaths : []),
+      ...(session.pendingTempPaths ? [...session.pendingTempPaths] : []),
+      session.rawPath,
+      session.audioPath,
+      session.manifestPath,
+      session.finalizingPath
+    ].filter((filePath) => typeof filePath === 'string' && filePath.length > 0);
+  }
+
+  activeTempPaths() {
+    const active = new Set();
+    const add = (filePath) => active.add(canonicalPathKey(filePath));
+    for (const session of this.sessions.values()) {
+      for (const filePath of this.sessionTempPaths(session)) add(filePath);
+    }
+    for (const session of this.losslessSessions.values()) {
+      for (const filePath of this.sessionTempPaths(session)) add(filePath);
+    }
+    for (const entry of this.finalizing.values()) {
+      for (const filePath of entry.paths || []) add(filePath);
+    }
+    return active;
+  }
+
+  isActiveTempPath(filePath) {
+    return this.activeTempPaths().has(canonicalPathKey(filePath));
+  }
+
+  addFinalizingPath(sessionId, filePath) {
+    const entry = this.finalizing.get(sessionId);
+    if (entry && typeof filePath === 'string') entry.paths.add(filePath);
+  }
+
+  async recoverAtStartup() {
+    if (this.startupRecoveryPromise) return this.startupRecoveryPromise;
+    this.startupRecoveryPromise = this.runFileMutation(async () => {
+      const sweep = await this.sweepTempDir({
+        maxAgeMs: STARTUP_RECOVERY_MIN_AGE_MS,
+        _exclusive: true
+      });
+      const reconciliation = await this.reconcileRecordingsDir({ _exclusive: true });
+      return { sweep, reconciliation };
+    });
+    return this.startupRecoveryPromise;
   }
 
   indexFile() {
@@ -683,7 +849,7 @@ class RecordingManager {
       if (!raw || typeof raw !== 'object' || !Array.isArray(raw.entries)) {
         throw new SyntaxError('녹화 인덱스 형식이 올바르지 않습니다.');
       }
-      for (const entry of raw.entries.slice(-MAX_INDEX_ENTRIES)) {
+      for (const entry of raw.entries) {
         if (entry && typeof entry.filePath === 'string' && entry.filePath.length <= 32768
           && entry.meta && typeof entry.meta === 'object' && !Array.isArray(entry.meta)) {
           this.metadata.set(entry.filePath, entry.meta);
@@ -708,13 +874,14 @@ class RecordingManager {
   saveIndex() {
     const run = async () => {
       const entries = [...this.metadata.entries()]
-        .slice(-MAX_INDEX_ENTRIES)
         .map(([filePath, meta]) => ({ filePath, meta }));
       const target = this.indexFile();
-      const temporary = `${target}.tmp-${process.pid}`;
       await fs.mkdir(path.dirname(target), { recursive: true });
-      await fs.writeFile(temporary, JSON.stringify({ version: 1, entries }), 'utf8');
-      await fs.rename(temporary, target);
+      const payload = { version: 2, entries };
+      if (Buffer.byteLength(JSON.stringify(payload), 'utf8') > MAX_INDEX_BYTES) {
+        throw codedError('METADATA_INDEX_TOO_LARGE', '녹화 인덱스가 안전한 저장 크기를 초과했습니다.');
+      }
+      await writeJsonAtomic(target, payload);
       this.indexDirty = false;
     };
 
@@ -724,7 +891,11 @@ class RecordingManager {
   }
 
   async setMetadata(filePath, meta) {
-    this.metadata.set(filePath, meta);
+    const identity = await fileIdentity(filePath);
+    this.metadata.set(filePath, {
+      ...meta,
+      ...(identity ? { fileIdentity: identity } : {})
+    });
     try {
       await this.saveIndex();
     } catch (error) {
@@ -738,6 +909,35 @@ class RecordingManager {
     this.emit('recordings:changed', { filePath });
   }
 
+  async metadataForFile(filePath, stats = null) {
+    const meta = this.metadata.get(filePath);
+    if (!meta || typeof meta !== 'object') return { meta: {}, changed: false };
+    const expected = normalizeStagedIdentity(meta.fileIdentity);
+    if (expected) {
+      if (await fileMatchesIdentity(filePath, expected)) return { meta, changed: false };
+      this.metadata.delete(filePath);
+      return { meta: {}, changed: true };
+    }
+
+    // One-time migration from pre-0.2.24 entries.  Those entries did not retain a file
+    // identity, so only adopt a legacy path when its recorded byte count still matches.
+    // New metadata always carries an identity and a same-name external replacement is
+    // therefore read-only instead of becoming deletable.
+    const knownBytes = Number(meta.bytes);
+    if (Number.isFinite(knownBytes) && stats && knownBytes !== Number(stats.size)) {
+      this.metadata.delete(filePath);
+      return { meta: {}, changed: true };
+    }
+    const identity = await fileIdentity(filePath);
+    if (!identity) {
+      this.metadata.delete(filePath);
+      return { meta: {}, changed: true };
+    }
+    const migrated = { ...meta, fileIdentity: identity };
+    this.metadata.set(filePath, migrated);
+    return { meta: migrated, changed: true };
+  }
+
   async flushIndex() {
     await this.indexChain.catch(() => {});
     if (this.indexDirty) await this.saveIndex();
@@ -747,7 +947,10 @@ class RecordingManager {
    * Recovers app-owned leftovers from the marked temporary directory. A crash or a force-quit used to
    * strand partial files there forever, invisible to the user.
    */
-  async sweepTempDir({ maxAgeMs = 0 } = {}) {
+  async sweepTempDir({ maxAgeMs = 0, _exclusive = false } = {}) {
+    if (!_exclusive) {
+      return this.runFileMutation(() => this.sweepTempDir({ maxAgeMs, _exclusive: true }));
+    }
     if (this.recovering) return { removed: 0, recovered: [], failed: [] };
     this.recovering = true;
     // A settings change is blocked while recovery is active. Keep the same directory
@@ -771,7 +974,6 @@ class RecordingManager {
         return { removed: 0, recovered: [], failed: [] };
       }
 
-    const activeTempPaths = new Set([...this.sessions.values()].map((session) => session.tempPath));
     const recovered = [];
     const failed = [];
     let removed = 0;
@@ -783,6 +985,7 @@ class RecordingManager {
       const match = LOSSLESS_FINALIZING_PATTERN.exec(entry.name);
       if (!match || !entry.isFile()) continue;
       const fullPath = path.join(tempDir, entry.name);
+      if (this.isActiveTempPath(fullPath)) continue;
       const manifestPath = path.join(tempDir, `rp4-${match[1]}.lossless.json`);
       if (await paths.pathExists(manifestPath)) continue;
 
@@ -817,10 +1020,21 @@ class RecordingManager {
     }
 
     for (const entry of entries) {
-      const match = TEMP_RECORDING_PATTERN.exec(entry.name);
-      if (!match || !entry.isFile()) continue;
+      const normalMatch = TEMP_RECORDING_PATTERN.exec(entry.name);
+      const repairMatch = TEMP_REPAIR_PATTERN.exec(entry.name);
+      if ((!normalMatch && !repairMatch) || !entry.isFile()) continue;
       const fullPath = path.join(tempDir, entry.name);
-      if (activeTempPaths.has(fullPath)) continue;
+      if (this.isActiveTempPath(fullPath)) continue;
+      const isRepair = Boolean(repairMatch);
+      const sessionUuid = normalMatch?.[1] || repairMatch[1];
+      const extension = (normalMatch?.[2] || repairMatch[4]).toLowerCase();
+      if (isRepair) {
+        const original = path.join(tempDir, `rp4-${repairMatch[1]}.part.${repairMatch[2].toLowerCase()}`);
+        // Prefer the original staging file if it survived as well. Recovering both would
+        // create duplicate recordings; the repair remains available if the original later
+        // proves unusable.
+        if (await paths.pathExists(original)) continue;
+      }
 
       const itemStats = await fs.lstat(fullPath).catch(() => null);
       if (!itemStats?.isFile() || itemStats.isSymbolicLink()) continue;
@@ -832,8 +1046,7 @@ class RecordingManager {
       // Anything with real content is salvaged into the recordings folder instead of
       // being deleted, so an interrupted take is never silently thrown away.
       if (stats.size > MIN_RECOVERABLE_RECORDING_BYTES) {
-        const extension = match[2].toLowerCase();
-        const repairPath = `${fullPath}.repair-${crypto.randomUUID()}.${extension}`;
+        const repairPath = isRepair ? null : `${fullPath}.repair-${crypto.randomUUID()}.${extension}`;
         let recoveredSource = fullPath;
         let repaired = false;
         let validationFailure = null;
@@ -841,22 +1054,24 @@ class RecordingManager {
           await ffmpeg.validateMedia(fullPath);
         } catch (error) {
           validationFailure = error?.message || String(error);
-          try {
-            await ffmpeg.remux(fullPath, repairPath, {
-              jobId: `recover:${match[1]}`
-            });
-            await ffmpeg.validateMedia(repairPath);
-            recoveredSource = repairPath;
-            repaired = true;
-            validationFailure = null;
-          } catch (repairError) {
-            validationFailure = repairError?.message || validationFailure || String(repairError);
-            await fs.rm(repairPath, { force: true }).catch(() => {});
+          if (!isRepair) {
+            try {
+              await ffmpeg.remux(fullPath, repairPath, {
+                jobId: `recover:${sessionUuid}`
+              });
+              await ffmpeg.validateMedia(repairPath);
+              recoveredSource = repairPath;
+              repaired = true;
+              validationFailure = null;
+            } catch (repairError) {
+              validationFailure = repairError?.message || validationFailure || String(repairError);
+              await fs.rm(repairPath, { force: true }).catch(() => {});
+            }
           }
         }
 
         const partial = Boolean(validationFailure);
-        const baseName = `${timestamp()}_recovered${partial ? '_partial' : ''}_${match[1].slice(0, 8)}`;
+        const baseName = `${timestamp()}_recovered${partial ? '_partial' : ''}_${sessionUuid.slice(0, 8)}`;
         try {
           const target = await commitStagedFileToUnique(
             recoveredSource,
@@ -883,7 +1098,7 @@ class RecordingManager {
           recovered.push(target);
           continue;
         } catch (error) {
-          await fs.rm(repairPath, { force: true }).catch(() => {});
+          if (repairPath) await fs.rm(repairPath, { force: true }).catch(() => {});
           failed.push({ filePath: fullPath, error: error?.message || String(error) });
           continue;
         }
@@ -893,14 +1108,11 @@ class RecordingManager {
       removed += 1;
     }
 
-    const activeLosslessManifests = new Set(
-      [...this.losslessSessions.values()].map((session) => session.manifestPath)
-    );
     for (const entry of entries) {
       const match = /^rp4-([0-9a-f-]{36})\.lossless\.json$/i.exec(entry.name);
       if (!match || !entry.isFile()) continue;
       const manifestPath = path.join(tempDir, entry.name);
-      if (activeLosslessManifests.has(manifestPath)) continue;
+      if (this.isActiveTempPath(manifestPath)) continue;
       const rawPath = path.join(tempDir, `rp4-${match[1]}.lossless.raw`);
       const audioPath = path.join(tempDir, `rp4-${match[1]}.lossless.pcm`);
       try {
@@ -925,8 +1137,11 @@ class RecordingManager {
           let committedTarget = path.join(recordingsDir, committedName);
           const finalizingPath = path.join(tempDir, `rp4-${match[1]}.lossless-finalizing.avi`);
           let stagedIdentity = normalizeStagedIdentity(manifest.stagedIdentity);
-          let committed = stagedIdentity
-            ? await fileMatchesIdentity(committedTarget, stagedIdentity)
+          let stagedContentIdentity = normalizeContentIdentity(manifest.stagedContentIdentity);
+          let committed = stagedContentIdentity
+            ? await fileMatchesContentIdentity(committedTarget, stagedContentIdentity)
+            : stagedIdentity
+              ? await fileMatchesIdentity(committedTarget, stagedIdentity)
             : false;
           if (!committed && await paths.pathExists(finalizingPath)) {
             await ffmpeg.validateMedia(finalizingPath, {
@@ -934,7 +1149,8 @@ class RecordingManager {
               expectedFrames: Number(manifest.frameCount) || undefined
             });
             stagedIdentity = await fileIdentity(finalizingPath);
-            if (!stagedIdentity) {
+            stagedContentIdentity = await contentIdentity(finalizingPath);
+            if (!stagedIdentity || !stagedContentIdentity) {
               throw new Error('무압축 최종화 파일의 정체성을 확인할 수 없습니다.');
             }
             const extension = path.extname(committedName).slice(1).toLowerCase();
@@ -950,7 +1166,8 @@ class RecordingManager {
                 version: 3,
                 state: 'ready-to-commit',
                 targetName: path.basename(target),
-                stagedIdentity
+                stagedIdentity,
+                stagedContentIdentity
               };
               await writeJsonAtomic(manifestPath, journal);
               try {
@@ -965,7 +1182,10 @@ class RecordingManager {
             }
           }
           if (committed) {
-            if (!(await fileMatchesIdentity(committedTarget, stagedIdentity))) {
+            const matchesCommittedTarget = stagedContentIdentity
+              ? await fileMatchesContentIdentity(committedTarget, stagedContentIdentity)
+              : await fileMatchesIdentity(committedTarget, stagedIdentity);
+            if (!matchesCommittedTarget) {
               failed.push({
                 filePath: committedTarget,
                 error: '무압축 최종화 대상의 정체성이 일치하지 않아 원본을 보존했습니다.'
@@ -976,7 +1196,10 @@ class RecordingManager {
               expectedDurationMs: boundedDurationMs(manifest.durationMs),
               expectedFrames: Number(manifest.frameCount) || undefined
             });
-            if (!(await fileMatchesIdentity(committedTarget, stagedIdentity))) {
+            const stillMatchesCommittedTarget = stagedContentIdentity
+              ? await fileMatchesContentIdentity(committedTarget, stagedContentIdentity)
+              : await fileMatchesIdentity(committedTarget, stagedIdentity);
+            if (!stillMatchesCommittedTarget) {
               failed.push({
                 filePath: committedTarget,
                 error: '검증 중 대상이 바뀌어 무압축 원본을 보존했습니다.'
@@ -997,11 +1220,18 @@ class RecordingManager {
                 bytes: committedStats?.size || 0
               });
             }
-            await Promise.allSettled([
+            const cleanup = await Promise.allSettled([
               fs.rm(rawPath, { force: true }),
               fs.rm(audioPath, { force: true })
             ]);
-            await fs.rm(manifestPath, { force: true });
+            if (cleanup.every((result) => result.status === 'fulfilled')) {
+              await fs.rm(manifestPath, { force: true });
+            } else {
+              failed.push({
+                filePath: manifestPath,
+                error: '커밋된 무압축 원본 정리를 다음 실행에서 다시 시도합니다.'
+              });
+            }
             recovered.push(committedTarget);
             continue;
           }
@@ -1126,7 +1356,7 @@ class RecordingManager {
     }
     if (webContentsId != null) this.startingWebContentsIds.add(webContentsId);
     try {
-      return await this.startReserved(meta, { webContentsId });
+      return await this.runFileMutation(() => this.startReserved(meta, { webContentsId }));
     } finally {
       if (webContentsId != null) this.startingWebContentsIds.delete(webContentsId);
     }
@@ -1164,6 +1394,7 @@ class RecordingManager {
     const handle = await fs.open(tempPath, 'wx');
 
     this.sessions.set(sessionId, {
+      sessionId,
       handle,
       webContentsId,
       recordingsDir,
@@ -1176,6 +1407,7 @@ class RecordingManager {
       forceRemux: safeMeta.clip === true,
       segmentedClip: safeMeta.clip === true && safeMeta.segmentedClip === true,
       segmentPaths: [tempPath],
+      pendingTempPaths: new Set(),
       currentSegmentIndex: 0,
       highestQueuedSegmentIndex: 0,
       handleClosed: false,
@@ -1218,7 +1450,7 @@ class RecordingManager {
     }
     if (webContentsId != null) this.startingWebContentsIds.add(webContentsId);
     try {
-      return await this.startLosslessReserved(meta, { webContentsId });
+      return await this.runFileMutation(() => this.startLosslessReserved(meta, { webContentsId }));
     } finally {
       if (webContentsId != null) this.startingWebContentsIds.delete(webContentsId);
     }
@@ -1228,7 +1460,12 @@ class RecordingManager {
     await paths.ensureRecordingDirs(this.settings.recordingsDir);
     const recordingsDir = this.settings.recordingsDir;
     const available = await freeBytes(recordingsDir);
-    if (available != null && available < MIN_LOSSLESS_FREE_BYTES_TO_START) {
+    if (available == null) {
+      this.emit('app:notice', {
+        level: 'warn',
+        messageKey: 'losslessDiskSpaceUnknown'
+      });
+    } else if (available < MIN_LOSSLESS_FREE_BYTES_TO_START) {
       throw codedError(
         'INSUFFICIENT_SPACE',
         '무압축 녹화에는 최소 2GB 이상의 여유 공간이 필요합니다.'
@@ -1282,7 +1519,7 @@ class RecordingManager {
     };
     try {
       // The journal is the recovery authority and must exist before raw data can.
-      await fs.writeFile(manifestPath, JSON.stringify(manifest), { encoding: 'utf8', flag: 'wx' });
+      await writeJsonAtomic(manifestPath, manifest);
       rawHandle = await fs.open(rawPath, 'wx');
       audioHandle = await fs.open(audioPath, 'wx');
     } catch (error) {
@@ -1464,18 +1701,38 @@ class RecordingManager {
       }
       return existing.promise;
     }
-    const session = this.losslessSessions.get(payload.sessionId);
-    if (!session) return Promise.resolve(null);
-    if (session.webContentsId != null && webContentsId != null
-      && session.webContentsId !== webContentsId) {
-      return Promise.reject(new Error('무압축 녹화 세션에 접근할 수 없습니다.'));
-    }
-    session.acceptingWrites = false;
-    this.losslessSessions.delete(payload.sessionId);
-    const promise = this.finishLosslessSession(session, payload)
-      .finally(() => this.finalizing.delete(payload.sessionId));
-    this.finalizing.set(payload.sessionId, { promise, webContentsId: session.webContentsId });
-    return promise;
+    return this.runFileMutation(() => {
+      const active = this.finalizing.get(payload.sessionId);
+      if (active) {
+        if (active.webContentsId != null && webContentsId != null
+          && active.webContentsId !== webContentsId) {
+          throw new Error('무압축 녹화 세션에 접근할 수 없습니다.');
+        }
+        return { promise: active.promise };
+      }
+      const session = this.losslessSessions.get(payload.sessionId);
+      if (!session) return { promise: Promise.resolve(null) };
+      if (session.webContentsId != null && webContentsId != null
+        && session.webContentsId !== webContentsId) {
+        throw new Error('무압축 녹화 세션에 접근할 수 없습니다.');
+      }
+      session.acceptingWrites = false;
+      this.losslessSessions.delete(payload.sessionId);
+      const entry = {
+        promise: null,
+        webContentsId: session.webContentsId,
+        paths: new Set(this.sessionTempPaths(session))
+      };
+      const promise = this.finishLosslessSession(session, payload)
+        .finally(() => {
+          if (this.finalizing.get(payload.sessionId)?.promise === promise) {
+            this.finalizing.delete(payload.sessionId);
+          }
+        });
+      entry.promise = promise;
+      this.finalizing.set(payload.sessionId, entry);
+      return { promise };
+    }).then(({ promise }) => promise);
   }
 
   async closeLosslessHandles(session) {
@@ -1577,6 +1834,7 @@ class RecordingManager {
       await ffmpeg.run(args, {
         jobId,
         totalDurationMs: durationMs,
+        inputBytes: session.rawBytes + (audioStats?.size || 0),
         onProgress: (ratio) => this.emit('recording:convert-progress', {
           phase: 'lossless-finalize',
           ratio
@@ -1591,7 +1849,8 @@ class RecordingManager {
       });
       validated = true;
       const stagedIdentity = await fileIdentity(finalizingPath);
-      if (!stagedIdentity) {
+      const stagedContentIdentity = await contentIdentity(finalizingPath);
+      if (!stagedIdentity || !stagedContentIdentity) {
         throw new Error('무압축 최종화 파일의 정체성을 확인할 수 없습니다.');
       }
       for (let attempt = 0; attempt < 500; attempt += 1) {
@@ -1602,14 +1861,15 @@ class RecordingManager {
           targetName: path.basename(target),
           durationMs,
           frameCount: session.frameCount,
-          stagedIdentity
+          stagedIdentity,
+          stagedContentIdentity
         };
         await writeJsonAtomic(session.manifestPath, journal);
         try {
           // Commit without replacing an unrelated file that may have appeared after the
           // name check. The journal still points at the staged file if the app crashes.
           await commitFileNoClobber(finalizingPath, target);
-          if (!(await fileMatchesIdentity(target, stagedIdentity))) {
+          if (!(await fileMatchesContentIdentity(target, stagedContentIdentity))) {
             throw new Error('커밋된 무압축 AVI의 정체성을 확인할 수 없습니다.');
           }
           break;
@@ -1628,11 +1888,21 @@ class RecordingManager {
 
     // The journal is removed last. A crash after commit can therefore identify the
     // committed target and clean raw artifacts without creating a duplicate recording.
-    await Promise.allSettled([
+    const cleanup = await Promise.allSettled([
       fs.rm(session.rawPath, { force: true }),
       fs.rm(session.audioPath, { force: true })
     ]);
-    await fs.rm(session.manifestPath, { force: true }).catch(() => {});
+    if (cleanup.every((result) => result.status === 'fulfilled')) {
+      await fs.rm(session.manifestPath, { force: true }).catch(() => {});
+    } else {
+      // Preserve the ready-to-commit journal when raw cleanup is blocked.  Startup can
+      // then verify the committed AVI and retry deletion instead of rebuilding a duplicate
+      // recording from a multi-gigabyte raw artifact.
+      this.emit('app:notice', {
+        level: 'warn',
+        message: '무압축 원본 정리를 다음 실행에서 다시 시도합니다.'
+      });
+    }
     const stats = await statFile(target);
     const meta = {
       ...session.meta,
@@ -1730,7 +2000,15 @@ class RecordingManager {
             path.dirname(session.tempPath),
             `rp4-${crypto.randomUUID()}.part.${session.recordedContainer}`
           );
-          session.handle = await fs.open(segmentPath, 'wx');
+          // Recovery can run independently after startup. Publish a pending path before
+          // opening it so the narrow open→segmentPaths gap cannot be mistaken for an
+          // orphaned clip segment.
+          session.pendingTempPaths.add(segmentPath);
+          try {
+            session.handle = await fs.open(segmentPath, 'wx');
+          } finally {
+            session.pendingTempPaths.delete(segmentPath);
+          }
           session.handleClosed = false;
           session.currentSegmentIndex = segmentIndex;
           session.segmentPaths.push(segmentPath);
@@ -1796,19 +2074,39 @@ class RecordingManager {
       return existing.promise;
     }
 
-    const session = this.sessions.get(payload.sessionId);
-    if (!session) return Promise.resolve(null);
-    if (session.webContentsId != null && webContentsId != null
-      && session.webContentsId !== webContentsId) {
-      return Promise.reject(new Error('녹화 세션에 접근할 수 없습니다.'));
-    }
+    return this.runFileMutation(() => {
+      const active = this.finalizing.get(payload.sessionId);
+      if (active) {
+        if (active.webContentsId != null && webContentsId != null
+          && active.webContentsId !== webContentsId) {
+          throw new Error('녹화 세션에 접근할 수 없습니다.');
+        }
+        return { promise: active.promise };
+      }
+      const session = this.sessions.get(payload.sessionId);
+      if (!session) return { promise: Promise.resolve(null) };
+      if (session.webContentsId != null && webContentsId != null
+        && session.webContentsId !== webContentsId) {
+        throw new Error('녹화 세션에 접근할 수 없습니다.');
+      }
 
-    session.acceptingWrites = false;
-    this.sessions.delete(payload.sessionId);
-    const promise = this.finishSession(session, payload)
-      .finally(() => this.finalizing.delete(payload.sessionId));
-    this.finalizing.set(payload.sessionId, { promise, webContentsId: session.webContentsId });
-    return promise;
+      session.acceptingWrites = false;
+      this.sessions.delete(payload.sessionId);
+      const entry = {
+        promise: null,
+        webContentsId: session.webContentsId,
+        paths: new Set(this.sessionTempPaths(session))
+      };
+      const promise = this.finishSession(session, payload)
+        .finally(() => {
+          if (this.finalizing.get(payload.sessionId)?.promise === promise) {
+            this.finalizing.delete(payload.sessionId);
+          }
+        });
+      entry.promise = promise;
+      this.finalizing.set(payload.sessionId, entry);
+      return { promise };
+    }).then(({ promise }) => promise);
   }
 
   async finishSession(session, payload = {}) {
@@ -1820,6 +2118,7 @@ class RecordingManager {
         path.dirname(session.tempPath),
         `rp4-${crypto.randomUUID()}.part.${session.recordedContainer}`
       );
+      this.addFinalizingPath(session.sessionId, combinedPath);
       try {
         const sourceSegments = [...session.segmentPaths];
         await ffmpeg.concatSegments(session.segmentPaths, combinedPath, {
@@ -2096,83 +2395,27 @@ class RecordingManager {
    * Background faststart pass. The recording is already saved and listed before this
    * runs, so the user never waits for it.
    */
-  async reconcileRecordingsDir() {
+  async reconcileRecordingsDir({ _exclusive = false } = {}) {
+    if (!_exclusive) {
+      return this.runFileMutation(() => this.reconcileRecordingsDir({ _exclusive: true }));
+    }
     if (this.reconciling) return { restored: 0, removed: 0, preservedCorrupt: 0, failed: [] };
     this.reconciling = true;
     try {
-    const recordingsDir = this.settings.recordingsDir;
-    await paths.ensureRecordingDirs(recordingsDir);
-    const entries = await fs.readdir(recordingsDir, { withFileTypes: true }).catch(() => []);
-    const result = { restored: 0, removed: 0, preservedCorrupt: 0, failed: [] };
-
-    for (const entry of entries) {
-      if (!entry.isFile()) continue;
-      const fullPath = path.join(recordingsDir, entry.name);
-      const originalName = recoveryOriginalName(entry.name);
-      if (!originalName) continue;
-      const original = path.join(recordingsDir, originalName);
-
-      try {
-        const artifactStats = await statFile(fullPath);
-        let artifactValid = false;
-        if (artifactStats && artifactStats.size > MIN_RECOVERABLE_RECORDING_BYTES) {
-          artifactValid = await ffmpeg.validateMedia(fullPath).then(() => true, () => false);
-        }
-        const originalExists = await paths.pathExists(original);
-        const originalValid = originalExists
-          ? await ffmpeg.validateMedia(original).then(() => true, () => false)
-          : false;
-
-        if (originalValid) {
-          await fs.rm(fullPath, { force: true });
-          result.removed += 1;
-        } else if (artifactValid) {
-          let corrupt = null;
-          if (originalExists) {
-            const originalExtension = path.extname(original);
-            corrupt = await uniquePath(
-              recordingsDir,
-              `${path.basename(original, originalExtension)}_corrupt_${crypto.randomUUID().slice(0, 8)}`,
-              originalExtension.slice(1).toLowerCase()
-            );
-            await this.moveFile(original, corrupt);
-            try {
-              await this.moveFile(fullPath, original);
-            } catch (error) {
-              try {
-                await this.moveFile(corrupt, original);
-              } catch (restoreError) {
-                error.restoreError = restoreError;
-                error.backupPath = corrupt;
-              }
-              throw error;
-            }
-          } else {
-            await this.moveFile(fullPath, original);
-          }
-          if (corrupt) {
-            const corruptStats = await statFile(corrupt);
-            await this.setMetadata(corrupt, {
-              status: 'partial',
-              partial: true,
-              outcome: 'recovered-corrupt-original',
-              recovered: true,
-              failureReason: '복구 파일로 교체하기 전의 손상된 원본입니다.',
-              recoveredAt: new Date().toISOString(),
-              bytes: corruptStats?.size || 0
-            });
-            result.preservedCorrupt += 1;
-          }
-          result.restored += 1;
-        } else {
-          result.failed.push({ filePath: fullPath, error: '원본과 복구 파일을 모두 검증하지 못해 보존했습니다.' });
-        }
-      } catch (error) {
-        result.failed.push({ filePath: fullPath, error: error?.message || String(error) });
-      }
-    }
-
-    return result;
+      await paths.ensureRecordingDirs(this.settings.recordingsDir);
+      /*
+       * A user-selected recordings directory is not an app-owned workspace.  Previous
+       * builds treated names such as `video.mp4.optimizing-<uuid>.mp4` and
+       * `video.mp4.backup-<uuid>` as proof of RP4 ownership, then deleted or replaced
+       * them during startup reconciliation.  A filename is never sufficient authority to
+       * mutate a user file, so legacy/un-journaled artifacts are intentionally preserved.
+       *
+       * New operations clean up their own artifacts in-process.  A future durable
+       * replacement journal can opt in here with both path and identity checks; until
+       * then, preservation is safer than guessing and avoids destructive recovery of an
+       * unrelated sync/download file.
+       */
+      return { restored: 0, removed: 0, preservedCorrupt: 0, failed: [] };
     } finally {
       this.reconciling = false;
     }
@@ -2242,6 +2485,17 @@ class RecordingManager {
   async runVerification(job) {
     const { filePath, key, durationMs, optimizable } = job;
     if (this.deletingFiles.has(key)) return false;
+    const sourceIdentity = await fileIdentity(filePath);
+    if (sourceIdentity) {
+      const ownership = await this.metadataForFile(filePath, await statFile(filePath));
+      if (ownership.changed) {
+        void this.saveIndex().catch(() => { this.indexDirty = true; });
+      }
+      if (!normalizeStagedIdentity(ownership.meta.fileIdentity)
+        || !(await fileMatchesIdentity(filePath, sourceIdentity))) {
+        return false;
+      }
+    }
     this.emit('recording:verify', { filePath, state: 'start' });
     try {
       await ffmpeg.validateMedia(filePath, {
@@ -2249,6 +2503,12 @@ class RecordingManager {
         jobId: job.jobId
       });
       if (this.deletingFiles.has(key)) return false;
+      if (sourceIdentity && !(await fileMatchesIdentity(filePath, sourceIdentity))) {
+        this.metadata.delete(filePath);
+        void this.saveIndex().catch(() => { this.indexDirty = true; });
+        this.emit('recording:verify', { filePath, state: 'skipped-source-changed' });
+        return false;
+      }
       const meta = this.metadata.get(filePath);
       if (meta) {
         await this.setMetadata(filePath, {
@@ -2267,6 +2527,12 @@ class RecordingManager {
       return true;
     } catch (error) {
       if (this.deletingFiles.has(key)) return false;
+      if (sourceIdentity && !(await fileMatchesIdentity(filePath, sourceIdentity))) {
+        this.metadata.delete(filePath);
+        void this.saveIndex().catch(() => { this.indexDirty = true; });
+        this.emit('recording:verify', { filePath, state: 'skipped-source-changed' });
+        return false;
+      }
       if (error?.code === 'CANCELLED') {
         // Preserve `verifying`; startup will resume an interrupted background decode.
         this.emit('recording:verify', { filePath, state: 'cancelled' });
@@ -2390,6 +2656,18 @@ class RecordingManager {
         this.optimizingJobId = `optimize:${crypto.randomUUID()}`;
         try {
           const before = await statFile(job.filePath);
+          const sourceIdentity = await fileIdentity(job.filePath);
+          const ownership = await this.metadataForFile(job.filePath, before);
+          if (ownership.changed) {
+            void this.saveIndex().catch(() => { this.indexDirty = true; });
+          }
+          // Only a file that still proves it is RP4-managed may be optimized in place.
+          // A user can replace an old recording with a same-name download while this app
+          // is open; that replacement must remain read-only to RP4.
+          if (!sourceIdentity || !normalizeStagedIdentity(ownership.meta.fileIdentity)
+            || !(await fileMatchesIdentity(job.filePath, sourceIdentity))) {
+            continue;
+          }
           const available = await freeBytes(path.dirname(job.filePath));
           const required = (before?.size || 0) * 1.1 + MIN_FREE_BYTES_TO_CONTINUE;
           if (available != null && available < required) {
@@ -2406,6 +2684,9 @@ class RecordingManager {
             jobId: this.optimizingJobId
           }) || {};
           if (this.deletingFiles.has(jobKey)) continue;
+          if (!(await fileMatchesIdentity(job.filePath, sourceIdentity))) {
+            throw codedError('SOURCE_CHANGED', '최적화 검증 중 원본 파일이 변경되었습니다.');
+          }
           await ffmpeg.remux(job.filePath, optimized, {
             jobId: this.optimizingJobId,
             totalDurationMs: job.durationMs
@@ -2414,6 +2695,9 @@ class RecordingManager {
           if (this.deletingFiles.has(jobKey)) {
             await fs.rm(optimized, { force: true });
             continue;
+          }
+          if (!(await fileMatchesIdentity(job.filePath, sourceIdentity))) {
+            throw codedError('SOURCE_CHANGED', '최적화 중 원본 파일이 변경되었습니다.');
           }
 
           const after = await statFile(optimized);
@@ -2435,8 +2719,12 @@ class RecordingManager {
               await fs.rm(optimized, { force: true });
               continue;
             }
+            if (!(await fileMatchesIdentity(job.filePath, sourceIdentity))) {
+              throw codedError('SOURCE_CHANGED', '최적화 결과를 교체하기 전에 원본 파일이 변경되었습니다.');
+            }
             await replaceFileSafely(job.filePath, optimized, {
               move: this.moveFile,
+              expectedOriginalIdentity: sourceIdentity,
               validate: async (filePath) => {
                 if (this.deletingFiles.has(jobKey)) {
                   throw codedError('CANCELLED', '파일 삭제 요청으로 최적화를 중단했습니다.');
@@ -2544,9 +2832,12 @@ class RecordingManager {
       .filter((entry) => !OPTIMIZING_FILE_PATTERN.test(entry.name))
       .map((entry) => path.join(recordingsDir, entry.name));
 
+    let ownershipChanged = false;
     const recordings = await mapWithConcurrency(files, 12, async (filePath) => {
       const stats = await statFile(filePath);
-      return this.toDto(filePath, stats, this.metadata.get(filePath) || {});
+      const owned = await this.metadataForFile(filePath, stats);
+      if (owned.changed) ownershipChanged = true;
+      return this.toDto(filePath, stats, owned.meta);
     });
 
     // Drop index entries whose files are gone so the index cannot grow without bound.
@@ -2560,7 +2851,7 @@ class RecordingManager {
         pruned = true;
       }
     }
-    if (pruned) {
+    if (pruned || ownershipChanged) {
       void this.saveIndex().catch(() => { this.indexDirty = true; });
     }
 
@@ -2659,9 +2950,15 @@ class RecordingManager {
     if (!recordingsDir || !target) return false;
     if (path.dirname(target).toLowerCase() !== recordingsDir.toLowerCase()
       || !RECORDING_EXTENSIONS.test(target)) return false;
-    if (!(await paths.pathExists(target))) return false;
-    const targetMeta = this.metadata.get(target);
-    if (!targetMeta) return false;
+    const targetStats = await statFile(target);
+    if (!targetStats) return false;
+    const managed = await this.metadataForFile(target, targetStats);
+    if (managed.changed) {
+      void this.saveIndex().catch(() => { this.indexDirty = true; });
+    }
+    const targetMeta = managed.meta;
+    const targetIdentity = normalizeStagedIdentity(targetMeta.fileIdentity);
+    if (!targetIdentity || !(await fileMatchesIdentity(target, targetIdentity))) return false;
 
     const previousMeta = targetMeta;
     const targetKey = recordingWorkKey(target);
@@ -2686,7 +2983,14 @@ class RecordingManager {
         if (this.optimizingFileKey === targetKey) return false;
       }
 
-      if (!(await paths.pathExists(target))) return false;
+      // Cancellation/thumbnail draining performs asynchronous work.  Do not send a
+      // same-name replacement to the recycle bin if another program changed the file
+      // while those tasks were stopping.
+      if (!(await fileMatchesIdentity(target, targetIdentity))) {
+        this.metadata.delete(target);
+        void this.saveIndex().catch(() => { this.indexDirty = true; });
+        return false;
+      }
       await trash(target);
       deleted = true;
       this.metadata.delete(target);

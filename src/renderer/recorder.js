@@ -13,6 +13,8 @@
   const LOSSLESS_ACK_TIMEOUT_MS = 15000;
   const LOSSLESS_DRAIN_TIMEOUT_MS = 15000;
   const MAX_LOSSLESS_AUDIO_QUEUE_BYTES = 8 * 1024 * 1024;
+  const RECORDER_STOP_TIMEOUT_MS = 15000;
+  const SHUTDOWN_FINALIZE_TIMEOUT_MS = 18000;
 
   function cleanupPreview() {
     if (state.preview) {
@@ -837,9 +839,14 @@
       return;
     }
     try {
-      if (context.recorder.state !== 'inactive') context.recorder.stop();
+      if (context.recorder.state !== 'inactive') {
+        context.recorder.stop();
+        armRecorderStopTimeout(context);
+      } else {
+        void finalizeRecording(context);
+      }
     } catch {
-      // ignore
+      void finalizeRecording(context);
     }
   }
 
@@ -872,6 +879,18 @@
       });
   }
 
+  function armRecorderStopTimeout(context) {
+    if (!context || context.lossless || context.finalized) return;
+    window.clearTimeout(context.stopTimeout);
+    context.stopTimeout = window.setTimeout(() => {
+      if (context.finalized) return;
+      context.failure ||= 'MediaRecorder 종료 응답 시간이 초과되었습니다.';
+      // Do not leave the app indefinitely waiting for a browser stop event.  The main
+      // process still preserves the bytes already flushed to its staging file.
+      void finalizeRecording(context);
+    }, RECORDER_STOP_TIMEOUT_MS);
+  }
+
   async function stopRecording() {
     const starting = state.startingRecording;
     if (starting && !state.recording) {
@@ -889,8 +908,17 @@
       await finalizeLosslessRecording(context);
       return;
     }
-    if (context.recorder.state === 'inactive') return;
-    context.recorder.stop();
+    if (context.recorder.state === 'inactive') {
+      await finalizeRecording(context);
+      return;
+    }
+    try {
+      context.recorder.stop();
+      armRecorderStopTimeout(context);
+    } catch (error) {
+      context.failure ||= error?.message || 'MediaRecorder를 중지하지 못했습니다.';
+      await finalizeRecording(context);
+    }
   }
 
   async function finalizeLosslessRecording(context) {
@@ -952,9 +980,10 @@
    * this is a close plus a rename and returns immediately.
    */
   async function finalizeRecording(context) {
-    if (!context) return;
+    if (!context || context.finalized) return;
 
     context.finalized = true;
+    window.clearTimeout(context.stopTimeout);
     const durationMs = elapsedMs(context);
     await context.writeQueue;
 
@@ -1096,7 +1125,18 @@
       poll();
     });
     await stopRecording();
-    await done;
+    let timer;
+    const finalized = await Promise.race([
+      done.then(() => true),
+      new Promise((resolve) => {
+        timer = window.setTimeout(() => resolve(false), SHUTDOWN_FINALIZE_TIMEOUT_MS);
+      })
+    ]);
+    window.clearTimeout(timer);
+    if (!finalized && state.recording) {
+      state.recording.failure ||= '앱 종료 중 녹화 마무리 시간이 초과되었습니다.';
+      await finalizeRecording(state.recording).catch(() => {});
+    }
   }
 
   async function smokeLosslessTransport(sessionId, frameBytes) {

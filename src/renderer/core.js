@@ -225,6 +225,7 @@ window.RP4 = window.RP4 || {};
   }
 
   async function writeBlobInSlices(sessionId, blob, { terminal = false, segmentIndex } = {}) {
+    let warning = null;
     for (let offset = 0; offset < blob.size; offset += IPC_SLICE_BYTES) {
       const part = blob.slice(offset, Math.min(blob.size, offset + IPC_SLICE_BYTES));
       const result = await window.rp4.writeRecordingChunk({
@@ -238,9 +239,13 @@ window.RP4 = window.RP4 || {};
         completedBytes: Math.min(blob.size, offset + part.size),
         totalBytes: blob.size
       });
-      if (result?.warning) return result;
+      // A terminal MediaRecorder blob is the final data emitted before `stop`.  It can be
+      // larger than the normal IPC slice size, so a warning must not make us abandon the
+      // remaining slices and silently truncate the tail of a recording.  Preserve the
+      // first warning for the caller after every slice has reached the main process.
+      if (result?.warning && !warning) warning = result.warning;
     }
-    return null;
+    return warning ? { warning } : null;
   }
 
   RP4.state = state;

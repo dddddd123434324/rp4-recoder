@@ -104,6 +104,14 @@ function createMainWindow({
     win.show();
   });
 
+  const reportVisibility = (visible) => {
+    if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+      win.webContents.send('app:window-visibility', { visible });
+    }
+  };
+  win.on('hide', () => reportVisibility(false));
+  win.on('show', () => reportVisibility(true));
+
   win.on('close', (event) => {
     if (win.rp4AllowClose) return;
     event.preventDefault();
@@ -175,6 +183,7 @@ async function drainRecordings(win, recordingManager, {
       let hardTimer = null;
       let accepted = false;
       let lastProgress = null;
+      let lastProgressPhase = null;
       const armInactivityTimer = () => {
         clearTimeout(timer);
         timer = setTimeout(() => finish(false), timeoutMs);
@@ -201,9 +210,27 @@ async function drainRecordings(win, recordingManager, {
       };
       const onProgress = (event, payload = {}) => {
         if (!matches(event, payload)) return;
-        const signature = JSON.stringify(payload.progress || {});
+        const progress = payload.progress && typeof payload.progress === 'object'
+          ? payload.progress : {};
+        const phase = typeof progress.phase === 'string' ? progress.phase : '';
+        const completedBytes = Number(progress.completedBytes);
+        const totalBytes = Number(progress.totalBytes);
+        const ratio = Number(progress.ratio);
+        const hasMeasuredProgress = Number.isFinite(completedBytes)
+          || Number.isFinite(totalBytes) || Number.isFinite(ratio);
+        // A changing heartbeat sequence only proves that JavaScript is alive; it must not
+        // postpone the shutdown watchdog when the encoder/write queue is stuck.  A phase
+        // transition is useful once, while byte/ratio changes are actual forward work.
+        if (!hasMeasuredProgress && phase === lastProgressPhase) return;
+        const signature = JSON.stringify({
+          phase,
+          completedBytes: Number.isFinite(completedBytes) ? completedBytes : null,
+          totalBytes: Number.isFinite(totalBytes) ? totalBytes : null,
+          ratio: Number.isFinite(ratio) ? ratio : null
+        });
         if (signature === lastProgress) return;
         lastProgress = signature;
+        lastProgressPhase = phase;
         armInactivityTimer();
       };
       const onFailed = (event, payload = {}) => {

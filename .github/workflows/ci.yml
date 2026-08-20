@@ -18,3 +18,25 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+
+  package:
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run dist
+      - name: Verify release artifacts
+        shell: pwsh
+        run: |
+          $artifacts = Get-ChildItem -LiteralPath dist -File -Filter 'RP4-Recorder-*.exe'
+          if ($artifacts.Count -lt 2) { throw 'Portable and installer artifacts were not both produced.' }
+          $version = node -p "require('./package.json').version"
+          if (-not (Test-Path -LiteralPath "dist\RP4-Recorder-$version-SHA256SUMS.txt")) {
+            throw 'Missing versioned SHA256SUMS.txt.'
+          }

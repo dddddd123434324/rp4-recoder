@@ -73,8 +73,13 @@ function reportFatalAsyncFailure(error, source = 'asynchronous task') {
       app.exit(1);
       return;
     }
+    const rendererUnavailable = !mainWindow || mainWindow.isDestroyed()
+      || mainWindow.webContents.isDestroyed();
     await shutdown({
-      rendererUnavailable: true,
+      // An unhandled main-process task does not imply that the renderer crashed.  When it
+      // is still alive, let it flush MediaRecorder's terminal data before the main process
+      // closes its staging handles.
+      rendererUnavailable,
       failureReason: '처리되지 않은 비동기 오류로 녹화를 안전하게 마무리합니다.',
       exitCode: 1
     });
@@ -321,14 +326,18 @@ async function bootstrap() {
       });
     }
     const rendererLoaded = mainWindow.rp4Loaded;
+    // Start recovery immediately after the window begins loading.  Recording start IPC is
+    // already registered, so RecordingManager's mutation gate owns the recovery slot
+    // before the renderer can become interactive, while first paint still proceeds.
+    const startupRecovery = recordings.recoverAtStartup();
 
     hotkeys.register(settings.value.hotkeys);
 
     await rendererLoaded;
-    // The window becomes interactive before media probing/recovery. These jobs can
-    // decode large files and must never hold the first paint hostage.
-    const sweep = await recordings.sweepTempDir();
-    const reconciliation = await recordings.reconcileRecordingsDir();
+    // The window becomes interactive before media probing/recovery finishes.  Starts wait
+    // behind RecordingManager's mutation gate so a live staging file cannot be mistaken
+    // for a crash leftover while this work is in progress.
+    const { sweep, reconciliation } = await startupRecovery;
     void recordings.resumePendingMediaJobs().catch((error) => {
       process.stderr.write(`resume media jobs failed: ${error?.stack || error}\n`);
       send('app:notice', {
@@ -444,6 +453,10 @@ async function bootstrap() {
 
 process.on('uncaughtExceptionMonitor', (error) => {
   process.stderr.write(`uncaught: ${error?.stack || error}\n`);
+});
+
+process.on('uncaughtException', (error) => {
+  reportFatalAsyncFailure(error, 'uncaught exception');
 });
 
 process.on('unhandledRejection', (reason) => {

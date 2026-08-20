@@ -110,8 +110,11 @@
 
   function startEpoch(session) {
     const epoch = createEpoch(session);
-    session.currentEpoch = epoch;
+    // Do not replace a still-retryable stopped epoch until MediaRecorder actually accepts
+    // the new one.  A constructor/start failure used to leave the buffer detached from
+    // the session, making a failed clip save consume footage.
     epoch.recorder.start(CHUNK_MS);
+    session.currentEpoch = epoch;
     return epoch;
   }
 
@@ -163,16 +166,23 @@
   async function stopEpoch(epoch) {
     if (!epoch || epoch.recorder.state === 'inactive') return;
     let timer;
+    let onStop;
     const stopped = new Promise((resolve, reject) => {
-      epoch.recorder.addEventListener('stop', () => {
+      onStop = () => {
         clearTimeout(timer);
         resolve();
-      }, { once: true });
+      };
+      epoch.recorder.addEventListener('stop', onStop, { once: true });
       timer = setTimeout(() => reject(new Error('클립 녹화기 종료 응답 시간이 초과되었습니다.')), 10000);
     });
-    epoch.recorder.stop();
-    await stopped;
-    epoch.endedAt = Date.now();
+    try {
+      epoch.recorder.stop();
+      await stopped;
+      epoch.endedAt = Date.now();
+    } finally {
+      clearTimeout(timer);
+      if (onStop) epoch.recorder.removeEventListener('stop', onStop);
+    }
   }
 
   async function rotateBuffer(session) {
@@ -190,10 +200,25 @@
     // Stopping establishes an unambiguous boundary: MediaRecorder emits its final
     // dataavailable before stop, so the snapshot includes the click instant.
     const current = session.currentEpoch;
-    await stopEpoch(current);
+    if (current) await stopEpoch(current);
     const epochs = [...session.completedEpochs, current].filter((epoch) => epoch?.initChunk);
+    if (state.clip === session && !session.stopping) {
+      try {
+        startEpoch(session);
+      } catch (error) {
+        // `current` has already stopped, but it still belongs to the rolling buffer.
+        // Keep it available for an immediate retry instead of clearing the buffer before
+        // a successor recorder is known to be running.
+        if (current && !session.completedEpochs.includes(current)) {
+          session.completedEpochs.push(current);
+        }
+        session.currentEpoch = null;
+        throw error;
+      }
+    }
+    // Transfer ownership to the snapshot only after the next epoch is running.  The
+    // caller restores these blobs on save failure.
     session.completedEpochs = [];
-    if (state.clip === session && !session.stopping) startEpoch(session);
 
     const targetMs = session.profile.clipDurationSeconds * 1000;
     while (epochs.length > 1

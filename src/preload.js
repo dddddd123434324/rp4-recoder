@@ -93,6 +93,7 @@ contextBridge.exposeInMainWorld('rp4', {
   onVerifyState: (callback) => subscribe('recording:verify', callback),
   onDiskFull: (callback) => subscribe('recording:disk-full', callback),
   onLosslessWriterMessage: (callback) => subscribe('lossless:writer-message', callback),
+  onWindowVisibility: (callback) => subscribe('app:window-visibility', callback),
   // Fired when the app is closing so the renderer can flush and finalize a recording
   // before the window goes away.
   onFinalizeRecordings: (callback) => subscribe('app:finalize-recordings', callback),

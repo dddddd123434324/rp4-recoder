@@ -20,6 +20,7 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const vm = require('node:vm');
 
 const ffmpegStatic = require('ffmpeg-static');
 const ffmpeg = require('../src/main/ffmpeg');
@@ -220,6 +221,26 @@ async function run() {
       && (stagedCommitStats.ino === 0 || committedRaceStats.ino === stagedCommitStats.ino),
     `copyCalls=${commitCopyCalls} inode=${stagedCommitStats.ino}->${committedRaceStats.ino}`);
 
+  // Network and some removable filesystems cannot create a hard link. The fallback must
+  // verify content rather than reusing the staging inode as the target identity.
+  const fallbackSource = path.join(settings.tempDir, `rp4-${crypto.randomUUID()}.part.mp4`);
+  await fsp.writeFile(fallbackSource, Buffer.from('copy-fallback-integrity-check'));
+  const originalLink = fsp.link;
+  fsp.link = async () => {
+    const error = new Error('hard links unavailable');
+    error.code = 'EPERM';
+    throw error;
+  };
+  let fallbackTarget;
+  try {
+    fallbackTarget = await commitStagedFileToUnique(fallbackSource, RECORDINGS, 'copy-fallback', 'mp4');
+  } finally {
+    fsp.link = originalLink;
+  }
+  check('copy fallback verifies content before releasing staging',
+    !fs.existsSync(fallbackSource)
+      && (await fsp.readFile(fallbackTarget, 'utf8')) === 'copy-fallback-integrity-check');
+
   const remuxMp4Args = ffmpeg.remuxArguments('input.mp4', 'output.mp4');
   const remuxWebmArgs = ffmpeg.remuxArguments('input.webm', 'output.webm');
   const remuxMkvArgs = ffmpeg.remuxArguments('input.mkv', 'output.mkv');
@@ -362,6 +383,30 @@ async function run() {
   }
   check('failed replacement validation restores the original',
     replacementRejected && await fsp.readFile(replaceOriginal, 'utf8') === 'known-good');
+
+  const copyReplaceOriginal = path.join(SANDBOX, 'copy-replace-original.bin');
+  const copyReplaceCandidate = path.join(SANDBOX, 'copy-replace-candidate.bin');
+  await fsp.writeFile(copyReplaceOriginal, 'copy-known-good');
+  await fsp.writeFile(copyReplaceCandidate, 'copy-invalid-new');
+  const originalReplaceLink = fsp.link;
+  fsp.link = async () => {
+    const error = new Error('hard links unavailable');
+    error.code = 'EPERM';
+    throw error;
+  };
+  let copyReplacementRejected = false;
+  try {
+    await replaceFileSafely(copyReplaceOriginal, copyReplaceCandidate, {
+      validate: async () => { throw new Error('invalid media'); }
+    });
+  } catch {
+    copyReplacementRejected = true;
+  } finally {
+    fsp.link = originalReplaceLink;
+  }
+  check('copy-fallback replacement rollback restores the original',
+    copyReplacementRejected
+      && await fsp.readFile(copyReplaceOriginal, 'utf8') === 'copy-known-good');
 
   const raceOriginal = path.join(SANDBOX, 'replace-race-original.bin');
   const raceCandidate = path.join(SANDBOX, 'replace-race-candidate.bin');
@@ -537,16 +582,22 @@ async function run() {
       && /^verify:/.test(verificationCalls[0]?.options?.jobId || ''));
   verificationCalls[0].resolve({});
   await verifyPromiseA;
-  await new Promise((resolve) => setImmediate(resolve));
+  const queuedVerificationDeadline = Date.now() + 1000;
+  while (verificationCalls.length < 2 && Date.now() < queuedVerificationDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
   check('queued media validation starts after the previous decode',
     verificationCalls.length === 2 && maxActiveVerifications === 1);
-  verificationCalls[1].resolve({});
+  verificationCalls[1]?.resolve({});
   await verifyPromiseB;
 
   const cancelPath = path.join(RECORDINGS, 'verify-cancelled.mp4');
   verificationManager.metadata.set(cancelPath, { status: 'verifying', durationMs: 3000 });
   const cancelPromise = verificationManager.enqueueVerification(cancelPath, 3000);
-  await new Promise((resolve) => setImmediate(resolve));
+  const cancellationVerificationDeadline = Date.now() + 1000;
+  while (verificationCalls.length < 3 && Date.now() < cancellationVerificationDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
   const closeWithVerificationStartedAt = Date.now();
   await verificationManager.closeAllSessions();
   check('session handle shutdown does not wait for a full background decode',
@@ -614,6 +665,34 @@ async function run() {
   const rendererAppSource = await fsp.readFile(
     path.join(__dirname, '..', 'src', 'renderer', 'app.js'), 'utf8'
   );
+  const terminalWrites = [];
+  const terminalWindow = {
+    rp4: {
+      writeRecordingChunk: async (payload) => {
+        terminalWrites.push(new Uint8Array(payload.buffer).byteLength);
+        return { warning: 'disk pressure' };
+      },
+      reportFinalizeProgress: () => {}
+    },
+    setTimeout,
+    clearTimeout
+  };
+  terminalWindow.window = terminalWindow;
+  const terminalContext = vm.createContext({
+    window: terminalWindow,
+    document: { querySelector: () => null, querySelectorAll: () => [] },
+    Element: class Element {}
+  });
+  vm.runInContext(rendererCoreSource, terminalContext);
+  const terminalResult = await terminalWindow.RP4.util.writeBlobInSlices(
+    'terminal-test',
+    new Blob([Buffer.alloc(16 * 1024 * 1024 + 1)]),
+    { terminal: true }
+  );
+  check('terminal Blob flushes every IPC slice after a disk warning',
+    terminalWrites.length === 3
+      && terminalWrites.reduce((total, size) => total + size, 0) === 16 * 1024 * 1024 + 1
+      && terminalResult?.warning === 'disk pressure');
   check('failed shutdown restores the renderer capture lifecycle',
     /abortCaptureShutdown[\s\S]*captureLifecycle = 'idle'/.test(rendererCoreSource)
       && /RP4\.lifecycle\.abortShutdown\(\)/.test(rendererAppSource));
@@ -719,6 +798,36 @@ async function run() {
       && requestedClipShutdownMode === 'wait-current-save'
       && shutdownOptions.failureReason === null
       && Date.now() - shutdownStartedAt >= 90);
+
+  const syntheticHeartbeatContents = new EventEmitter();
+  let syntheticHeartbeat = null;
+  syntheticHeartbeatContents.send = (channel, payload) => {
+    if (channel !== 'app:finalize-recordings') return;
+    require('electron').ipcMain.emit(
+      'app:shutdown-accepted', { sender: syntheticHeartbeatContents }, { requestId: payload.requestId }
+    );
+    let sequence = 0;
+    syntheticHeartbeat = setInterval(() => {
+      sequence += 1;
+      require('electron').ipcMain.emit(
+        'app:shutdown-progress',
+        { sender: syntheticHeartbeatContents },
+        { requestId: payload.requestId, progress: { phase: 'shutdown-finalizing', sequence } }
+      );
+    }, 10);
+  };
+  const syntheticHeartbeatStartedAt = Date.now();
+  const syntheticHeartbeatResult = await windowHelpers.drainRecordings(
+    { isDestroyed: () => false, webContents: syntheticHeartbeatContents },
+    fakeRecordings,
+    { timeoutMs: 50, maxTotalMs: 250 }
+  );
+  clearInterval(syntheticHeartbeat);
+  check('synthetic shutdown heartbeat cannot mask stalled finalization',
+    syntheticHeartbeatResult.rendererAccepted === true
+      && syntheticHeartbeatResult.rendererReady === false
+      && syntheticHeartbeatResult.timedOut === true
+      && Date.now() - syntheticHeartbeatStartedAt < 180);
 
   const hardLimitContents = new EventEmitter();
   let hardLimitHeartbeat = null;
@@ -1128,6 +1237,62 @@ async function run() {
   check('no conversion was performed', saved?.converted === false);
   // The whole point of the change: stopping is a close plus a rename.
   check('stop completes in under 250 ms', stopMs < 250, `${stopMs} ms`);
+
+  // A same-name external replacement must lose RP4 ownership before it reaches any
+  // destructive action. Use rename to model sync clients that atomically swap a download
+  // into place rather than merely writing the old file in place.
+  const ownershipPath = path.join(RECORDINGS, 'ownership-replaced.mp4');
+  const ownershipReplacement = path.join(RECORDINGS, 'ownership-external-source.mp4');
+  await fsp.copyFile(saved.filePath, ownershipPath);
+  const ownershipStats = await fsp.stat(ownershipPath);
+  await recordings.setMetadata(ownershipPath, {
+    status: 'complete', bytes: ownershipStats.size, durationMs: 1
+  });
+  await fsp.writeFile(ownershipReplacement, Buffer.alloc(2048, 0x7f));
+  await fsp.rm(ownershipPath, { force: true });
+  await fsp.rename(ownershipReplacement, ownershipPath);
+  const ownershipListed = (await recordings.list()).find((entry) => entry.filePath === ownershipPath);
+  let ownershipTrashCalled = false;
+  const ownershipDeleted = await recordings.trashRecording(ownershipPath, {
+    trash: async () => { ownershipTrashCalled = true; await fsp.rm(ownershipPath, { force: true }); }
+  });
+  check('same-name external replacement is listed as unmanaged',
+    ownershipListed?.managed === false && ownershipListed?.status === 'unmanaged');
+  check('same-name external replacement cannot be sent to trash',
+    ownershipDeleted === false && ownershipTrashCalled === false && fs.existsSync(ownershipPath));
+  await fsp.rm(ownershipPath, { force: true });
+
+  const optimizeOwnershipPath = path.join(RECORDINGS, 'optimize-ownership.mp4');
+  const optimizeOwnershipReplacement = path.join(RECORDINGS, 'optimize-ownership-external.mp4');
+  await fsp.copyFile(saved.filePath, optimizeOwnershipPath);
+  const optimizeOwnershipManager = new RecordingManager({ settings, emit: () => {} });
+  await optimizeOwnershipManager.setMetadata(optimizeOwnershipPath, {
+    status: 'complete', bytes: (await fsp.stat(optimizeOwnershipPath)).size, durationMs: 5000
+  });
+  const originalOwnershipValidate = ffmpeg.validateMedia;
+  const originalOwnershipRemux = ffmpeg.remux;
+  let swappedDuringOptimize = false;
+  ffmpeg.validateMedia = async () => {
+    if (!swappedDuringOptimize) {
+      swappedDuringOptimize = true;
+      await fsp.writeFile(optimizeOwnershipReplacement, Buffer.from('external replacement'));
+      await fsp.rm(optimizeOwnershipPath, { force: true });
+      await fsp.rename(optimizeOwnershipReplacement, optimizeOwnershipPath);
+    }
+    return { durationMs: 5000, frameCount: 1 };
+  };
+  ffmpeg.remux = async () => { throw new Error('remux must not run after source replacement'); };
+  optimizeOwnershipManager.enqueueOptimize(optimizeOwnershipPath, 5000);
+  await optimizeOwnershipManager.optimizeDrainPromise;
+  ffmpeg.validateMedia = originalOwnershipValidate;
+  ffmpeg.remux = originalOwnershipRemux;
+  const optimizeOwnershipText = await fsp.readFile(optimizeOwnershipPath, 'utf8');
+  check('optimization never replaces an externally swapped source',
+    swappedDuringOptimize && optimizeOwnershipText === 'external replacement'
+      && !(await fsp.readdir(RECORDINGS)).some((name) => (
+        name.startsWith('optimize-ownership.mp4.backup-')
+      )));
+  await fsp.rm(optimizeOwnershipPath, { force: true });
 
   const probe = await ffprobe(saved.filePath);
   check('saved file is readable H.264 MP4',
@@ -1567,8 +1732,8 @@ async function run() {
     genericProbe.codec === 'h264' && (genericProbe.durationSec || 0) > 1,
     `codec=${genericProbe.codec} duration=${genericProbe.durationSec}s`);
 
-  // Recovery artifacts have strict app-generated names. User recordings that merely
-  // contain ".backup-" must never be deleted or renamed.
+  // A user-selected recordings folder is not app-owned. Even UUID-looking old optimizer
+  // artifacts are preserved unless a future durable journal proves their ownership.
   const userBackupName = path.join(RECORDINGS, 'normal.backup-user.mp4');
   await fsp.copyFile(saved.filePath, userBackupName);
   const recoveryUuid = crypto.randomUUID();
@@ -1577,27 +1742,21 @@ async function run() {
   await fsp.copyFile(saved.filePath, trueBackup);
   const reconciliation = await recordings.reconcileRecordingsDir();
   check('ordinary backup-like recording name is preserved', fs.existsSync(userBackupName));
-  check('only UUID-suffixed optimization backup is restored',
-    reconciliation.restored === 1 && fs.existsSync(restoredTarget) && !fs.existsSync(trueBackup));
+  check('un-journaled UUID-suffixed optimization backup is preserved',
+    reconciliation.restored === 0 && !fs.existsSync(restoredTarget) && fs.existsSync(trueBackup));
 
   const visibleCorruptOriginal = path.join(RECORDINGS, 'visible-corrupt.mp4');
   const visibleRecoveryArtifact = `${visibleCorruptOriginal}.backup-${crypto.randomUUID()}`;
   await fsp.writeFile(visibleCorruptOriginal, Buffer.alloc(1024, 0x41));
   await fsp.copyFile(saved.filePath, visibleRecoveryArtifact);
   const visibleRecovery = await recordings.reconcileRecordingsDir();
-  const visibleCorruptName = (await fsp.readdir(RECORDINGS)).find((name) => (
-    /^visible-corrupt_corrupt_[0-9a-f]{8}\.mp4$/i.test(name)
-  ));
-  const visibleCorruptPath = visibleCorruptName
-    ? path.join(RECORDINGS, visibleCorruptName)
-    : null;
-  check('successful recovery exposes the damaged original instead of hiding it',
-    visibleRecovery.restored === 1
-      && visibleRecovery.preservedCorrupt === 1
-      && Boolean(visibleCorruptPath)
-      && recordings.metadata.get(visibleCorruptPath)?.outcome === 'recovered-corrupt-original');
+  check('un-journaled recovery-like files are never replaced or renamed',
+    visibleRecovery.restored === 0
+      && visibleRecovery.preservedCorrupt === 0
+      && fs.existsSync(visibleCorruptOriginal)
+      && fs.existsSync(visibleRecoveryArtifact));
   await fsp.rm(visibleCorruptOriginal, { force: true });
-  if (visibleCorruptPath) await fsp.rm(visibleCorruptPath, { force: true });
+  await fsp.rm(visibleRecoveryArtifact, { force: true });
 
   const rollbackOriginal = path.join(RECORDINGS, 'rollback-restored.mp4');
   const rollbackArtifact = `${rollbackOriginal}.backup-${crypto.randomUUID()}`;
@@ -1617,12 +1776,12 @@ async function run() {
     }
   });
   const rollbackReconciliation = await rollbackManager.reconcileRecordingsDir();
-  check('recovery replacement rolls the original name back after second move failure',
-    rollbackReconciliation.failed.some((entry) => entry.filePath === rollbackArtifact)
+  check('reconciliation never enters an un-journaled replacement transaction',
+    rollbackReconciliation.failed.length === 0
       && fs.existsSync(rollbackOriginal)
       && fs.existsSync(rollbackArtifact)
       && (await fsp.readFile(rollbackOriginal)).equals(corruptOriginalBytes));
-  check('failed recovery replacement leaves no hidden corrupt-name orphan',
+  check('un-journaled recovery leaves no hidden corrupt-name artifact',
     !(await fsp.readdir(RECORDINGS)).some((name) => (
       name.startsWith('rollback-restored.mp4.corrupt-')
     )));
@@ -1822,6 +1981,42 @@ async function run() {
       && path.dirname(snapshotSweep.recovered[0]) === recoverySnapshotSource
       && !fs.existsSync(recoverySnapshotOrphan));
 
+  // A newly created staging file must wait behind an active recovery sweep. This fixes
+  // the historical open(temp) → sessions.set gap where sweep could salvage a live take.
+  const mutationGateDir = path.join(SANDBOX, 'mutation-gate-recordings');
+  await paths.ensureRecordingDirs(mutationGateDir);
+  const mutationGateSettings = {
+    recordingsDir: mutationGateDir,
+    value: { optimizeMp4: false },
+    get tempDir() { return paths.tempDirFor(this.recordingsDir); }
+  };
+  const mutationGateManager = new RecordingManager({ settings: mutationGateSettings, emit: () => {} });
+  const mutationGateOrphan = path.join(
+    paths.tempDirFor(mutationGateDir),
+    `rp4-${crypto.randomUUID()}.part.mp4`
+  );
+  await fsp.copyFile(saved.filePath, mutationGateOrphan);
+  const originalGateValidate = ffmpeg.validateMedia;
+  let releaseGateValidation;
+  ffmpeg.validateMedia = () => new Promise((resolve) => { releaseGateValidation = resolve; });
+  const gateSweep = mutationGateManager.sweepTempDir();
+  const gateDeadline = Date.now() + 1000;
+  while (!releaseGateValidation && Date.now() < gateDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  if (!releaseGateValidation) throw new Error('mutation-gate recovery validation did not start');
+  const gatedStart = mutationGateManager.start({
+    mode: 'screen', modeLabel: 'gate', sourceName: 'gate', format: 'mp4', mimeType: recorded.mime
+  });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const startWaitedForRecovery = mutationGateManager.sessions.size === 0;
+  releaseGateValidation({ durationMs: 5000, frameCount: 1 });
+  await gateSweep;
+  const gatedSession = await gatedStart;
+  await mutationGateManager.stop({ sessionId: gatedSession.sessionId });
+  ffmpeg.validateMedia = originalGateValidate;
+  check('recording start waits for an active recovery sweep', startWaitedForRecovery);
+
   // ---- orphaned temp files are recovered, not lost ------------------------------
   const orphan = path.join(settings.tempDir, `rp4-${crypto.randomUUID()}.part.mp4`);
   await fsp.writeFile(orphan, Buffer.concat([recorded.buffers[0], recorded.buffers[1]]));
@@ -1933,7 +2128,12 @@ app.whenReady().then(async () => {
   process.stdout.write(`\n${passed}/${results.length} checks passed\n`);
 
   try {
-    fs.rmSync(SANDBOX, { recursive: true, force: true });
+    const cleanupManifest = process.env.RP4_TEST_CLEANUP_MANIFEST;
+    if (cleanupManifest) {
+      fs.writeFileSync(cleanupManifest, JSON.stringify({ sandbox: SANDBOX }), 'utf8');
+    } else {
+      fs.rmSync(SANDBOX, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
   } catch {
     // The OS will clean the temp directory eventually.
   }

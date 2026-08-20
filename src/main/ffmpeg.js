@@ -23,7 +23,13 @@ const activeJobs = new Map();
 const DEFAULT_CANCEL_TIMEOUT_MS = 5000;
 const MIN_JOB_TIMEOUT_MS = 60 * 1000;
 const DEFAULT_JOB_TIMEOUT_MS = 10 * 60 * 1000;
-const MAX_JOB_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+// RP4 accepts recordings up to 24 hours.  A two-hour absolute FFmpeg cutoff made valid
+// long recordings fail validation/finalization on slower disks or CPUs.  The real safety
+// guard is a no-progress watchdog below; this is only a generous upper bound for a job
+// that continues to make observable progress.
+const MAX_JOB_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
+const PROGRESS_STALL_TIMEOUT_MS = 10 * 60 * 1000;
+const PROGRESS_STALL_CHECK_MS = 30 * 1000;
 const MIN_PROCESSING_BYTES_PER_SECOND = 2 * 1024 * 1024;
 
 function resolveTimeoutMs(totalDurationMs = 0, timeoutMs, inputBytes = 0) {
@@ -45,8 +51,10 @@ function resolveTimeoutMs(totalDurationMs = 0, timeoutMs, inputBytes = 0) {
   );
 }
 
-function timeoutError(timeoutMs) {
-  const error = new Error(`FFmpeg 작업이 시간 제한(${Math.ceil(timeoutMs / 1000)}초)을 초과했습니다.`);
+function timeoutError(timeoutMs, { stalled = false } = {}) {
+  const error = new Error(stalled
+    ? `FFmpeg 작업 진행이 ${Math.ceil(timeoutMs / 1000)}초 동안 멈췄습니다.`
+    : `FFmpeg 작업이 시간 제한(${Math.ceil(timeoutMs / 1000)}초)을 초과했습니다.`);
   error.code = 'TIMEOUT';
   return error;
 }
@@ -80,6 +88,11 @@ function run(args, {
   }
 
   const id = jobId || crypto.randomUUID();
+  if (activeJobs.has(id)) {
+    const error = new Error('같은 FFmpeg 작업 ID가 이미 실행 중입니다.');
+    error.code = 'DUPLICATE_JOB_ID';
+    return Promise.reject(error);
+  }
   const fullArgs = ['-hide_banner', '-nostdin', '-nostats', '-progress', 'pipe:1', ...args];
   const effectiveTimeoutMs = resolveTimeoutMs(totalDurationMs, timeoutMs, inputBytes);
 
@@ -91,32 +104,58 @@ function run(args, {
 
     let cancelled = false;
     let timedOut = false;
+    let stalled = false;
     let timeout = null;
+    let stallTimer = null;
     let resolveClosed;
     const closed = new Promise((done) => { resolveClosed = done; });
-    activeJobs.set(id, {
+    const job = {
       cancel: () => {
-        if (timedOut) return;
+        if (timedOut || stalled) return;
         cancelled = true;
         child.kill('SIGKILL');
       },
       closed
-    });
+    };
+    activeJobs.set(id, job);
 
     let stderr = '';
     let stdoutBuffer = '';
     let finalProgress = {};
+    let lastProgressAt = Date.now();
+    let lastProgressSignature = '';
+
+    const markProgress = (fields) => {
+      // A repeating `progress=continue` record alone is not useful: only changed output
+      // time/frame/byte values demonstrate that FFmpeg is still doing work.
+      const signature = [
+        fields.frame,
+        fields.out_time_us ?? fields.out_time_ms,
+        fields.total_size
+      ].join('|');
+      if (signature && signature !== '||' && signature !== lastProgressSignature) {
+        lastProgressSignature = signature;
+        lastProgressAt = Date.now();
+      }
+    };
+    const clearTimers = () => {
+      clearTimeout(timeout);
+      clearInterval(stallTimer);
+    };
+    const unregister = () => {
+      if (activeJobs.get(id) === job) activeJobs.delete(id);
+    };
 
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk) => {
       stdoutBuffer += chunk;
       const blocks = stdoutBuffer.split(/(?<=progress=\w+\r?\n)/);
       stdoutBuffer = blocks.pop() || '';
-      if (!onProgress && !captureProgress) return;
 
       for (const block of blocks) {
         const fields = parseProgress(block);
         finalProgress = { ...finalProgress, ...fields };
+        markProgress(fields);
         if (!onProgress) continue;
         const microseconds = Number(fields.out_time_us ?? fields.out_time_ms);
         if (!Number.isFinite(microseconds) || totalDurationMs <= 0) continue;
@@ -136,24 +175,37 @@ function run(args, {
       timedOut = true;
       child.kill('SIGKILL');
     }, effectiveTimeoutMs);
+    stallTimer = setInterval(() => {
+      if (Date.now() - lastProgressAt <= PROGRESS_STALL_TIMEOUT_MS) return;
+      stalled = true;
+      child.kill('SIGKILL');
+    }, PROGRESS_STALL_CHECK_MS);
 
     child.on('error', (error) => {
-      clearTimeout(timeout);
-      activeJobs.delete(id);
+      clearTimers();
+      unregister();
       resolveClosed();
-      reject(timedOut ? timeoutError(effectiveTimeoutMs) : error);
+      reject(timedOut
+        ? timeoutError(effectiveTimeoutMs)
+        : stalled ? timeoutError(PROGRESS_STALL_TIMEOUT_MS, { stalled: true }) : error);
     });
 
     child.on('close', (code) => {
-      clearTimeout(timeout);
-      activeJobs.delete(id);
+      clearTimers();
+      unregister();
       resolveClosed();
       if (captureProgress && stdoutBuffer.trim()) {
-        finalProgress = { ...finalProgress, ...parseProgress(stdoutBuffer) };
+        const fields = parseProgress(stdoutBuffer);
+        finalProgress = { ...finalProgress, ...fields };
+        markProgress(fields);
         stdoutBuffer = '';
       }
       if (timedOut) {
         reject(timeoutError(effectiveTimeoutMs));
+        return;
+      }
+      if (stalled) {
+        reject(timeoutError(PROGRESS_STALL_TIMEOUT_MS, { stalled: true }));
         return;
       }
       if (cancelled) {
@@ -535,6 +587,7 @@ module.exports = {
   MIN_JOB_TIMEOUT_MS,
   DEFAULT_JOB_TIMEOUT_MS,
   MAX_JOB_TIMEOUT_MS,
+  PROGRESS_STALL_TIMEOUT_MS,
   MIN_PROCESSING_BYTES_PER_SECOND,
   resolveTimeoutMs,
   waitForClose,

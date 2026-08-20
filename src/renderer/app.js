@@ -916,17 +916,29 @@
       void RP4.recorder.stopRecording();
     });
 
+    window.rp4.onWindowVisibility(({ visible } = {}) => {
+      const idle = !state.recording && !state.startingRecording && !state.clip
+        && !state.clipSaving && !state.clipStartPromise;
+      if (!idle) return;
+      if (!visible) {
+        // Closing the custom titlebar hides to the tray.  Release an idle preview capture
+        // so a hidden recorder does not keep the screen indicator and GPU pipeline alive.
+        state.previewGeneration += 1;
+        RP4.recorder.cleanupPreview();
+      } else {
+        void RP4.recorder.startPreview();
+      }
+    });
+
     window.rp4.onFinalizeRecordings(async ({ requestId, clipShutdownMode = 'discard' } = {}) => {
       state.shutdownRequestId = requestId;
       state.shuttingDown = true;
       document.body.classList.add('shutdown-pending');
       window.rp4.reportFinalizeAccepted(requestId);
-      let heartbeatSequence = 0;
-      util.reportShutdownProgress({ phase: 'shutdown-finalizing', sequence: heartbeatSequence });
-      const heartbeat = window.setInterval(() => {
-        heartbeatSequence += 1;
-        util.reportShutdownProgress({ phase: 'shutdown-finalizing', sequence: heartbeatSequence });
-      }, 5000);
+      // Only report measurable work (slice bytes or FFmpeg progress).  A changing timer
+      // sequence kept the main-process inactivity watchdog alive even when finalization
+      // had actually stalled.
+      util.reportShutdownProgress({ phase: 'shutdown-finalizing' });
       try {
         if (clipShutdownMode !== 'discard') {
           const clipResult = await RP4.clips.prepareForShutdown(clipShutdownMode);
@@ -957,7 +969,6 @@
         RP4.app.updateClipUi();
         if (!state.recording && !state.clip) void RP4.recorder.startPreview();
       } finally {
-        window.clearInterval(heartbeat);
         state.shutdownRequestId = null;
       }
     });
