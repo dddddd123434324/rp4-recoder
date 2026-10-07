@@ -1264,7 +1264,9 @@ svg {
 
 .settings-modal-card {
   width: min(620px, 100%);
-  max-height: min(690px, 88vh);
+  /* Keep every tab the same size, with room for the complete recording form. */
+  height: min(780px, calc(100vh - 56px));
+  max-height: none;
   grid-template-rows: auto auto minmax(0, 1fr);
   background: #101216;
 }

@@ -184,7 +184,7 @@
 
     els.recordButton.classList.toggle('recording', recording);
     els.recordButton.querySelector('span').textContent = recording ? 'STOP' : 'REC';
-    els.recordButton.disabled = clipActive || transitioning;
+    els.recordButton.disabled = clipActive || transitioning || state.sourceSelectionPending;
 
     els.pauseButton.disabled = !recording;
     els.pauseButton.querySelector('span').textContent = state.isPaused ? '재개' : '일시정지';
@@ -200,7 +200,7 @@
   }
 
   function updateProfileControls() {
-    const locked = RP4.lifecycle.isBusy();
+    const locked = RP4.lifecycle.isBusy() || state.sourceSelectionPending;
     const lossless = RP4.profile.get().lossless;
     const fixedControls = [
       els.formatSelect,
@@ -238,7 +238,7 @@
     els.clipModeButton.classList.toggle('active', active);
     els.clipModeButton.querySelector('span').textContent =
       active ? '클립 녹화 모드 중지' : '클립 녹화 모드 시작';
-    els.clipModeButton.disabled = transitioning
+    els.clipModeButton.disabled = transitioning || state.sourceSelectionPending
       || state.captureLifecycle === 'saving-clip'
       || (!active && RP4.profile.get().lossless);
     els.clipSaveButton.disabled = !active || state.clipSaving || transitioning;
@@ -440,8 +440,14 @@
   }
 
   async function setMode(mode) {
+    if (state.shuttingDown) return;
     if (state.sourceSelectionPending) {
       RP4.ui.showToast('진행 중인 캡처 소스 선택을 먼저 완료해 주세요.');
+      return;
+    }
+    // Selecting an area again ends the current recording before changing its source.
+    if (mode === 'area') {
+      await chooseDesktopArea(++state.sourceSelectionGeneration);
       return;
     }
     if (RP4.lifecycle.isBusy()) {
@@ -450,11 +456,6 @@
     }
 
     const generation = ++state.sourceSelectionGeneration;
-
-    if (mode === 'area') {
-      await chooseDesktopArea(generation);
-      return;
-    }
 
     if (mode === 'screen') {
       state.sourceSelectionPending = true;
@@ -476,10 +477,27 @@
   async function chooseDesktopArea(generation) {
     if (state.sourceSelectionPending) return;
     state.sourceSelectionPending = true;
+    updateClipUi();
     try {
+      if (RP4.lifecycle.isBusy()) {
+        if (!state.recording && !state.startingRecording) {
+          RP4.ui.showToast('클립 녹화 모드를 중지한 뒤 영역을 다시 선택해 주세요.');
+          return;
+        }
+        try {
+          await RP4.recorder.finishRecording();
+        } catch (error) {
+          console.error(error);
+          RP4.ui.showToast('녹화 저장에 실패해 영역을 변경하지 않았습니다.');
+          return;
+        }
+      }
+      if (generation !== state.sourceSelectionGeneration || RP4.lifecycle.isBusy()
+        || state.shuttingDown) return;
       await performChooseDesktopArea(generation);
     } finally {
       state.sourceSelectionPending = false;
+      updateClipUi();
     }
   }
 

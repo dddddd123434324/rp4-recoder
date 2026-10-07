@@ -1144,8 +1144,8 @@
     if (context) RP4.lifecycle.finish(context.operationId);
   }
 
-  /** Waits for an in-flight recording to finish, used while the app is shutting down. */
-  async function finalizeForShutdown() {
+  /** Saves and drains the current recording before source changes or app shutdown. */
+  async function finishRecording() {
     if (state.startingRecording) {
       state.startingRecording.cancelled = true;
       state.startingRecording.stopping = true;
@@ -1173,18 +1173,18 @@
     ]);
     window.clearTimeout(timer);
     if (!finalized && state.recording) {
-      state.recording.failure ||= '앱 종료 중 녹화 마무리 시간이 초과되었습니다.';
+      state.recording.failure ||= '녹화 마무리 시간이 초과되었습니다.';
       const forced = context.lossless
         ? await finalizeLosslessRecording(context)
         : await finalizeRecording(context);
       if (forced?.ok === false) {
-        throw forced.error || new Error('앱 종료 중 녹화 파일을 저장하지 못했습니다.');
+        throw forced.error || new Error('녹화 파일을 저장하지 못했습니다.');
       }
       return;
     }
     const outcome = await context.finalizePromise;
     if (outcome?.ok === false) {
-      throw outcome.error || new Error('앱 종료 중 녹화 파일을 저장하지 못했습니다.');
+      throw outcome.error || new Error('녹화 파일을 저장하지 못했습니다.');
     }
   }
 
@@ -1209,7 +1209,8 @@
     togglePause,
     elapsedMs,
     normalizeLosslessTimestamp,
-    finalizeForShutdown,
+    finishRecording,
+    finalizeForShutdown: finishRecording,
     smokeLosslessTransport
   };
 }(window.RP4));

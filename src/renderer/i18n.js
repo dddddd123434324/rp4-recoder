@@ -24,6 +24,8 @@
     '캡처 가능한 화면을 찾지 못했습니다.': 'No capturable display was found.',
     '진행 중인 캡처 소스 선택을 먼저 완료해 주세요.': 'Finish selecting the current capture source first.',
     '녹화 중에는 캡처 모드를 바꿀 수 없습니다.': 'Capture mode cannot be changed while recording.',
+    '클립 녹화 모드를 중지한 뒤 영역을 다시 선택해 주세요.': 'Stop clip mode before selecting a new area.',
+    '녹화 저장에 실패해 영역을 변경하지 않았습니다.': 'The area was not changed because the recording could not be saved.',
     '실제 화면에서 녹화할 영역을 드래그하세요.': 'Drag the area to record on the desktop.',
     '영역 선택 화면을 열지 못했습니다.': 'Could not open the area selector.',
     '영역 녹화에 사용할 화면을 찾지 못했습니다.': 'No display is available for area recording.',
