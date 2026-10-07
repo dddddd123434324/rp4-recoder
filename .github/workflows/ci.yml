@@ -41,3 +41,21 @@ jobs:
           if (-not (Test-Path -LiteralPath "dist\RP4-Recorder-$version-SHA256SUMS.txt")) {
             throw 'Missing versioned SHA256SUMS.txt.'
           }
+
+  package-store:
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run dist:store
+      - name: Verify Store artifact
+        shell: pwsh
+        run: |
+          $artifacts = Get-ChildItem -LiteralPath dist-store -File -Filter 'RP4-Recorder-Store-*.appx'
+          if ($artifacts.Count -ne 1) { throw 'Expected exactly one Store AppX artifact.' }

@@ -975,9 +975,11 @@ class RecordingManager {
       ...meta,
       ...(identity ? { fileIdentity: identity } : {})
     });
+    let persisted = true;
     try {
       await this.saveIndex();
     } catch (error) {
+      persisted = false;
       this.indexDirty = true;
       this.emit('app:notice', {
         level: 'warn',
@@ -986,6 +988,7 @@ class RecordingManager {
       });
     }
     this.emit('recordings:changed', { filePath });
+    return persisted;
   }
 
   async metadataForFile(filePath) {
@@ -1119,12 +1122,13 @@ class RecordingManager {
       journal = { ...journal, state: 'cleanup-pending' };
       await persist().catch(() => {});
       const cleanupComplete = await this.cleanupArtifactSources(tempDir, [journal.source, ...journal.cleanupSources]);
-      if (cleanupComplete) {
-        await fs.rm(journalPath, { force: true }).catch(() => {});
-      } else {
-        await persist().catch(() => {});
-      }
-      return { target: committed.target, cleanupPending: !cleanupComplete };
+      // Keep the journal until the metadata index is durable. A crash after publishing the
+      // user-visible file must not turn an RP4 recording into an unmanaged external file.
+      return {
+        target: committed.target,
+        cleanupPending: !cleanupComplete,
+        journalPath
+      };
     }
     throw new Error('고유한 녹화 파일 이름을 확보하지 못했습니다.');
   }
@@ -1206,26 +1210,36 @@ class RecordingManager {
       const cleanupComplete = await this.cleanupArtifactSources(tempDir, [journal.source, ...journal.cleanupSources]);
       if (!cleanupComplete) {
         await persist().catch(() => {});
-        failed.push({ filePath: journalPath, error: '커밋된 원본 정리를 다음 실행에서 다시 시도합니다.' });
+        failed.push({ filePath: journalPath, error: '커밋된 원본 정리는 다음 실행에서 다시 시도합니다.' });
+        continue;
+      }
+      let metadataPersisted = this.metadata.has(target) && !this.indexDirty;
+      if (!metadataPersisted) {
+        const existingMeta = this.metadata.get(target);
+        if (existingMeta) {
+          metadataPersisted = await this.setMetadata(target, existingMeta);
+        } else {
+          const stats = await statFile(target);
+          metadataPersisted = await this.setMetadata(target, {
+            ...normalizeRecordingMeta(journal.meta),
+            format: journal.extension,
+            status: 'complete',
+            partial: false,
+            outcome: 'recovered-committed',
+            recovered: true,
+            durationMs: boundedDurationMs(journal.durationMs),
+            bytes: stats?.size || 0
+          });
+        }
+      }
+      if (!metadataPersisted) {
+        failed.push({ filePath: journalPath, error: '녹화 메타데이터 저장을 다음 실행에서 다시 시도합니다.' });
         continue;
       }
       await fs.rm(journalPath, { force: true }).catch(() => {});
       for (const source of allSources) {
         const sourcePath = artifactSourcePath(tempDir, source);
         if (sourcePath) pendingPaths.delete(canonicalPathKey(sourcePath));
-      }
-      if (!this.metadata.has(target)) {
-        const stats = await statFile(target);
-        await this.setMetadata(target, {
-          ...normalizeRecordingMeta(journal.meta),
-          format: journal.extension,
-          status: 'complete',
-          partial: false,
-          outcome: 'recovered-committed',
-          recovered: true,
-          durationMs: boundedDurationMs(journal.durationMs),
-          bytes: stats?.size || 0
-        });
       }
       recovered.push(target);
     }
@@ -1512,8 +1526,10 @@ class RecordingManager {
               continue;
             }
             const committedStats = await statFile(committedTarget);
-            if (!this.metadata.has(committedTarget)) {
-              await this.setMetadata(committedTarget, {
+            let metadataPersisted = this.metadata.has(committedTarget) && !this.indexDirty;
+            if (!metadataPersisted) {
+              const existingMeta = this.metadata.get(committedTarget);
+              metadataPersisted = await this.setMetadata(committedTarget, existingMeta || {
                 ...normalizeRecordingMeta(manifest.meta),
                 format: 'avi',
                 lossless: true,
@@ -1525,6 +1541,13 @@ class RecordingManager {
                 bytes: committedStats?.size || 0
               });
             }
+            if (!metadataPersisted) {
+              failed.push({
+                filePath: manifestPath,
+                error: '무압축 녹화 메타데이터 저장을 다음 실행에서 다시 시도합니다.'
+              });
+              continue;
+            }
             const cleanup = await Promise.allSettled([
               fs.rm(rawPath, { force: true }),
               fs.rm(audioPath, { force: true })
@@ -1534,7 +1557,7 @@ class RecordingManager {
             } else {
               failed.push({
                 filePath: manifestPath,
-                error: '커밋된 무압축 원본 정리를 다음 실행에서 다시 시도합니다.'
+                error: '커밋된 무압축 원본 정리는 다음 실행에서 다시 시도합니다.'
               });
             }
             recovered.push(committedTarget);
@@ -2199,21 +2222,19 @@ class RecordingManager {
       );
     }
 
-    // The journal is removed last. A crash after commit can therefore identify the
-    // committed target and clean raw artifacts without creating a duplicate recording.
+    // Keep the manifest until both raw cleanup and metadata persistence succeed. A crash
+    // after publishing the AVI can then restore ownership without rebuilding a duplicate.
     const cleanup = await Promise.allSettled([
       fs.rm(session.rawPath, { force: true }),
       fs.rm(session.audioPath, { force: true })
     ]);
-    if (cleanup.every((result) => result.status === 'fulfilled')) {
-      await fs.rm(session.manifestPath, { force: true }).catch(() => {});
-    } else {
-      // Preserve the ready-to-commit journal when raw cleanup is blocked.  Startup can
-      // then verify the committed AVI and retry deletion instead of rebuilding a duplicate
-      // recording from a multi-gigabyte raw artifact.
+    const cleanupComplete = cleanup.every((result) => result.status === 'fulfilled');
+    if (!cleanupComplete) {
+      // Preserve the ready-to-commit journal when raw cleanup is blocked. Startup can
+      // verify the committed AVI and retry deletion instead of rebuilding a duplicate.
       this.emit('app:notice', {
         level: 'warn',
-        message: '무압축 원본 정리를 다음 실행에서 다시 시도합니다.'
+        message: '무압축 원본 정리는 다음 실행에서 다시 시도합니다.'
       });
     }
     const stats = await statFile(target);
@@ -2247,7 +2268,10 @@ class RecordingManager {
       stoppedAt: new Date().toISOString(),
       bytes: stats?.size || 0
     };
-    await this.setMetadata(target, meta);
+    const metadataPersisted = await this.setMetadata(target, meta);
+    if (cleanupComplete && metadataPersisted) {
+      await fs.rm(session.manifestPath, { force: true }).catch(() => {});
+    }
     if (performanceWarning) {
       this.emit('app:notice', {
         level: 'warn',
@@ -2514,7 +2538,10 @@ class RecordingManager {
       bytes: stats?.size || 0
     };
 
-    await this.setMetadata(finalized.filePath, meta);
+    const metadataPersisted = await this.setMetadata(finalized.filePath, meta);
+    if (metadataPersisted && !finalized.cleanupPending && finalized.journalPath) {
+      await fs.rm(finalized.journalPath, { force: true }).catch(() => {});
+    }
 
     if (verificationPending) {
       this.enqueueVerification(
@@ -2608,7 +2635,8 @@ class RecordingManager {
           format: targetFormat,
           converted: true,
           optimizable: false,
-          cleanupPending: committed.cleanupPending
+          cleanupPending: committed.cleanupPending,
+          journalPath: committed.journalPath
         };
       } catch (error) {
         await fs.rm(staging, { force: true }).catch(() => {});
@@ -2623,6 +2651,7 @@ class RecordingManager {
         format: targetFormat,
         converted: false,
         cleanupPending: committed.cleanupPending,
+        journalPath: committed.journalPath,
         // A stream-copy pass moves the moov atom to the front. It is optional, runs in
         // the background, and never delays the save.
         optimizable: targetFormat === 'mp4',
@@ -2656,7 +2685,8 @@ class RecordingManager {
           format: 'mp4',
           converted: true,
           optimizable: false,
-          cleanupPending: committed.cleanupPending
+          cleanupPending: committed.cleanupPending,
+          journalPath: committed.journalPath
         };
       } catch (error) {
         await fs.rm(staging, { force: true }).catch(() => {});
@@ -2689,7 +2719,8 @@ class RecordingManager {
           format: 'mp4',
           converted: true,
           optimizable: false,
-          cleanupPending: committed.cleanupPending
+          cleanupPending: committed.cleanupPending,
+          journalPath: committed.journalPath
         };
       } catch (error) {
         await fs.rm(staging, { force: true }).catch(() => {});
@@ -2705,7 +2736,8 @@ class RecordingManager {
       format: recordedContainer,
       converted: false,
       optimizable: false,
-      cleanupPending: committed.cleanupPending
+      cleanupPending: committed.cleanupPending,
+      journalPath: committed.journalPath
     };
   }
 
@@ -2726,6 +2758,7 @@ class RecordingManager {
       converted: false,
       optimizable: false,
       cleanupPending: committed.cleanupPending,
+      journalPath: committed.journalPath,
       conversionError: error?.message || String(error)
     };
   }
@@ -2747,6 +2780,7 @@ class RecordingManager {
       converted: false,
       optimizable: false,
       cleanupPending: committed.cleanupPending,
+      journalPath: committed.journalPath,
       partial: true,
       failureReason
     };

@@ -40,6 +40,40 @@
     return epochs.reduce((total, epoch) => total + epochDuration(epoch), 0);
   }
 
+  function recordedDurationBefore(epoch, boundaryAt) {
+    const total = epochDuration(epoch, epoch?.endedAt || boundaryAt);
+    const startedAt = Number(epoch?.startedAt);
+    const endedAt = Number(epoch?.endedAt);
+    if (!Number.isFinite(startedAt) || !Number.isFinite(boundaryAt)
+      || boundaryAt <= startedAt) return 0;
+    if (Number.isFinite(endedAt) && boundaryAt >= endedAt) return total;
+    return Math.max(0, Math.min(
+      total,
+      boundaryAt - startedAt - Math.max(0, Number(epoch?.pausedAccumMs) || 0)
+    ));
+  }
+
+  /** Maps the save-button instant onto the encoded rolling timeline. */
+  function clipTiming(snapshot, targetMs) {
+    const epochs = Array.isArray(snapshot?.epochs) ? snapshot.epochs : [];
+    const requestedAtValue = Number(snapshot?.requestedAt);
+    const fallbackBoundary = Number(snapshot?.endedAt);
+    const requestedAt = Number.isFinite(requestedAtValue)
+      ? requestedAtValue
+      : Number.isFinite(fallbackBoundary) ? fallbackBoundary : Date.now();
+    const totalDurationMs = epochs.reduce((total, epoch) => total + epochDuration(epoch), 0);
+    const availableBeforeRequestMs = Math.max(0, Math.min(
+      totalDurationMs,
+      epochs.reduce((total, epoch) => total + recordedDurationBefore(epoch, requestedAt), 0)
+    ));
+    const requestedWindowMs = Math.max(0, Number(targetMs) || 0);
+    return {
+      durationMs: Math.min(requestedWindowMs, availableBeforeRequestMs),
+      endOffsetMs: Math.max(0, totalDurationMs - availableBeforeRequestMs),
+      totalDurationMs
+    };
+  }
+
   function clipLimitBytes() {
     const limitMb = Number(state.appSettings.clipBufferLimitMb) || 256;
     return limitMb * 1024 * 1024;
@@ -437,13 +471,14 @@
         return { ok: false, saved: null, partial: false, error: '아직 저장할 클립 데이터가 없습니다.' };
       }
 
-      if (snapshot.durationMs < MIN_SAVEABLE_CLIP_MS) {
+      const timing = clipTiming(snapshot, windowMs);
+      if (timing.durationMs < MIN_SAVEABLE_CLIP_MS) {
         const error = '클립 버퍼가 아직 충분히 쌓이지 않았습니다.';
         RP4.ui.showToast(error);
         return { ok: false, saved: null, partial: false, error };
       }
 
-      const estimatedMs = Math.max(1, Math.min(windowMs, snapshot.durationMs));
+      const estimatedMs = Math.max(1, Math.round(timing.durationMs));
       RP4.ui.setStatus('클립 저장 중', '클릭 시점까지의 최근 장면을 저장하고 있습니다.', 'warn');
 
       const meta = {
@@ -464,7 +499,7 @@
         hasMic: session.hasMic,
         durationMs: estimatedMs,
         trimRecentMs: estimatedMs,
-        trimEndOffsetMs: Math.max(0, snapshot.endedAt - snapshot.requestedAt),
+        trimEndOffsetMs: Math.max(0, Math.round(timing.endOffsetMs)),
         clip: true,
         segmentedClip: snapshot.epochs.length > 1
       };
@@ -641,6 +676,6 @@
     finalizeForShutdown,
     pruneActiveBuffer,
     bufferStatus,
-    policy: { activeBufferLimit, segmentDurationMs, restoreFailedSnapshot }
+    policy: { activeBufferLimit, segmentDurationMs, restoreFailedSnapshot, clipTiming }
   };
 }(window.RP4));

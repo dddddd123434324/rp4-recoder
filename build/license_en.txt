@@ -1,0 +1,37 @@
+﻿RP4 Recorder Installation and Use Terms
+
+Please review these terms before installing or using RP4 Recorder. Selecting
+"I Agree" in the installer confirms that you have read and accepted them.
+
+1. Open-source licenses
+
+RP4 Recorder's first-party source code is provided under the MIT License. The bundled
+FFmpeg and ffmpeg-static components are covered by the GNU General Public License,
+version 3. The bundled PyeojinGothic font is covered by the SIL Open Font License 1.1.
+Complete copyright notices, license texts, and corresponding-source information are
+available in the installed LICENSE file, THIRD_PARTY_NOTICES.md, and legal directory.
+
+2. Privacy and local processing
+
+RP4 Recorder uses no account, advertising, or analytics. Recordings, screenshots,
+settings, and temporary recovery data remain on your PC and are not sent to an external
+server. Screen, system-audio, and microphone access is used only to perform recording
+features requested by you.
+
+3. Your responsibility when recording
+
+Before recording or sharing screens, windows, games, voices, or other content, you are
+responsible for obtaining any necessary rights and consent and for following applicable
+laws, service terms, and privacy obligations. RP4 Recorder does not control what you
+record or how you distribute a recording.
+
+4. No warranty
+
+To the extent permitted by the applicable open-source licenses, RP4 Recorder is provided
+"as is," without express or implied warranties, including merchantability, fitness for a
+particular purpose, and non-infringement. To the maximum extent permitted by law, the
+copyright holders and contributors are not liable for damages arising from use of, or
+inability to use, the software.
+
+Source code and current notices:
+https://github.com/dddddd123434324/rp4-recoder

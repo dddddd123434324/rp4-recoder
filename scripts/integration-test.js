@@ -558,6 +558,38 @@ async function run() {
       && artifactRecoveryFiles.length === 1
       && !artifactRecovery.recovered.some((filePath) => path.basename(filePath).includes('recovered')));
 
+  // Simulate a process exit after the user-visible file is committed but before the
+  // recording metadata index is written. The commit journal must restore ownership.
+  const metadataCrashSource = path.join(settings.tempDir, `rp4-${crypto.randomUUID()}.part.mp4`);
+  await fsp.writeFile(metadataCrashSource, Buffer.from('durable committed recording'));
+  const metadataCrashCommit = await recordings.commitArtifactToUnique({
+    sourcePath: metadataCrashSource,
+    recordingsDir: RECORDINGS,
+    baseName: 'post-commit-metadata-recovery',
+    extension: 'mp4',
+    meta: { mode: 'screen', sourceName: 'metadata recovery' },
+    durationMs: 1250
+  });
+  check('artifact journal remains until recording metadata is durable',
+    metadataCrashCommit.cleanupPending === false
+      && fs.existsSync(metadataCrashCommit.journalPath)
+      && !recordings.metadata.has(metadataCrashCommit.target));
+
+  const metadataRecoveryManager = new RecordingManager({ settings, emit: () => {} });
+  await metadataRecoveryManager.loadIndex();
+  const metadataCrashRecovery = await metadataRecoveryManager.sweepTempDir();
+  const metadataRecoveredItem = (await metadataRecoveryManager.list())
+    .find((item) => item.filePath === metadataCrashCommit.target);
+  const metadataRecoveredMeta = metadataRecoveryManager.metadata.get(metadataCrashCommit.target);
+  check('startup recovery restores ownership after a post-commit crash',
+    metadataCrashRecovery.recovered.includes(metadataCrashCommit.target)
+      && !fs.existsSync(metadataCrashCommit.journalPath)
+      && metadataRecoveredItem?.managed === true
+      && Boolean(metadataRecoveredMeta?.fileIdentity));
+  if (metadataRecoveredMeta) {
+    recordings.metadata.set(metadataCrashCommit.target, metadataRecoveredMeta);
+  }
+
   require('../src/main/ipc').registerIpcHandlers({
     settings,
     recordings,
@@ -1198,6 +1230,14 @@ async function run() {
         audioBitrateKbps: 320,
         clipDurationSeconds: 300
       });
+      const boundaryTiming = window.RP4.clips.policy.clipTiming({
+        requestedAt: 11500,
+        endedAt: 12000,
+        epochs: [
+          { startedAt: 10000, endedAt: 11000, pausedAccumMs: 0 },
+          { startedAt: 11000, endedAt: 12000, pausedAccumMs: 0 }
+        ]
+      }, 2000);
       const restoredSession = {
         profile: { clipDurationSeconds: 300 },
         segmentMs: 1000,
@@ -1225,6 +1265,8 @@ async function run() {
         runningMarker: running.marker,
         activeLimit,
         highBitrateSegmentMs,
+        boundaryDurationMs: boundaryTiming.durationMs,
+        boundaryEndOffsetMs: boundaryTiming.endOffsetMs,
         restoredEpochs: restoredSession.completedEpochs.length,
         restoredPendingBytes: restoredSession.pendingSnapshotBytes,
         restoredActiveBytes: restoredSession.completedEpochs[0]?.initChunk?.size || 0,
@@ -1242,6 +1284,10 @@ async function run() {
   check('high bitrate shortens rolling clip epochs',
     clipPolicyResult.highBitrateSegmentMs === 1000,
     `${clipPolicyResult.highBitrateSegmentMs} ms`);
+  check('clip timing excludes frames captured after the save request',
+    clipPolicyResult.boundaryDurationMs === 1500
+      && clipPolicyResult.boundaryEndOffsetMs === 500,
+    `${clipPolicyResult.boundaryDurationMs} ms + ${clipPolicyResult.boundaryEndOffsetMs} ms offset`);
   check('failed clip save restores its snapshot before memory pruning',
     clipPolicyResult.restoredEpochs === 1
       && clipPolicyResult.restoredPendingBytes === 0
@@ -1312,6 +1358,11 @@ async function run() {
   check('stop returned a saved recording', Boolean(saved), saved?.name);
   check('saved file is .mp4', saved?.name?.toLowerCase().endsWith('.mp4') === true, saved?.name);
   check('no conversion was performed', saved?.converted === false);
+  const lingeringCommitJournals = (await fsp.readdir(settings.tempDir))
+    .filter((name) => /^rp4-[0-9a-f-]{36}\.commit\.json$/i.test(name));
+  check('durable metadata removes the completed commit journal',
+    lingeringCommitJournals.length === 0,
+    lingeringCommitJournals.join(', '));
   // The whole point of the change: stopping is a close plus a rename.
   check('stop completes in under 250 ms', stopMs < 250, `${stopMs} ms`);
 
