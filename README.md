@@ -23,7 +23,7 @@ Windows용 화면 녹화 프로그램입니다. H.264 영상을 MP4로 바로 �
 
 [GitHub Releases](https://github.com/dddddd123434324/rp4-recoder/releases/latest)에서 설치판 또는 포터블 버전을 받을 수 있습니다.
 
-Microsoft Store 배포도 준비 중입니다.
+Microsoft Store 배포 중입니다.
 
 Windows 코드 서명 인증서는 아직 포함되어 있지 않습니다. 각 릴리즈의
 `SHA256SUMS.txt`로 내려받은 파일의 SHA-256을 확인할 수 있습니다.
