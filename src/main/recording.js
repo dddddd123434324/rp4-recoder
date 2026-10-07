@@ -1012,20 +1012,18 @@ class RecordingManager {
   }
 
   async describeArtifactSource(tempDir, filePath, { optional = false } = {}) {
-    if (!isDirectChildPath(tempDir, filePath)) {
-      throw new Error('커밋 정리 대상이 앱 임시 폴더를 벗어났습니다.');
+    // `settings.tempDir` can use an 8.3/alias spelling while `ensureOwnedTempDir()` returns
+    // the canonical Windows path. Validate the resolved file instead of rejecting a safe
+    // direct child merely because the two equivalent parent strings differ.
+    const owned = await openOwnedRegularFile(tempDir, filePath, 'r', { optional });
+    if (!owned) return null;
+    try {
+      const identity = await fileIdentity(owned.filePath);
+      if (!identity) throw new Error('커밋할 임시 파일의 정체성을 확인할 수 없습니다.');
+      return { name: path.basename(owned.filePath), identity };
+    } finally {
+      await owned.handle.close().catch(() => {});
     }
-    const details = await fs.lstat(filePath).catch(() => null);
-    if (!details) {
-      if (optional) return null;
-      throw new Error('커밋할 임시 파일을 찾을 수 없습니다.');
-    }
-    if (!details.isFile() || details.isSymbolicLink()) {
-      throw new Error('커밋 정리 대상이 안전한 일반 파일이 아닙니다.');
-    }
-    const identity = await fileIdentity(filePath);
-    if (!identity) throw new Error('커밋할 임시 파일의 정체성을 확인할 수 없습니다.');
-    return { name: path.basename(filePath), identity };
   }
 
   async artifactSourceMatches(tempDir, source) {

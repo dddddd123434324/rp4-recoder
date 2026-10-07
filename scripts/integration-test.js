@@ -516,6 +516,27 @@ async function run() {
   check('oversized recording index is backed up without parsing',
     oversizedIndex.recovered && Boolean(oversizedIndex.backupPath));
 
+  // Windows can expose the same temp directory through an 8.3 path or junction alias.
+  // Ownership must be decided from the resolved path, not the lexical parent spelling.
+  const tempAlias = path.join(SANDBOX, 'recording-temp-alias');
+  await fsp.symlink(settings.tempDir, tempAlias, 'junction');
+  const aliasArtifactSource = path.join(tempAlias, `rp4-${crypto.randomUUID()}.part.mp4`);
+  await fsp.writeFile(aliasArtifactSource, Buffer.from('canonical temp alias'));
+  const aliasArtifactCommit = await recordings.commitArtifactToUnique({
+    sourcePath: aliasArtifactSource,
+    recordingsDir: RECORDINGS,
+    baseName: 'canonical-temp-alias',
+    extension: 'mp4',
+    meta: { mode: 'screen', sourceName: 'path alias' },
+    durationMs: 500
+  });
+  const aliasArtifactRecovery = await recordings.sweepTempDir();
+  check('artifact commit accepts a canonical alias of the owned temp directory',
+    aliasArtifactRecovery.recovered.includes(aliasArtifactCommit.target)
+      && !fs.existsSync(aliasArtifactCommit.journalPath)
+      && recordings.metadata.has(aliasArtifactCommit.target));
+  await fsp.rm(tempAlias, { recursive: true, force: true });
+
   // A successful user-visible commit and a failed temp cleanup are different phases.
   // In particular, a precise clip must never surface its longer source buffer as another
   // recovered recording merely because an antivirus/indexer held that temp file open.
