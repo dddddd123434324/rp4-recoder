@@ -546,7 +546,7 @@ async function run() {
   await fsp.writeFile(artifactTrimmed, Buffer.from('precise requested clip'));
   const originalArtifactRm = fsp.rm;
   fsp.rm = async (target, options) => {
-    if (path.resolve(target) === path.resolve(artifactOriginal)) {
+    if (path.basename(String(target)) === path.basename(artifactOriginal)) {
       const error = new Error('simulated temporary file lock');
       error.code = 'EPERM';
       throw error;
@@ -1833,11 +1833,9 @@ async function run() {
       && /\bmp4\b/.test(fallbackProbe.container || ''),
     `video=${fallbackProbe.codec} audio=${fallbackProbe.audioCodec} container=${fallbackProbe.container}`);
 
-  // ---- clip mode: init segment + suffix of fragments ----------------------------
-  const clipBuffers = [
-    recorded.buffers[0],
-    ...recorded.buffers.slice(Math.max(1, recorded.buffers.length - 2))
-  ];
+  // ---- clip mode: complete MediaRecorder epoch ----------------------------------
+  // Production keeps complete epochs so an exact trim always has the preceding keyframe.
+  const clipBuffers = [...recorded.buffers];
   const clipStarted = Date.now();
   const clipMeta = {
     ...meta,
@@ -1862,7 +1860,8 @@ async function run() {
   });
   const clipMs = Date.now() - clipStarted;
 
-  check('clip saved', Boolean(clip), `${clip?.name} in ${clipMs} ms`);
+  check('clip saved', Boolean(clip) && !clip?.conversionError,
+    `${clip?.name} in ${clipMs} ms${clip?.conversionError ? `: ${clip.conversionError}` : ''}`);
   check('clip is .mp4', clip?.name?.toLowerCase().endsWith('.mp4') === true);
   const clipProbe = await ffprobe(clip.filePath);
   check('clip is decodable H.264', clipProbe.codec === 'h264', `codec=${clipProbe.codec}`);
