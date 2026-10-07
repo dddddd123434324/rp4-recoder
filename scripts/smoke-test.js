@@ -11,7 +11,11 @@ const projectRoot = path.resolve(__dirname, '..');
 
 async function main() {
   const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), 'rp4-smoke-'));
-  const env = { ...process.env, RP4_SMOKE: '1' };
+  const env = {
+    ...process.env,
+    RP4_SMOKE: '1',
+    RP4_SMOKE_TIMEOUT_MS: process.env.RP4_SMOKE_TIMEOUT_MS || '90000'
+  };
   delete env.ELECTRON_RUN_AS_NODE;
 
   let code;
